@@ -6,7 +6,7 @@ model: it collects evidence from the real system, checks NIST SP 800-53 controls
 drafted narrative cites, fills in the customer's own workbooks and draws the architecture. The agent (a hobkin with
 this pack) drafts, by running the toolkit and reading what it says. See DESIGN.md.
 
-    atone init SYSTEM [--store s3://bucket/prefix | DIR]   a folder for a system (its spec, tailoring, mappings)
+    atone init SYSTEM [--remote URL] [--from URL]   the system's codex: a git repository (or a clone of one)
     atone discover SYSTEM [--ssh user@host]...   what runs on the hosts: for drafting the system spec
     atone collect SYSTEM [--kind K]... [--ssh user@host]...   evidence, from the built-in collectors
     atone import SYSTEM [FILE]... [--sample FILE]   scanner results (OpenSCAP natively; others through a mapping)
@@ -22,13 +22,20 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone due SYSTEM              what's due by the cadence (nothing printed when nothing is: a hobkin's watch)
     atone report SYSTEM --out DIR [--conmon]   report.html, for people
     atone sources                 public guidance worth a lore, and NIST's files
+    atone review SYSTEM [CONTROL...] --by NAME   a person reviews drafted statements (alone: what's waiting)
+    atone decide SYSTEM KIND "what and why" --by NAME   a decision: risk acceptance, deviation, poam-schedule...
+    atone package SYSTEM --tag TAG   the package into packages/TAG/, committed and tagged
+    atone history SYSTEM [--control ID] [--path evidence/HOST]   the system's security history
+    atone commit SYSTEM "message"   commit edits to the codex (spec, mappings, interfaces, drafts), with trailers
     atone oscal SYSTEM --out DIR  the SSP, assessment results and POA&M as OSCAL 1.1.2
     atone controls fetch [--from DIR]   a newer copy of NIST's OSCAL files (the package ships them)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
     atone --version
 
-Everything lives under $ATONE_HOME (default ~/atone): sources/ (a newer copy of NIST's files, if fetched), systems/NAME/ (a system's spec,
+Each system's codex is a git repository at $ATONE_HOME/systems/NAME (default ~/atone): its single source of truth,
+whose history is its security history (CODEX.md inside says what's where). $ATONE_HOME/sources/ holds a newer copy
+of NIST's files, if one was fetched. systems/NAME/ (a system's spec,
 tailoring, site file, mappings, imports and runs) and, unless a system names another, store/ (its evidence).
 Standard library only, plus lorewell for lores.
 """
@@ -37,13 +44,11 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
-import gzip
 import hashlib
 import json
 import os
 import pwd
 import re
-import secrets
 import shlex
 import shutil
 import socket
@@ -91,7 +96,8 @@ REDACT = [
      # (any prefix: db_password=, jdbc.password:, AWS_SECRET_ACCESS_KEY=)
     (r"(?i)(<(?:password|passwd|credential|secret)[^>]*>)[^<]+(</)", r"\1<redacted>\2"),   # XML config values
     (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
-    (r"(?<![\w/+=])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),          # long base64: keys, tokens
+    (r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[G-Zg-z+/])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),  # base64
+    # (a long base64 blob, a key or token; not a hex hash like a SHA-256 or a commit id, which is all 0-9a-f)
 ]
 _REDACT = [(re.compile(p, re.S), r) for p, r in REDACT]
 
@@ -200,12 +206,6 @@ def make_record(system: str, kind: str, host: str, source: str, content, site: b
     return {"id": f"{kind}.{re.sub(r'[^A-Za-z0-9_-]+', '-', host)}.{stamp(now)}.{sha[:8]}", "system": system,
             "kind": kind, "host": host, "at": now, "source": source, "site": site, "sha256": sha,
             "content": text, "atone": __version__}
-
-
-def record_key(rec: dict) -> str:
-    day = time.strftime("%Y-%m-%d", time.gmtime(rec["at"]))
-    return (f"system={rec['system']}/kind={rec['kind']}/dt={day}/host={rec['host']}/"
-            f"{stamp(rec['at'])}_{secrets.token_hex(3)}.json.gz")
 
 
 def check_record(rec: dict) -> bool:
@@ -344,9 +344,25 @@ def c_listeners(spec: dict) -> list[tuple[str, object]]:
 
 
 def c_flows(spec: dict) -> list[tuple[str, object]]:
-    """Connections open now (run on a schedule, they add up to the connections seen over time)."""
-    return [("/proc/net (connected)", sorted((r for r in proc_net() if r["state"] != "listen"),
-                                             key=lambda r: (r["local"], r["remote"])))]
+    """Connections open now, each as which way it goes and to what: inbound to one of this host's listening ports
+    (from an address; its port is ephemeral, so it's dropped), or outbound to a port elsewhere (this side's port is
+    ephemeral). Kept in the codex as a set that grows: a new connection is a change, the same one again isn't."""
+    rows = proc_net()
+    listening = {(r["proto"], r["local"].rpartition(":")[2]) for r in rows if r["state"] == "listen"}
+    out = {}
+    for r in rows:
+        if r["state"] == "listen":
+            continue
+        lip, _, lport = r["local"].rpartition(":")
+        rip, _, rport = r["remote"].rpartition(":")
+        if rip.startswith("127.") or rip in ("::1", "0.0.0.0", "::") or not rport or rport == "0":
+            continue
+        inbound = (r["proto"], lport) in listening
+        row = {"proto": r["proto"], "direction": "in" if inbound else "out",
+               "local": f"{lip}:{lport}" if inbound else lip, "remote": rip if inbound else f"{rip}:{rport}",
+               "process": (r.get("process") or "")[:200], "user": r.get("user", "")}
+        out[(row["proto"], row["direction"], row["local"], row["remote"], row["process"])] = row
+    return [("connections", sorted(out.values(), key=lambda x: (x["direction"], x["local"], x["remote"])))]
 
 
 def c_firewall(spec: dict) -> list[tuple[str, object]]:
@@ -664,7 +680,7 @@ def import_oscap(path: Path) -> list[dict]:
             results.append({"rule": rid, "title": r.get("title", ""), "result": result,
                             "severity": rr.get("severity") or r.get("severity"), "controls": r.get("controls") or []})
         out.append({"kind": "scan", "host": target,
-                    "source": f"openscap {profile.rsplit('_profile_', 1)[-1] or 'results'} ({path.name})",
+                    "source": f"openscap {profile.rsplit('_profile_', 1)[-1] or 'results'}",
                     "content": {"tool": "openscap", "profile": profile, "target": target,
                                 "start": tr.get("start-time"), "end": tr.get("end-time"), "results": results}})
     if not out:
@@ -736,7 +752,7 @@ def import_mapped(path: Path, mapping: dict) -> list[dict]:
         f["cve"] = re.findall(r"CVE-\d{4}-\d{4,}", f.get("cve", "") or f.get("finding", ""))
         by_host.setdefault(f["host"], []).append(f)
     tool = mapping.get("tool") or "scanner"
-    return [{"kind": "scan", "host": host, "source": f"{tool} ({path.name})",
+    return [{"kind": "scan", "host": host, "source": tool,
              "content": {"tool": tool, "findings": found}} for host, found in sorted(by_host.items())]
 
 
@@ -748,7 +764,7 @@ def import_file(path: Path, mappings: list[dict]) -> list[dict]:
         if fnmatch.fnmatch(path.name, m.get("match") or ""):
             return import_mapped(path, m)
     raise AtoneError(f"{path.name}: not OpenSCAP output, and no scanner mapping matches it. Draft one from its "
-                     f"columns (atone import SYSTEM --sample {path}) as imports/TOOL.mapping.json")
+                     f"columns (atone import SYSTEM --sample {path}) as mappings/scanners/TOOL.mapping.json")
 
 
 def sample(path: Path, n: int = 5) -> str:
@@ -1153,82 +1169,274 @@ SITE_STARTER = {
 }
 
 
-def init_system(name: str, store: str | None) -> Path:
+CODEX_IGNORE = """# local state: never part of the history
+runs/
+imports/*
+!imports/.keep
+PLAN.md
+plan.json
+*.part
+*.tmp
+"""
+CODEX_MD = """# The atone codex for {name}
+
+This repository is everything known about the security of **{name}**, and its history is the system's security
+history. Artifacts (the SSP workbook, the POA&M, OSCAL, the diagrams, the report) are generated from it by atone;
+never edit them by hand.
+
+| Path | What it is |
+|---|---|
+| `system.json` | the system: purpose, owners, categorization, hosts, components and the config files that define them |
+| `tailoring.json` | the baseline, controls added and removed, parameter values, inherited and shared controls |
+| `interfaces.json` | the intended flows (the SSP's boundary and data flows) |
+| `controls/` | each control: responsibility, status (from atone's checks), its implementation statement (claims with citations) and review |
+| `decisions/` | what people decided: risk acceptances, deviations, false positives, approved dates; each with who and why |
+| `poam/` | one file per weakness, from opened to closed |
+| `mappings/` | how the system is assessed: control mappings, scanner and workbook mappings |
+| `evidence/` | the latest observed state of each host and the AWS account, redacted; its history is the system's |
+| `workbooks/` | the customer's working documents, as given |
+| `packages/` | exactly what was delivered, at each tag |
+| `site.json` | commands atone doesn't have (a person's own); evidence from them says so |
+
+Commits carry their provenance as trailers (`Control:`, `Status:`, `Evidence:`, `Drafted-by:`, `Reviewed-by:`,
+`Decided-by:`): `atone history {name}` reads them. `main` is the system as understood and approved; the agent
+drafts on branches, and merging is approval. Tags mark what was delivered (`atone package`).
+
+A pre-commit hook refuses anything atone's redaction floor would catch (keys, tokens, passwords), whoever commits.
+"""
+HOOK = """#!/bin/sh
+# atone: refuse a commit that adds anything the redaction floor would catch (keys, tokens, passwords)
+PYTHONPATH="{path}${{PYTHONPATH:+:$PYTHONPATH}}" exec "{python}" -m atone guard
+"""
+
+
+def git(d: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    r = subprocess.run(["git", "-C", str(d), *args], capture_output=True, text=True)
+    if check and r.returncode:
+        raise AtoneError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def guard_text(text: str, where: str = "") -> list[str]:
+    """Lines the redaction floor would change: what must never be committed."""
+    out = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if redact(line) != line:
+            shown = redact(line)
+            out.append(f"{where}:{i}: {clip_text(shown, 120)}")
+    return out
+
+
+def guard_staged(d: Path) -> list[str]:
+    """What the staged changes would add that the redaction floor catches."""
+    diff = git(d, "diff", "--cached", "-U0", "--no-color", "--diff-filter=AM").stdout
+    found, current = [], ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            if redact(line[1:]) != line[1:]:
+                found.append(f"{current}: {clip_text(redact(line[1:]), 120)}")
+    return found
+
+
+def _ident(d: Path) -> list[str]:
+    """The repository's own git identity (and signing) when it has one; else atone's, on this host."""
+    if git(d, "config", "user.name", check=False).stdout.strip():
+        return []
+    host = socket.gethostname()
+    return ["-c", f"user.name=atone on {host}", "-c", f"user.email=atone@{host}"]
+
+
+def codex_commit(d: Path, subject: str, body: str = "", trailers: list[tuple[str, str]] | None = None,
+                 paths: list[str] | None = None) -> str | None:
+    """Commit what changed (in `paths`, or everything), with provenance as trailers. Nothing changed: no commit.
+    The agent's commits say so (Drafted-by), from HOBKIN_ID. Signing is the repository's own configuration."""
+    git(d, "add", "-A", "--", *(paths or ["."]))
+    if git(d, "diff", "--cached", "--quiet", check=False).returncode == 0:
+        return None
+    bad = guard_staged(d)
+    if bad:
+        git(d, "reset", "-q")
+        raise AtoneError("not committed: it would add what the redaction floor catches:\n  " + "\n  ".join(bad[:10]))
+    trailers = list(trailers or [])
+    if os.environ.get("HOBKIN_ID") and not any(k == "Drafted-by" for k, _ in trailers):
+        trailers.append(("Drafted-by", f"hobkin {os.environ['HOBKIN_ID']}"))
+    msg = subject + ("\n\n" + body.strip() if body.strip() else "") + (
+        "\n\n" + "\n".join(f"{k}: {v}" for k, v in trailers) if trailers else "")
+    r = subprocess.run(["git", "-C", str(d), *_ident(d), "commit", "-q", "-F", "-"], input=msg, capture_output=True,
+                       text=True)
+    if r.returncode:
+        raise AtoneError(f"git commit: {(r.stderr or r.stdout).strip()}")
+    return git(d, "rev-parse", "--short", "HEAD").stdout.strip()
+
+
+def init_system(name: str, store: str | None = None, remote: str | None = None, from_url: str | None = None) -> Path:
+    """A system's codex: a git repository at ~/atone/systems/NAME (cloned from `from_url` when there's one already,
+    as on a fresh machine), with its layout, the starter mappings, and the guard hook."""
     d = system_dir(name, must_exist=False)
-    for sub in ("mappings", "imports", "runs", "workbooks", "drafts"):
+    if from_url and not (d / ".git").exists():
+        d.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["git", "clone", "-q", from_url, str(d)], capture_output=True, text=True)
+        if r.returncode:
+            raise AtoneError(f"git clone {from_url}: {r.stderr.strip()}")
+    d.mkdir(parents=True, exist_ok=True)
+    if not (d / ".git").exists():
+        git(d, "init", "-q", "-b", "main")
+    for sub in ("mappings/controls", "mappings/scanners", "mappings/workbooks", "imports", "runs", "workbooks",
+                "drafts", "controls", "decisions", "poam", "evidence", "packages"):
         (d / sub).mkdir(parents=True, exist_ok=True)
-    starter = d / "mappings" / "starter.json"
+    (d / "imports" / ".keep").touch()
+    for path, text in ((".gitignore", CODEX_IGNORE), ("CODEX.md", CODEX_MD.format(name=name))):
+        if not (d / path).exists():
+            (d / path).write_text(text)
+    starter = d / "mappings" / "controls" / "starter.json"
     if not starter.exists():
         write_json(starter, STARTER_MAPPINGS)
-    for fname, starter in (("tailoring.json", TAILORING_STARTER), ("system.json", SPEC_STARTER),
-                           ("site.json", SITE_STARTER)):
+    for fname, start in (("tailoring.json", TAILORING_STARTER), ("system.json", SPEC_STARTER),
+                         ("site.json", SITE_STARTER), ("interfaces.json", [])):
         if not (d / fname).exists():
-            write_json(d / fname, starter)
+            write_json(d / fname, start)
     conf = read_json(d / "atone.json", {})
-    if store or "store" not in conf:
-        conf["store"] = store or str(HOME / "store")
+    if store:
+        conf["store"] = store
+    if conf != read_json(d / "atone.json", None):
         write_json(d / "atone.json", conf)
+    hook = d / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(HOOK.format(python=sys.executable, path=str(Path(__file__).resolve().parent.parent)))
+    hook.chmod(0o755)
+    if remote and git(d, "remote", check=False).stdout.strip() == "":
+        git(d, "remote", "add", "origin", remote)
+    codex_commit(d, f"codex: {name} set up" if not from_url else f"codex: {name} on {socket.gethostname()}",
+                 trailers=[("System", name)])
     return d
 
 
-def system_store(d: Path) -> Store:
-    return Store(read_json(d / "atone.json", {}).get("store") or str(HOME / "store"))
+def system_store(d: Path) -> Store | None:
+    """Where raw scanner exports are archived, by hash (a folder or s3://...), if the system names one."""
+    url = read_json(d / "atone.json", {}).get("store")
+    return Store(url) if url else None
 
 
-def save_records(d: Path, recs: list[dict]) -> str:
-    """Records to the store, and the run's index (ids and keys, no content) to runs/RUN/evidence.jsonl."""
-    run = stamp()
-    store = system_store(d)
-    idx = d / "runs" / run
-    idx.mkdir(parents=True, exist_ok=True)
-    with open(idx / "evidence.jsonl", "a") as f:
-        for rec in recs:
-            key = record_key(rec)
-            store.put(key, gzip.compress(json.dumps(rec).encode()))
-            f.write(json.dumps({k: rec[k] for k in ("id", "kind", "host", "at", "source", "site", "sha256")
-                                if k in rec} | ({"file_sha256": rec["file_sha256"]} if "file_sha256" in rec else {})
-                               | {"key": key, "bytes": len(rec["content"])}) + "\n")
-    (d / "runs" / "latest").write_text(run + "\n")
-    return run
+def slug(text: str, n: int = 100) -> str:
+    out = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_.")[:n] or "x"
+    return out if out == text[:n] else out + "-" + hashlib.sha1(text.encode()).hexdigest()[:6]
 
 
-def run_index(d: Path, run: str | None = None) -> list[dict]:
-    if not run and (d / "runs" / "latest").exists():
-        run = (d / "runs" / "latest").read_text().strip()
-    if not run:
-        return []
-    path = d / "runs" / run / "evidence.jsonl"
-    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
+def _evidence_path(rec: dict) -> str:
+    ext = "json" if rec["content"][:1] in "[{" else "txt"
+    return f"evidence/{slug(rec['host'], 60)}/{rec['kind']}/{slug(rec['source'])}.{ext}"
+
+
+def _seen(d: Path) -> dict:
+    return read_json(d / "runs" / "seen.json", {}) or {}
+
+
+def _merge_connections(old_text: str, new_rows: list, now: float) -> list:
+    """Connections seen before and now: a set that grows (each with when it was first seen); this collect's are
+    remembered locally (runs/connections-seen.json), so how recently each was seen never churns the history."""
+    try:
+        old = json.loads(old_text) if old_text else []
+    except json.JSONDecodeError:
+        old = []
+    key = lambda r: (r.get("proto"), r.get("direction"), r.get("local"), r.get("remote"), r.get("process"))
+    merged = {key(r): r for r in old if isinstance(r, dict)}
+    for r in new_rows:
+        if key(r) not in merged:
+            merged[key(r)] = {**r, "first_seen": time.strftime("%Y-%m-%d", time.gmtime(now))}
+    return sorted(merged.values(), key=lambda r: (r.get("direction", ""), r.get("local", ""), r.get("remote", "")))
+
+
+def save_records(d: Path, recs: list[dict], subject: str | None = None, trailers=None) -> list[dict]:
+    """Evidence into the codex: each record at its stable path (evidence/HOST/KIND/SOURCE), the content as it is
+    (readable in a diff), its id, hash and when it was first seen in the host's index.json. A file changes only when
+    the content does; then it's committed. Returns what changed: [{path, change, id}]."""
+    now = time.time()
+    seen = _seen(d)
+    conn_seen = read_json(d / "runs" / "connections-seen.json", {}) or {}
+    indexes: dict[str, dict] = {}
+    changed = []
+    for rec in recs:
+        rel = _evidence_path(rec)
+        host_dir = rel.split("/")[1]
+        idx = indexes.setdefault(host_dir, read_json(d / "evidence" / host_dir / "index.json", {}) or {})
+        if rec["kind"] == "flows" and rec["source"] == "connections":
+            try:
+                rows = json.loads(rec["content"])
+            except json.JSONDecodeError:
+                rows = []
+            for r in rows:
+                conn_seen[json.dumps([rec["host"], r.get("proto"), r.get("direction"), r.get("local"), r.get("remote"),
+                                      r.get("process")])] = now
+            old = (d / rel).read_text() if (d / rel).exists() else ""
+            text = json.dumps(_merge_connections(old, rows, now), indent=1, sort_keys=True)
+            rec = {**rec, "content": text, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+        name = rel.split("/", 2)[2]
+        prev = idx.get(name)
+        seen[rel] = now
+        if prev and prev.get("sha256") == rec["sha256"]:
+            continue
+        (d / rel).parent.mkdir(parents=True, exist_ok=True)
+        (d / rel).write_text(rec["content"] if rec["content"].endswith("\n") else rec["content"] + "\n")
+        idx[name] = {k: rec[k] for k in ("id", "kind", "host", "source", "site", "sha256") if k in rec}
+        idx[name]["first_seen"] = rec["at"]
+        for k in ("file_sha256", "from_file"):
+            if k in rec:
+                idx[name][k] = rec[k]
+        changed.append({"path": rel, "change": "changed" if prev else "added", "id": rec["id"]})
+    for host_dir, idx in indexes.items():
+        write_json(d / "evidence" / host_dir / "index.json", idx)
+    write_json(d / "runs" / "seen.json", seen)
+    write_json(d / "runs" / "connections-seen.json", conn_seen)
+    if changed:
+        hosts = sorted({c["path"].split("/")[1] for c in changed})
+        codex_commit(d, subject or f"evidence: {len(changed)} changed ({', '.join(hosts)})",
+                     "\n".join(f"{c['change']}: {c['path']}" for c in changed[:200]),
+                     (trailers or []) + [("Evidence", c["id"]) for c in changed[:50]], paths=["evidence"])
+    return changed
+
+
+def _content_hash_ok(text: str, sha: str) -> bool:
+    return hashlib.sha256(text.encode()).hexdigest() == sha or \
+        hashlib.sha256(text.rstrip("\n").encode()).hexdigest() == sha
 
 
 def current_index(d: Path, fresh_days: float | None = None) -> list[dict]:
-    """The evidence that's current: for each (kind, host, source), its newest record, if it's no older than the
-    system's fresh_days (atone.json; default 30). Collecting and importing add to it, run by run."""
-    days = fresh_days if fresh_days is not None else float(read_json(d / "atone.json", {}).get("fresh_days") or 30)
-    cut = time.time() - days * 86400
-    newest: dict[tuple, dict] = {}
-    runs = sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []
-    for run in runs:
-        for e in run_index(d, run):
-            k = (e["kind"], e["host"], e["source"])
-            if e["at"] >= cut and (k not in newest or e["at"] >= newest[k]["at"]):
-                newest[k] = {**e, "run": run}
-    return sorted(newest.values(), key=lambda e: (e["kind"], e["host"], e["source"]))
+    """The evidence in the codex: the latest observed state of each source on each host. Each entry says when it was
+    last collected here (`last_seen`, local; a fresh clone doesn't know, and says so with None)."""
+    seen = _seen(d)
+    out = []
+    for idx_file in sorted((d / "evidence").glob("*/index.json")) if (d / "evidence").is_dir() else []:
+        for name, meta in (read_json(idx_file, {}) or {}).items():
+            rel = f"evidence/{idx_file.parent.name}/{name}"
+            out.append({**meta, "path": rel, "at": seen.get(rel) or meta.get("first_seen"), "last_seen": seen.get(rel)})
+    return sorted(out, key=lambda e: (e["kind"], e["host"], e["source"]))
 
 
-def window_index(d: Path, kinds: tuple, fresh_days: float | None = None) -> list[dict]:
-    """Every record of these kinds within fresh_days, not just the newest: what's been seen over time (each collect
-    snapshots the connections open at that moment; together they're the connections seen)."""
-    days = fresh_days if fresh_days is not None else float(read_json(d / "atone.json", {}).get("fresh_days") or 30)
-    cut = time.time() - days * 86400
-    runs = sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []
-    return [{**e, "run": run} for run in runs for e in run_index(d, run) if e["kind"] in kinds and e["at"] >= cut]
+def load_record(d: Path, entry: dict) -> dict | None:
+    """A piece of evidence from the codex: its content (as hashed: the final newline added on writing taken off if
+    it wasn't part of it), its id, hash and where it came from. `tampered` when the file doesn't match its hash."""
+    p = d / entry["path"]
+    if not p.exists():
+        return None
+    text = p.read_text()
+    for content in (text, text[:-1] if text.endswith("\n") else None):
+        if content is not None and hashlib.sha256(content.encode()).hexdigest() == entry["sha256"]:
+            return {**entry, "content": content}
+    return {**entry, "content": text, "tampered": True}
+
+
+def was_evidence(d: Path, eid: str) -> bool:
+    """Whether an evidence id was ever in the codex (it's in the history, superseded by newer evidence)."""
+    return bool(git(d, "log", "--all", "--format=%h", "-S", eid, "--", "evidence", check=False).stdout.strip())
 
 
 def search_index(d: Path):
     """The current evidence in a full-text index (SQLite FTS5: ranked, with snippets), kept in step: records that
-    are new are added, ones no longer current are dropped. In runs/evidence-index.db; rebuilt from the store if lost."""
+    are new are added, ones no longer current are dropped. In runs/ (local); rebuilt from the codex if lost."""
     import sqlite3
+    (d / "runs").mkdir(exist_ok=True)
     con = sqlite3.connect(d / "runs" / "evidence-index.db")
     con.executescript("CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY);"
                       "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, kind UNINDEXED, host, source, "
@@ -1265,13 +1473,9 @@ def search_evidence(d: Path, query: str, n: int = 20) -> list[dict]:
     return [dict(zip(("id", "kind", "host", "source", "snippet"), h)) for h in hits]
 
 
-def load_record(d: Path, entry: dict) -> dict | None:
-    data = system_store(d).get(entry["key"])
-    return json.loads(gzip.decompress(data)) if data else None
-
-
-def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None = None, log=print) -> str:
-    """Evidence from the built-in collectors: on this host (or each --ssh target), then the AWS calls once."""
+def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None = None, log=print) -> list[dict]:
+    """Evidence from the built-in collectors, on this host (or each --ssh target), then the AWS calls once; what
+    changed is committed to the codex."""
     d = system_dir(name)
     spec = read_json(d / "system.json", {})
     site = read_json(d / "site.json", {})
@@ -1297,43 +1501,48 @@ def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None
         recs.append(make_record(name, "site", socket.gethostname(), f"site command {label}: {cmd}",
                                 text if code == 0 else f"exit code {code}: {text}", site=True,
                                 extra_redact=site.get("redact")))
-    run = save_records(d, recs)
-    log(f"{len(recs)} records in run {run}")
-    return run
+    changed = save_records(d, recs, f"evidence: collected ({', '.join(sorted({r['host'] for r in recs}))})")
+    log(f"{len(recs)} pieces of evidence, {len(changed)} changed since the last collect"
+        + (" (committed)" if changed else ""))
+    return changed
 
 
 def import_results(name: str, files: list[str] | None = None, log=print, eaveswatch: str | None = None,
-                   ew_system: str | None = None, env: str | None = None) -> str:
-    """Scanner results into evidence: the files given, or everything in the system's imports/ folder; or, with
-    `eaveswatch` (its store), what eaveswatch shows about logging."""
+                   ew_system: str | None = None, env: str | None = None) -> list[dict]:
+    """Scanner results into evidence (committed to the codex): the files given, or everything in imports/; or, with
+    `eaveswatch` (its store), what eaveswatch shows about logging. Raw exports stay out of the history (they're
+    archived in the store by hash if the system names one): what's normalized from them goes in."""
     d = system_dir(name)
     site = read_json(d / "site.json", {})
     if eaveswatch:
         recs = [make_record(name, p["kind"], p["host"], p["source"], p["content"], extra_redact=site.get("redact"))
                 for p in import_eaveswatch(eaveswatch, ew_system or name, env)]
-        run = save_records(d, recs)
-        log(f"eaveswatch: {', '.join(r['source'] for r in recs)} (run {run})")
-        return run
-    mappings = []
-    for mp in sorted((d / "imports").glob("*.mapping.json")):
-        m = read_json(mp, {})
-        mappings.append({**m, "_file": mp.name})
+        changed = save_records(d, recs, f"evidence: imported from eaveswatch ({ew_system or name})")
+        log(f"eaveswatch: {', '.join(r['source'] for r in recs)} ({len(changed)} changed)")
+        return changed
+    mappings = [{**read_json(mp, {}), "_file": mp.name} for mp in sorted((d / "mappings" / "scanners").glob("*.mapping.json"))]
     paths = [Path(f) for f in files] if files else sorted(p for p in (d / "imports").iterdir()
-                                                           if p.is_file() and not p.name.endswith(".mapping.json"))
+                                                           if p.is_file() and not p.name.startswith("."))
     if not paths:
         raise AtoneError(f"nothing to import: put scanner exports in {d / 'imports'}, or name them")
+    store = system_store(d)
     recs = []
     for path in paths:
-        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        data = path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        if store:
+            store.put(f"exports/{sha}{path.suffix}", data)
+        n = 0
         for part in import_file(path, mappings):
             rec = make_record(name, part["kind"], part["host"], part["source"], part["content"],
                               extra_redact=site.get("redact"))
-            rec["file_sha256"] = sha                     # the export it came from, as it was
+            rec.update(file_sha256=sha, from_file=path.name)           # the export it came from, as it was
             recs.append(rec)
-        log(f"{path.name}: {sum(1 for r in recs if r['file_sha256'] == sha)} hosts")
-    run = save_records(d, recs)
-    log(f"{len(recs)} records in run {run}")
-    return run
+            n += 1
+        log(f"{path.name}: {n} hosts")
+    changed = save_records(d, recs, f"evidence: imported {', '.join(p.name for p in paths)}")
+    log(f"{len(recs)} pieces of evidence, {len(changed)} changed" + (" (committed)" if changed else ""))
+    return changed
 
 
 # ---- checks: control mappings (data the ISSE owns), the check engine, verifying a narrative's citations
@@ -1357,7 +1566,7 @@ NOT_READ = re.compile(r"^(not collected|not readable here|.*: not installed here
 def load_mappings(d: Path) -> dict[str, dict]:
     """{control id: mapping} from the system's mappings/ folder (a file may hold one mapping or a list)."""
     out = {}
-    for p in sorted((d / "mappings").rglob("*.json")):
+    for p in sorted((d / "mappings" / "controls").rglob("*.json")):
         data = read_json(p, [])
         for m in data if isinstance(data, list) else [data]:
             if isinstance(m, dict) and m.get("control"):
@@ -1547,10 +1756,71 @@ def run_check(c: dict, recs: list[dict], ctl_id: str, values: dict) -> dict:
     return out
 
 
+def control_path(d: Path, cid: str) -> Path:
+    return d / "controls" / f"{cid}.json"
+
+
+def load_controls(d: Path) -> dict[str, dict]:
+    """The model's controls: {id: what the codex says of it} (status and checks from atone's checks; the statement
+    and its review from people and the agent)."""
+    out = {}
+    for p in sorted((d / "controls").glob("*.json")) if (d / "controls").is_dir() else []:
+        c = read_json(p, {}) or {}
+        if c.get("control"):
+            out[c["control"]] = c
+    return out
+
+
+def save_control(d: Path, cid: str, data: dict) -> bool:
+    """Write a control's file if it changed; whether it did."""
+    path = control_path(d, cid)
+    if read_json(path, None) == data:
+        return False
+    write_json(path, data)
+    return True
+
+
+def approved_schedule(d: Path) -> dict:
+    """POA&M dates a person approved (decisions/poam-schedule.json: {item key: date}); none are made up."""
+    return (read_json(d / "decisions" / "poam-schedule.json", {}) or {}).get("dates") or {}
+
+
+def sync_poam(d: Path) -> tuple[list, list]:
+    """The POA&M in the codex: a file per weakness (poam/KEY.json). New ones are opened, with their evidence; open
+    ones whose finding isn't in the evidence any more are marked as looking closed (a person closes them: atone
+    decide SYSTEM poam-close). Returns (opened, look closed)."""
+    items = {it["key"]: it for it in poam_items(d)}
+    opened, gone = [], []
+    have = {}
+    for p in sorted((d / "poam").glob("*.json")) if (d / "poam").is_dir() else []:
+        x = read_json(p, {}) or {}
+        if x.get("key"):
+            have[x["key"]] = (p, x)
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    for key, it in items.items():
+        if key in have:
+            p, x = have[key]
+            if x.get("evidence_says"):                 # back in the evidence: no longer looks closed
+                x.pop("evidence_says")
+                write_json(p, x)
+            continue
+        write_json(d / "poam" / f"{slug(key, 120)}.json", {**{k: it[k] for k in ("key", "weakness", "description",
+                    "control", "severity", "source", "asset", "evidence")}, "detected": it["detected"] or today,
+                    "opened": today, "status": "open"})
+        opened.append(it)
+    for key, (p, x) in have.items():
+        if x.get("status") == "open" and key not in items and not x.get("evidence_says"):
+            x["evidence_says"] = f"not in the evidence since {today}: it looks closed (a person decides)"
+            write_json(p, x)
+            gone.append(x)
+    return opened, gone
+
+
 def check_system(name: str, log=print) -> dict:
     """Every control in the system's baseline, against its mapping and the current evidence: per control, its checks'
-    results, a status (met, partly, not met, unknown, inherited), and what a person must supply. Written to
-    runs/checks-STAMP.json (and runs/checks-latest.json)."""
+    results, a status (met, partly, not met, unknown, inherited), and what a person must supply. Each control's
+    file in controls/ is updated (its statement and review kept), the POA&M synced, and what changed committed, each
+    status change a trailer. (runs/checks-latest.json keeps this run's results locally.)"""
     d = system_dir(name)
     spec = read_json(d / "system.json", {})
     ctls = system_controls(d)
@@ -1591,10 +1861,147 @@ def check_system(name: str, log=print) -> dict:
     counts = {s: sum(1 for r in results.values() if r["status"] == s) for s in STATUSES}
     out = {"system": name, "at": time.time(), "controls": results, "counts": counts,
            "evidence": len(index), "atone": __version__}
-    write_json(d / "runs" / f"checks-{stamp()}.json", out)
     write_json(d / "runs" / "checks-latest.json", out)
-    log(", ".join(f"{v} {k}" for k, v in counts.items()) + f" ({len(results)} controls, {len(index)} pieces of evidence)")
+    before = load_controls(d)
+    changes = []
+    for cid, entry in results.items():
+        old = before.get(cid) or {}
+        new = {**entry, **({"statement": old["statement"]} if old.get("statement") else {})}
+        if save_control(d, cid, new) and old.get("status") != entry["status"]:
+            changes.append((cid, old.get("status") or "new", entry["status"]))
+    for cid in set(before) - set(results):           # tailored out: its file goes (the history keeps it)
+        control_path(d, cid).unlink()
+        changes.append((cid, before[cid].get("status"), "removed"))
+    first = not before
+    real = [c for c in changes if not (c[1] == "new" and c[2] == "unknown")]    # a new control nothing says about yet
+    codex_commit(d, f"checks: the first assessment ({len(results)} controls)" if first else
+                 f"checks: {len(real)} control status changes" if real else "checks: details updated",
+                 ", ".join(f"{k} {v}" for k, v in counts.items() if v),
+                 [("Status", f"{c} {a} -> {b}") for c, a, b in real[:100]], paths=["controls"])
+    opened, gone = sync_poam(d)
+    if opened or gone:
+        codex_commit(d, f"poam: {len(opened)} opened" + (f", {len(gone)} look closed" if gone else ""),
+                     "\n".join([f"opened: {i['weakness']} on {i['asset']} ({i['severity']})" for i in opened]
+                               + [f"looks closed: {x['weakness']} on {x['asset']}" for x in gone]),
+                     [("Evidence", i["evidence"]) for i in opened[:50]], paths=["poam"])
+    log(", ".join(f"{v} {k}" for k, v in counts.items()) + f" ({len(results)} controls, {len(index)} pieces of evidence)"
+        + (f"; {len(changes)} status changes" if changes else "") + (f"; POA&M: {len(opened)} opened" if opened else ""))
     return out
+
+
+def save_statement(d: Path, verified: dict) -> str | None:
+    """A verified narrative into its control's file (as drafted: a person reviews it with atone review), committed
+    with the evidence it cites."""
+    cid = verified["control"]
+    ctl = read_json(control_path(d, cid), None) or {"control": cid}
+    who = f"hobkin {os.environ['HOBKIN_ID']}" if os.environ.get("HOBKIN_ID") else \
+        (git(d, "config", "user.name", check=False).stdout.strip() or "someone")
+    ctl["statement"] = {"text": verified["statement"], "claims": verified["claims"], "dropped": verified["dropped"],
+                        "coverage": verified["coverage"], "drafted_by": who,
+                        "drafted_at": time.strftime("%Y-%m-%d", time.gmtime()), "reviewed_by": None, "reviewed_at": None}
+    if not save_control(d, cid, ctl):
+        return None
+    cites = sorted({c["evidence"] for cl in verified["claims"] for c in cl.get("cites") or []})
+    cov = verified["coverage"]
+    return codex_commit(d, f"{ctl.get('label', cid.upper())}: implementation statement drafted",
+                        f"{cov['evidence']} claims on evidence, {cov['person']} on a person's word, {cov['dropped']} "
+                        "dropped by verify.", [("Control", cid)] + [("Evidence", e) for e in cites],
+                        paths=[str(control_path(d, cid).relative_to(d))])
+
+
+def review_statements(d: Path, cids: list[str], by: str) -> str | None:
+    """A person's review of drafted statements: who, and when, committed (Reviewed-by)."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    done = []
+    for cid in cids:
+        ctl = read_json(control_path(d, cid), None)
+        if not ctl or not ctl.get("statement"):
+            raise AtoneError(f"{cid} has no drafted statement to review")
+        ctl["statement"].update(reviewed_by=by, reviewed_at=today)
+        save_control(d, cid, ctl)
+        done.append(ctl.get("label", cid))
+    return codex_commit(d, f"review: {', '.join(done)}", f"Reviewed by {by}.",
+                        [("Reviewed-by", by)] + [("Control", c) for c in cids], paths=["controls"])
+
+
+DECISION_KINDS = ("risk-acceptance", "deviation", "false-positive", "tailoring", "poam-schedule", "poam-close", "other")
+
+
+def decide(d: Path, kind: str, what: str, by: str, controls: list[str] | None = None, until: str | None = None,
+           from_file: str | None = None, items: list[str] | None = None) -> str | None:
+    """A person's decision, recorded and committed with who and why (Decided-by): a risk acceptance, a deviation, a
+    false positive, a tailoring change; an approved POA&M schedule (from the agent's proposal, --from); closing POA&M
+    items (--item)."""
+    if kind not in DECISION_KINDS:
+        raise AtoneError(f"a decision is one of: {', '.join(DECISION_KINDS)}")
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    rec = {"kind": kind, "what": what, "by": by, "at": today, "controls": controls or [], "until": until}
+    paths = ["decisions"]
+    if kind == "poam-schedule":
+        dates = read_json(Path(from_file or d / "drafts" / "poam-schedule.json"), None)
+        if not isinstance(dates, dict) or not dates:
+            raise AtoneError("an approved schedule needs the proposed one: --from FILE ({item key: date})")
+        write_json(d / "decisions" / "poam-schedule.json", {**rec, "dates": dates})
+    else:
+        if kind == "poam-close":
+            if not items:
+                raise AtoneError("poam-close needs --item KEY (one or more)")
+            for p in sorted((d / "poam").glob("*.json")):
+                x = read_json(p, {}) or {}
+                if x.get("key") in items or p.stem in items:
+                    x.update(status="closed", closed=today, closed_by=by, closed_because=what)
+                    write_json(p, x)
+            paths.append("poam")
+        write_json(d / "decisions" / f"{today}-{kind}-{slug(what, 40)}.json", rec)
+    return codex_commit(d, f"decision: {kind}: {clip_text(what, 60)}", what,
+                        [("Decided-by", by)] + [("Control", c) for c in controls or []] + [("Kind", kind)], paths=paths)
+
+
+def history(d: Path, control: str | None = None, path: str | None = None, since: str | None = None,
+            n: int = 50) -> list[dict]:
+    """The codex's history, newest first: each commit's date, author, subject and trailers. For one control: the
+    commits that name it (a Control trailer) or touched its file; for a path (evidence/HOST...); since a date."""
+    fmt = "--format=%h%x1f%an%x1f%aI%x1f%s%x1f%(trailers:unfold=true,separator=%x1d)%x1e"
+    base = ["log", f"-n{n}", fmt] + ([f"--since={since}"] if since else [])
+    runs = []
+    if control:
+        runs.append(base + [f"--grep=^Control: {control}$"])
+        runs.append(base + ["--", str(control_path(d, control).relative_to(d))])
+    else:
+        runs.append(base + (["--", path] if path else []))
+    found = {}
+    for args in runs:
+        for rec in git(d, *args, check=False).stdout.split("\x1e"):
+            f = rec.strip("\n").split("\x1f")
+            if len(f) >= 5:
+                found[f[0]] = {"commit": f[0], "author": f[1], "at": f[2], "subject": f[3],
+                               "trailers": [t for t in f[4].split("\x1d") if t.strip()]}
+    return sorted(found.values(), key=lambda c: c["at"], reverse=True)[:n]
+
+
+def package(name: str, tag: str, note: str = "", log=print) -> Path:
+    """What's delivered, kept: the workbooks filled, the diagrams, OSCAL and the report into packages/TAG/,
+    committed and tagged, so the history holds exactly what went out."""
+    d = system_dir(name)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}", tag):
+        raise AtoneError(f"not a tag: {tag!r}")
+    if git(d, "rev-parse", "-q", "--verify", f"refs/tags/{tag}", check=False).returncode == 0:
+        raise AtoneError(f"{tag} is taken: a package is never replaced")
+    out = d / "packages" / tag
+    out.mkdir(parents=True, exist_ok=True)
+    if any((d / "workbooks").glob("*.xlsx")):
+        fill_workbooks(name, out, log=log)
+    draw_system(name, out, log=log)
+    write_oscal(name, out / "oscal", log=log)
+    report(name, out, log=log)
+    codex_commit(d, f"package: {tag}", note or f"The package delivered as {tag}.", [("Package", tag)],
+                 paths=[str(out.relative_to(d))])
+    git(d, *_ident(d), "tag", "-a", tag, "-m", note or f"atone package {tag}")
+    log(f"{tag}: {out} (committed and tagged)")
+    return out
+
+
+
 
 
 def _norm(text: str) -> str:
@@ -1606,11 +2013,6 @@ def verify_narrative(d: Path, draft: dict) -> dict:
     content contains the words it quotes. A claim from a person cites who and when instead ({"person": ...}). Claims
     that don't hold are dropped, with why; the statement is rebuilt from what's left."""
     index = {e["id"]: e for e in current_index(d)}
-    superseded = {}
-    for run in sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []:
-        for e in run_index(d, run):
-            if e["id"] not in index:
-                superseded[e["id"]] = e
     kept, dropped = [], []
     for claim in draft.get("claims") or []:
         text, cites = (claim.get("text") or "").strip(), claim.get("cites") or []
@@ -1621,11 +2023,11 @@ def verify_narrative(d: Path, draft: dict) -> dict:
         for cite in cites:
             e = index.get(cite.get("evidence"))
             if not e:
-                why = (f"{cite.get('evidence')} has been superseded by newer evidence" if cite.get("evidence") in superseded
-                       else f"no evidence {cite.get('evidence')!r}")
+                why = (f"{cite.get('evidence')} has been superseded by newer evidence"
+                       if cite.get("evidence") and was_evidence(d, cite["evidence"]) else f"no evidence {cite.get('evidence')!r}")
                 break
             rec = load_record(d, e)
-            if not rec or not check_record(rec):
+            if not rec or rec.get("tampered") or not check_record(rec):
                 why = f"{e['id']} doesn't match its hash"
                 break
             if not cite.get("quote") or _norm(cite["quote"]) not in _norm(rec["content"]):
@@ -1939,7 +2341,7 @@ def plan_ssp(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
     flags). What's already filled in is kept; where the evidence disagrees with it, that's a flag, not an edit."""
     sheet, hdr = mapping["sheet"], int(mapping.get("header_row", 1))
     cols = resolve_columns(wb, sheet, hdr, mapping["columns"])
-    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    checks = load_controls(d)
     edits, changes, flags = {}, [], []
     probs = check_status_values(wb, sheet, f"{cols['status']}{hdr + 1}", mapping) if "status" in cols else []
     if probs:
@@ -1962,7 +2364,8 @@ def plan_ssp(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
         if not cid:
             continue
         res = checks.get(cid)
-        draft = read_json(d / "drafts" / "verified" / f"{cid}.json", None)
+        st = (res or {}).get("statement")
+        draft = {"statement": st["text"], "claims": st["claims"], "reviewed_by": st.get("reviewed_by")} if st else None
         ev = sorted({e for c in (res or {}).get("checks") or [] for e in c.get("evidence") or []})
         if res and "status" in cols:
             v = _status_value(mapping, res["status"])
@@ -1972,7 +2375,8 @@ def plan_ssp(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
         if "statement" in cols:
             if draft and draft.get("statement"):
                 cites = sorted({c["evidence"] for cl in draft["claims"] for c in cl.get("cites") or []})
-                setcell(f"{cols['statement']}{rown}", draft["statement"], "a verified narrative", cites)
+                setcell(f"{cols['statement']}{rown}", draft["statement"], "a verified narrative" + (
+                    f", reviewed by {draft['reviewed_by']}" if draft.get("reviewed_by") else ", not yet reviewed"), cites)
             elif res and res["status"] == "inherited":
                 prov = (res.get("provider") or {}).get("from") or "the provider"
                 setcell(f"{cols['statement']}{rown}", f"Inherited from {prov}.", "inherited, per the system's tailoring")
@@ -2021,8 +2425,8 @@ def poam_items(d: Path) -> list[dict]:
 
 def plan_poam(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
     """New POA&M rows for what's open and not on it yet (each with its evidence), and flags for rows still open whose
-    finding isn't in the latest evidence. Dates come from the schedule a person approved (drafts/poam-schedule.json:
-    {key: date}); none are made up."""
+    finding isn't in the latest evidence. Dates come from the schedule a person approved (atone decide ... poam-schedule);
+    none are made up."""
     sheet, hdr = mapping["sheet"], int(mapping.get("header_row", 1))
     cols = resolve_columns(wb, sheet, hdr, mapping["columns"])
     probs = check_status_values(wb, sheet, f"{cols['status']}{hdr + 1}", mapping) if "status" in cols else []
@@ -2031,7 +2435,7 @@ def plan_poam(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
     rows = {r: c for r, c in wb.rows(sheet).items() if r > hdr}
     have = {(str(c.get(cols.get("weakness", ""), "")).strip().lower(), str(c.get(cols.get("asset", ""), "")).strip().lower()): r
             for r, c in rows.items()}
-    schedule = read_json(d / "drafts" / "poam-schedule.json", {}) or {}
+    schedule = approved_schedule(d)
     items = poam_items(d)
     last = max(rows) if rows else hdr
     styles = {col: (wb.cells(sheet).get(f"{col}{last}") or {}).get("style") for col in cols.values()}
@@ -2069,16 +2473,17 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
     """Fill copies of the system's working documents (workbooks/*.xlsx, each with its WORKBOOK.mapping.json) into
     `out`, with a NAME.changes.json beside each: every change (cell, was, now, why, evidence) and every flag."""
     d = system_dir(name)
-    mappings = [{**read_json(p, {}), "_file": p.name} for p in sorted((d / "workbooks").glob("*.mapping.json"))]
+    mappings = [{**read_json(p, {}), "_file": p.name} for p in sorted((d / "mappings" / "workbooks").glob("*.mapping.json"))]
     paths = [Path(f) for f in files] if files else sorted((d / "workbooks").glob("*.xlsx"))
     if not paths:
-        raise AtoneError(f"no working documents: put them in {d / 'workbooks'} (with a mapping each: atone workbook "
-                         f"inspect FILE shows what to map)")
+        raise AtoneError(f"no working documents: put them in {d / 'workbooks'} (with a mapping each in "
+                         f"mappings/workbooks/: atone workbook inspect FILE shows what to map)")
     reports = []
     for path in paths:
         m = next((m for m in mappings if fnmatch.fnmatch(path.name, m.get("match") or "")), None)
         if not m:
-            raise AtoneError(f"{path.name}: no template mapping matches it (workbooks/NAME.mapping.json, \"match\": a glob)")
+            raise AtoneError(f"{path.name}: no template mapping matches it (mappings/workbooks/NAME.mapping.json, "
+                             "\"match\": a glob)")
         wb = Workbook(path)
         styles = None
         if m.get("kind") == "poam":
@@ -2381,7 +2786,7 @@ def build_graph(name: str) -> dict:
     import ipaddress
     d = system_dir(name)
     spec = read_json(d / "system.json", {})
-    documented = read_json(d / "documented.json", []) or []
+    documented = read_json(d / "interfaces.json", []) or []
     index = current_index(d)
     nodes, addr, comp_of = {}, {}, {}
 
@@ -2404,8 +2809,7 @@ def build_graph(name: str) -> dict:
             addr[a] = hn
             n["addresses"].append(a)
     listening = {}                                        # host -> {(proto, port)}
-    over_time = window_index(d, ("listeners", "flows"))   # every snapshot in the window, not just the newest
-    for e in over_time:
+    for e in index:
         if e["kind"] == "listeners":
             node(e["host"], inside=True, component=comp_of.get(e["host"]))
             for r in _json_content(d, e) or []:
@@ -2523,20 +2927,30 @@ def build_graph(name: str) -> dict:
                  "configured", evidence=t["lb"]["evidence"],
                  config={"file": f"target group {t['group']}", "line": 0, "quote": f"target {t['target_id']} port "
                          f"{t['port']} ({t['health'] or '?'})", "how": "a load balancer's target group"})
-    # actual: connections seen, in any snapshot in the window (inbound to a listening port, else outbound)
-    for e in over_time:
+    # actual: the connections seen on each host (a set that grows in the codex). Where this machine has seen
+    # collects, one last seen longer ago than fresh_days doesn't count as seen now (a fresh clone can't tell, so
+    # everything in the codex counts)
+    days = float(read_json(d / "atone.json", {}).get("fresh_days") or 30)
+    conn_seen = read_json(d / "runs" / "connections-seen.json", {}) or {}
+    for e in index:
         if e["kind"] != "flows":
             continue
         for r in _json_content(d, e) or []:
-            lip, _, lport = r["local"].rpartition(":")
-            rip, _, rport = r["remote"].rpartition(":")
-            if rip.startswith("127.") or rip in ("::1", "0.0.0.0") or not rport:
+            if not isinstance(r, dict) or "direction" not in r:
+                continue
+            last = conn_seen.get(json.dumps([e["host"], r.get("proto"), r.get("direction"), r.get("local"),
+                                             r.get("remote"), r.get("process")]))
+            if last and time.time() - last > days * 86400:
                 continue
             proto = r.get("proto", "tcp")
-            if (proto, int(lport)) in listening.get(e["host"], set()):
-                edge(peer(rip), e["host"], f"{proto}/{lport}", "actual", process=r.get("process"), evidence=e["id"])
+            if r["direction"] == "in":
+                port = r["local"].rpartition(":")[2]
+                edge(peer(r["remote"]), e["host"], f"{proto}/{port}", "actual", process=r.get("process"),
+                     evidence=e["id"], first_seen=r.get("first_seen"))
             else:
-                edge(e["host"], peer(rip), f"{proto}/{rport}", "actual", process=r.get("process"), evidence=e["id"])
+                rip, _, rport = r["remote"].rpartition(":")
+                edge(e["host"], peer(rip), f"{proto}/{rport}", "actual", process=r.get("process"), evidence=e["id"],
+                     first_seen=r.get("first_seen"))
     # configured: what the hosts' config files say they connect to (and listen on): the intentional connections
     by_name = {}
     for nid, n in list(nodes.items()):
@@ -2576,7 +2990,7 @@ def build_graph(name: str) -> dict:
             nodes[src].setdefault("configured_listens", [])
             if l["port"] not in nodes[src]["configured_listens"]:
                 nodes[src]["configured_listens"].append(l["port"])
-    # documented: the flows the SSP describes (documented.json, reviewed by a person)
+    # documented: the flows the SSP describes (interfaces.json, reviewed by a person)
     hosts_of = {c.get("name"): c.get("hosts") or [] for c in spec.get("components") or []}
     for f in documented:                                # a component stands for each of its hosts
         for src in hosts_of.get(f.get("from")) or [f.get("from")]:
@@ -2930,7 +3344,7 @@ def plan(name: str) -> dict:
     spec = read_json(d / "system.json", {})
     tail = read_json(d / "tailoring.json", {})
     index = current_index(d)
-    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    checks = load_controls(d)
     items = []
 
     def item(iid, who, what, done, unblocks="", control=None):
@@ -2943,7 +3357,7 @@ def plan(name: str) -> dict:
     for wb in wbs:
         item(f"mapping:{wb.name}", "hobkin", f"a template mapping for {wb.name} (atone workbook inspect), confirmed "
              "by the ISSE", any(fnmatch.fnmatch(wb.name, (read_json(m, {}) or {}).get("match") or "")
-                                for m in (d / "workbooks").glob("*.mapping.json")), f"filling {wb.name}")
+                                for m in (d / "mappings" / "workbooks").glob("*.mapping.json")), f"filling {wb.name}")
     item("baseline", "person", f"confirm the baseline ({tail.get('baseline', 'moderate')}) and tailoring: controls "
          "added or removed, parameter values (tailoring.json: set \"confirmed\" to who and when)",
          tail.get("confirmed"), "checks against the right controls")
@@ -2956,8 +3370,8 @@ def plan(name: str) -> dict:
     item("spec", "hobkin", "the system spec (system.json) from `atone discover`: hosts, components, the config files "
          "that define their connections; reviewed by the ISSE", spec.get("hosts") and spec.get("reviewed"),
          "collecting the right evidence")
-    item("documented", "hobkin", "the documented flows (documented.json), from the SSP's boundary and data flow "
-         "sections; reviewed by the ISSE", (d / "documented.json").exists(), "the architecture's documented layer")
+    item("documented", "hobkin", "the intended flows (interfaces.json), from the SSP's boundary and data flow "
+         "sections; reviewed by the ISSE", bool(read_json(d / "interfaces.json", [])), "the architecture's documented layer")
     seen_hosts = {e["host"] for e in index if e["kind"] in LOCAL_KINDS}
     for h in spec.get("hosts") or []:
         hn = h if isinstance(h, str) else h.get("name")
@@ -2989,11 +3403,17 @@ def plan(name: str) -> dict:
                  False, f"{r['label']}'s narrative", cid)
         if r["status"] != "inherited" and r["status"] != "unknown":
             item(f"narrative:{cid}", "hobkin", f"{r['label']}: a narrative, every claim cited (atone verify)",
-                 (d / "drafts" / "verified" / f"{cid}.json").exists(), f"{r['label']} in the SSP", cid)
+                 bool(r.get("statement")), f"{r['label']} in the SSP", cid)
+            if r.get("statement") and not r["statement"].get("reviewed_by"):
+                item(f"review:{cid}", "person", f"{r['label']}: review the drafted statement (atone review "
+                     f"{name} {cid} --by NAME)", False, f"{r['label']} in the SSP", cid)
     if any(r["status"] in ("not met", "partly") for r in checks.values()) or any(e["kind"] == "scan" for e in index):
-        item("schedule", "hobkin", "a POA&M schedule (drafts/poam-schedule.json): realistic dates, with margin for the "
-             "ISSE and DevOps to review and do the work; approved by a person", (d / "drafts" / "poam-schedule.json").exists(),
-             "dates on the POA&M")
+        item("schedule", "hobkin", "a proposed POA&M schedule (drafts/poam-schedule.json): realistic dates, with margin "
+             "for the ISSE and DevOps to review and do the work", (d / "drafts" / "poam-schedule.json").exists()
+             or bool(approved_schedule(d)), "dates on the POA&M")
+        if (d / "drafts" / "poam-schedule.json").exists():
+            item("schedule-approved", "person", f"approve the POA&M schedule (atone decide {name} poam-schedule "
+                 "--from drafts/poam-schedule.json --by NAME)", bool(approved_schedule(d)), "dates on the POA&M")
     out = {"system": name, "at": time.time(), "items": items,
            "open": {w: sum(1 for i in items if i["who"] == w and not i["done"]) for w in ("hobkin", "access", "person")},
            "done": sum(1 for i in items if i["done"])}
@@ -3025,7 +3445,10 @@ def due(name: str) -> list[str]:
     if now - checked > duration(cad["check"]) or (checked and newest > checked):
         out.append(f"check: {'new evidence since the last check' if checked and newest > checked else 'due'}: "
                    f"atone check {name}, then atone plan {name}")
-    if now - (conmon.stat().st_mtime if conmon.exists() else 0) > duration(cad["conmon"]):
+    tagged = git(d, "for-each-ref", "--sort=-creatordate", "--format=%(creatordate:unix)", "refs/tags/conmon*",
+                 check=False).stdout.split()
+    last_conmon = max([conmon.stat().st_mtime if conmon.exists() else 0] + [float(t) for t in tagged[:1]])
+    if now - last_conmon > duration(cad["conmon"]):
         out.append(f"conmon: the monthly continuous monitoring package (every {cad['conmon']}): your atone-conmon skill")
     return out
 
@@ -3041,12 +3464,12 @@ def report(name: str, out: Path, conmon: bool = False, log=print) -> Path:
     d = system_dir(name)
     out.mkdir(parents=True, exist_ok=True)
     p = plan(name)
-    checks = read_json(d / "runs" / "checks-latest.json", {}) or {}
-    ctl = checks.get("controls") or {}
+    ctl = load_controls(d)
+    checks = {"counts": {st: sum(1 for c in ctl.values() if c.get("status") == st) for st in STATUSES}}
     index = current_index(d)
     by_id = {e["id"]: e for e in index}
-    verified = {v.stem: read_json(v, {}) for v in (d / "drafts" / "verified").glob("*.json")} \
-        if (d / "drafts" / "verified").is_dir() else {}
+    verified = {cid: {"statement": c["statement"]["text"], "coverage": c["statement"]["coverage"],
+                      "reviewed_by": c["statement"].get("reviewed_by")} for cid, c in ctl.items() if c.get("statement")}
     graph = read_json(d / "runs" / "graph-latest.json", None)
     fills = [read_json(f, {}) for f in sorted((d / "runs").glob("fill-*.changes.json"))]
     cov = {k: sum(v.get("coverage", {}).get(k, 0) for v in verified.values()) for k in ("evidence", "person", "dropped")}
@@ -3099,11 +3522,18 @@ def report(name: str, out: Path, conmon: bool = False, log=print) -> Path:
             f"{_h((by_id.get(q['evidence']) or {}).get('sha256', '')[:16])}</small></details>"
             for q in x.get("quotes") or []) + "</div>" for x in c.get("checks") or []) or _h(c.get("why", ""))
         v = verified.get(c["control"])
-        narr = (_h(v["statement"]) + (f"<br><small>{v['coverage']['dropped']} claims dropped</small>"
-                                      if v["coverage"]["dropped"] else "")) if v else ""
+        narr = (_h(v["statement"]) + "<br><small>" + (f"reviewed by {_h(v['reviewed_by'])}" if v.get("reviewed_by")
+                                                       else "<b>not yet reviewed</b>")
+                + (f"; {v['coverage']['dropped']} claims dropped" if v["coverage"]["dropped"] else "") + "</small>") if v else ""
         h.append(f"<tr><td><b>{_h(c['label'])}</b><br>{_h(c['title'])}</td><td class='{c['status'].replace(' ', '-')}'>"
                  f"{_h(c['status'])}</td><td>{checks_html}</td><td>{narr}</td></tr>")
-    h.append("</table></main>")
+    h.append("</table>")
+    hist = history(d, n=25)
+    if hist:
+        h.append("<h2>Recent history</h2><table><tr><th>When</th><th>Who</th><th>What</th></tr>" + "".join(
+            f"<tr><td>{_h(c['at'][:16].replace('T', ' '))}</td><td>{_h(c['author'])}</td><td>{_h(c['subject'])}"
+            + "".join(f"<br><small>{_h(t)}</small>" for t in c["trailers"][:6]) + "</td></tr>" for c in hist) + "</table>")
+    h.append("</main>")
     dest = out / "report.html"
     dest.write_text("\n".join(h))
     if conmon:
@@ -3146,7 +3576,7 @@ def oscal_ssp(name: str) -> dict:
     d = system_dir(name)
     spec = read_json(d / "system.json", {})
     tail = read_json(d / "tailoring.json", {})
-    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    checks = load_controls(d)
     graph = read_json(d / "runs" / "graph-latest.json", None)
     this = _uuid(name, "this-system")
     comps = [{"uuid": this, "type": "this-system", "title": name, "description": spec.get("description") or
@@ -3168,7 +3598,8 @@ def oscal_ssp(name: str) -> dict:
                           **({"implemented-components": impl} if impl else {})})
     reqs = []
     for cid, r in checks.items():
-        v = read_json(d / "drafts" / "verified" / f"{cid}.json", None)
+        st = r.get("statement") or {}
+        v = {"statement": st.get("text")} if st else None
         req = {"uuid": _uuid(name, "req", cid), "control-id": cid}
         props = [{"name": "atone-status", "ns": ATONE_NS, "value": r["status"].replace(" ", "-")}]
         if r["status"] == "inherited":
@@ -3210,7 +3641,7 @@ def oscal_results(name: str) -> dict:
     """Assessment results: one result for the latest checks, an observation per check (with the evidence it read:
     ids and hashes) and a finding per control that has checks."""
     d = system_dir(name)
-    res = read_json(d / "runs" / "checks-latest.json", {}) or {}
+    res = {"controls": load_controls(d), "at": (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("at")}
     by_id = {e["id"]: e for e in current_index(d)}
     obs, finds = [], []
     for cid, r in (res.get("controls") or {}).items():
@@ -3245,7 +3676,7 @@ def oscal_poam(name: str) -> dict:
     """The POA&M: an item per open finding (imported findings, failed OpenSCAP rules), each with its observation and
     the evidence it came from."""
     d = system_dir(name)
-    schedule = read_json(d / "drafts" / "poam-schedule.json", {}) or {}
+    schedule = approved_schedule(d)
     by_id = {e["id"]: e for e in current_index(d)}
     items, obs = [], []
     for it in poam_items(d):
@@ -3316,6 +3747,21 @@ says on trust, so being right matters more than being complete: when in doubt, s
 - **People decide.** The ISSE owns the system spec and the mappings; the ISSO owns the package. You draft, prove,
   and propose.
 
+## The codex
+
+Everything about {{system}} lives in its codex, a git repository at `~/atone/systems/{{system}}` (its CODEX.md says
+what's where), and its history is the system's security history. So:
+
+- **atone commits what it does** (evidence, checks, the POA&M, verified statements, packages), with trailers saying
+  what and why. Commit your own edits (the system spec, mappings, interfaces, drafts) with `atone commit {{system}}
+  "what and why"`: it marks them as yours (Drafted-by) and refuses anything secret.
+- **Draft on a branch:** `git -C ~/atone/systems/{{system}} switch -c drafts/WHAT` before drafting statements,
+  mappings or a schedule; push it to the team's git server and ask for a review. Merging is approval: never merge
+  your own work into main.
+- **People review and decide through atone:** `atone review {{system}} CONTROL --by NAME`, `atone decide {{system}}
+  KIND "what and why" --by NAME`. Tell them the exact command; never run these for them.
+- **Keep it in step:** `git pull` before you start, push when you're done (on a branch).
+
 ## The plan comes first
 
 `atone plan {{system}}` works out every piece of the effort, and who can do it: you, access you need, or a person.
@@ -3327,7 +3773,8 @@ documents, the inherited-controls matrix, example narratives, and access.
 ## The cadence
 
 Your watch runs `atone due {{system}}` every hour and wakes you only when something's due: collecting (daily),
-checking (weekly, and after new evidence), and the monthly continuous monitoring package (your atone-conmon skill).
+checking (weekly, and after new evidence), and the monthly continuous monitoring package (your atone-conmon skill:
+it ends with `atone package {{system}} --tag conmon-YYYY-MM`, which is how the next month knows it's done).
 After each: `atone plan {{system}}`, and tell your people what changed and what you need.
 
 ## Your skills
@@ -3347,7 +3794,7 @@ SKILLS = {
    ask which to use, `lorewell build` them into a private lore here, and never send them anywhere else.
 4. What you learn about the system and its people (voice, quirks, owners) goes in your field lore; the mappings
    don't: they're files the ISSE reviews."""),
-    "atone-system-spec": ("Draft the system spec (system.json) and the documented flows (documented.json) for the "
+    "atone-system-spec": ("Draft the system spec (system.json) and the intended flows (interfaces.json) for the "
                           "ISSE to review.", """
 1. `atone discover {{system}}` (with `--ssh USER@HOST` for each host you have access to). Read discovery.json.
 2. In system.json: the hosts (name, addresses, other `names` it's known by), the components (which hosts run them;
@@ -3361,30 +3808,34 @@ SKILLS = {
    directives), with the line. Where a product's format hides a connection from them, add a pattern to that file's
    entry: `"connects": [{"pattern": "a regex with named groups host and port", "about": "what it is"}]` (or
    `"listens": true` with a port group), and check it finds what it should.
-4. In documented.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
+4. In interfaces.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
    component name (or "internet"). Quote the SSP's section for each in "about".
-5. Ask the ISSE to review both; when they have, set `"reviewed": "who, when"` in system.json."""),
+5. Commit them on a branch (`atone commit {{system}} "the system spec, from discovery"`) and ask the ISSE to review
+   them; when they have, they set `"reviewed": "who, when"` in system.json and merge."""),
     "atone-mappings": ("Draft control mappings, scanner mappings and workbook template mappings: data the ISSE "
                        "owns, run by atone's code.", """
-- **Control mappings** (mappings/*.json): for each control, the evidence that bears on it (`kind` from atone's menu,
+- **Control mappings** (mappings/controls/*.json): for each control, the evidence that bears on it (`kind` from atone's menu,
   `source` as a glob, `component`), checks (`present`, `absent`, `value` with `op` against a value or `{param:ID}`,
   `count` with `field_patterns`, `scan`, `findings`, `exists`), and `needs_person` (what only a person can supply).
-  Start from mappings/starter.json; look the control up in the controls lore (its objective says what to check).
+  Start from mappings/controls/starter.json; look the control up in the controls lore (its objective says what to check).
   `atone mappings {{system}}` shows what's wrong with any.
-- **Scanner mappings** (imports/TOOL.mapping.json): `atone import {{system}} --sample FILE` shows the columns; map
+- **Scanner mappings** (mappings/scanners/TOOL.mapping.json): `atone import {{system}} --sample FILE` shows the columns; map
   host, finding, id, severity (in the customer's words), cve, first_seen, solution.
-- **Template mappings** (workbooks/NAME.mapping.json): `atone workbook inspect FILE`; map the sheet, the header row,
+- **Template mappings** (mappings/workbooks/NAME.mapping.json): `atone workbook inspect FILE`; map the sheet, the header row,
   the columns, and `status_values` (atone's met, partly, not met, inherited, open, closed) to the workbook's own
   drop-down values, exactly as written there.
-- Ask the ISSE to confirm each; mappings are drafts until they do."""),
+- Commit them on a branch (`atone commit {{system}} "..."`) and ask the ISSE to confirm each; mappings are drafts
+  until they're merged."""),
     "atone-narratives": ("Write implementation statements as cited claims, and verify them.", """
 1. `atone check {{system}} CONTROL` for its results and the quotes its checks found; `atone evidence {{system}}
    search ...` for more. The controls lore for what the control asks; the customer's examples for their voice.
 2. Write drafts/CONTROL.json: `{"control": "au-11", "claims": [{"text": "...", "cites": [{"evidence": ID, "quote":
    "the exact words"}]}]}`. One fact per claim; quote words that are really in the evidence. A fact from a person:
    `{"text": "...", "person": "who, when"}`.
-3. `atone verify {{system}} drafts/CONTROL.json`. Dropped claims say why: fix the claim or drop it; never re-word a
-   claim so it says more than its evidence.
+3. `atone verify {{system}} drafts/CONTROL.json`: what holds goes into controls/CONTROL.json, committed, as a draft.
+   Dropped claims say why: fix the claim or drop it; never re-word a claim so it says more than its evidence.
+   Ask a person to review it (`atone review {{system}} CONTROL --by NAME`; `atone review {{system}}` lists what's
+   waiting).
 4. For many controls, hand families to brownies (each: these controls, these steps), then read what they wrote.
 5. Never write that a control is met, implemented or compliant: say what the system does, and let the status come
    from the checks."""),
@@ -3399,12 +3850,15 @@ SKILLS = {
     "atone-conmon": ("The monthly continuous monitoring package.", """
 1. Ask for this month's scan exports if they aren't in imports/; `atone import {{system}}`; `atone collect
    {{system}}`; `atone check {{system}}`.
-2. The POA&M: propose a schedule in drafts/poam-schedule.json (`{item key: "YYYY-MM-DD"}`; keys from the fill's
-   changes): realistic dates with margin for the ISSE and DevOps to review and do the work, by severity; ask a person
-   to approve it. Where there's a hard deadline, say plainly what can't fit.
-3. `atone fill {{system}} --out PACKAGE`, `atone draw {{system}} --out PACKAGE`, `atone report {{system}} --out
-   PACKAGE --conmon`.
-4. Tell your people what changed this month, what's open, and what you need, with the report's path."""),
+2. The POA&M (poam/ in the codex: atone opens items as findings appear): propose a schedule in
+   drafts/poam-schedule.json (`{item key: "YYYY-MM-DD"}`), realistic dates with margin for the ISSE and DevOps to
+   review and do the work, by severity; commit it and ask a person to approve it (`atone decide {{system}}
+   poam-schedule "..." --by NAME`). Where there's a hard deadline, say plainly what can't fit. Items atone marks as
+   looking closed: ask a person to close them (`atone decide {{system}} poam-close "why" --item KEY --by NAME`).
+3. `atone package {{system}} --tag conmon-YYYY-MM --note "..."`: the workbooks, diagrams, OSCAL and the report into
+   packages/conmon-YYYY-MM/, committed and tagged.
+4. Tell your people what changed this month (`atone history {{system}} --since "1 month ago"`), what's open, and
+   what you need, with the report's path."""),
 }
 
 
@@ -3428,18 +3882,19 @@ def hobkin_pack() -> str:
 
 def cmd_evidence(args) -> str:
     d = system_dir(args.system)
-    idx = run_index(d, args.run) if args.run else current_index(d)
+    idx = current_index(d)
     if args.what in (None, "list"):
-        return "\n".join(f"{e['id']}  {e['source']}  ({e['bytes']} bytes{', SITE' if e['site'] else ''})"
+        return "\n".join(f"{e['id']}  {e['host']}  {e['source']}" + (", SITE" if e.get("site") else "")
                          for e in idx) or "no evidence yet: atone collect " + args.system
     if args.what == "show":
         e = next((e for e in idx if e["id"] == (args.words or [""])[0]), None)
         if not e:
             raise AtoneError(f"no evidence {(args.words or [''])[0]!r} in that run")
         rec = load_record(d, e)
-        ok = "verified" if rec and check_record(rec) else "DOES NOT MATCH ITS HASH"
-        return f"{rec['id']} ({rec['source']}, {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(rec['at']))}, " \
-               f"sha256 {rec['sha256'][:16]}... {ok})\n\n{rec['content']}"
+        ok = "verified" if rec and not rec.get("tampered") and check_record(rec) else "DOES NOT MATCH ITS HASH"
+        return f"{rec['id']} ({rec['path']}, {rec['source']}, first seen " \
+               f"{time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(rec['first_seen']))}, sha256 {rec['sha256'][:16]}... " \
+               f"{ok})\n\n{rec['content']}"
     if args.what == "search":
         hits = search_evidence(d, " ".join(args.words or []))
         return "\n".join(f"{h['id']}  {h['source']}\n    {' '.join(h['snippet'].split())[:240]}" for h in hits) \
@@ -3476,9 +3931,11 @@ def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="atone", description=__doc__.split("\n\n")[0])
     ap.add_argument("--version", action="version", version=f"atone {__version__}")
     sub = ap.add_subparsers(dest="cmd")
-    p = sub.add_parser("init", help="a folder for a system")
+    p = sub.add_parser("init", help="a system's codex (a git repository), or a clone of one (--from)")
     p.add_argument("system")
-    p.add_argument("--store", help="where its evidence goes: s3://bucket/prefix or a folder (default ~/atone/store)")
+    p.add_argument("--from", dest="from_url", help="clone the system's codex from here (a fresh machine)")
+    p.add_argument("--remote", help="the internal git server's URL for it (origin)")
+    p.add_argument("--store", help="where raw scanner exports are archived by hash: s3://bucket/prefix or a folder")
     p = sub.add_parser("discover", help="what runs on the hosts (for drafting the system spec)")
     p.add_argument("system")
     p.add_argument("--ssh", action="append", default=[], help="user@host (repeatable; default: this host)")
@@ -3525,11 +3982,39 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("oscal", help="the SSP, assessment results and POA&M as OSCAL 1.1.2")
     p.add_argument("system")
     p.add_argument("--out", required=True)
-    p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
+    p = sub.add_parser("review", help="a person reviews drafted statements (or, alone, lists those unreviewed)")
+    p.add_argument("system")
+    p.add_argument("controls", nargs="*")
+    p.add_argument("--by", help="who reviewed them (name and role)")
+    p = sub.add_parser("decide", help="a person's decision, recorded: " + ", ".join(DECISION_KINDS))
+    p.add_argument("system")
+    p.add_argument("kind", choices=DECISION_KINDS)
+    p.add_argument("what", nargs="?", default="", help="what was decided, and why")
+    p.add_argument("--by", required=True, help="who decided (name and role)")
+    p.add_argument("--control", action="append", default=[], help="a control it concerns (repeatable)")
+    p.add_argument("--until", help="when it's to be looked at again (YYYY-MM-DD)")
+    p.add_argument("--from", dest="from_file", help="poam-schedule: the proposed schedule to approve")
+    p.add_argument("--item", action="append", default=[], help="poam-close: the POA&M item (key or file name)")
+    p = sub.add_parser("package", help="the package, generated into packages/TAG/, committed and tagged")
+    p.add_argument("system")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--note", default="")
+    p = sub.add_parser("history", help="the system's security history, from the codex")
+    p.add_argument("system")
+    p.add_argument("--control")
+    p.add_argument("--path", help="e.g. evidence/app01 (a host's evidence), poam, decisions")
+    p.add_argument("--since")
+    p.add_argument("-n", type=int, default=50)
+    sub.add_parser("guard", help="(the codex's pre-commit hook) refuse staged changes the redaction floor catches")
+    p = sub.add_parser("commit", help="commit edits to the codex (the spec, mappings, interfaces, drafts) with trailers")
+    p.add_argument("system")
+    p.add_argument("message")
+    p.add_argument("--path", action="append", default=[], help="only these (default: everything changed)")
+    p.add_argument("--control", action="append", default=[], help="a control it concerns (a Control trailer)")
+    p = sub.add_parser("evidence", help="the current evidence: list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
     p.add_argument("words", nargs="*")
-    p.add_argument("--run")
     p = sub.add_parser("controls", help="lore | fetch [--from DIR] | SYSTEM [list | show ID]")
     p.add_argument("what")
     p.add_argument("rest", nargs="*")
@@ -3551,9 +4036,37 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.cmd == "init":
-            d = init_system(args.system, args.store)
-            print(f"{args.system}: {d} (system.json: what it is; tailoring.json: its baseline and tailoring; "
-                  f"site.json: a person's own commands)")
+            d = init_system(args.system, args.store, args.remote, args.from_url)
+            print(f"{args.system}: the codex is {d} (a git repository; CODEX.md says what's in it)")
+        elif args.cmd == "guard":
+            bad = guard_staged(Path.cwd())
+            if bad:
+                print("atone: not committed: these would add what the redaction floor catches (keys, tokens, "
+                      "passwords):\n  " + "\n  ".join(bad[:20]), file=sys.stderr)
+                return 1
+        elif args.cmd == "commit":
+            print(codex_commit(system_dir(args.system), args.message, trailers=[("Control", c.lower()) for c in args.control],
+                               paths=args.path or None) or "nothing to commit")
+        elif args.cmd == "review":
+            d = system_dir(args.system)
+            if not args.controls:
+                todo = [(c.get("label", cid), c["statement"]["drafted_by"]) for cid, c in load_controls(d).items()
+                        if c.get("statement") and not c["statement"].get("reviewed_by")]
+                print("\n".join(f"{lbl}: drafted by {who}" for lbl, who in todo) or "nothing waiting for review")
+            else:
+                if not args.by:
+                    raise AtoneError("say who reviewed them: --by \"Name (role)\"")
+                print(review_statements(d, [c.lower() for c in args.controls], args.by) or "nothing changed")
+        elif args.cmd == "decide":
+            print(decide(system_dir(args.system), args.kind, args.what, args.by, [c.lower() for c in args.control],
+                         args.until, args.from_file, args.item) or "nothing changed")
+        elif args.cmd == "package":
+            package(args.system, args.tag, args.note)
+        elif args.cmd == "history":
+            for c in history(system_dir(args.system), args.control and args.control.lower(), args.path, args.since, args.n):
+                print(f"{c['at'][:16].replace('T', ' ')}  {c['commit']}  {c['author']}: {c['subject']}"
+                      + "".join(f"\n      {t}" for t in c["trailers"][:8])
+                      + (f"\n      ... and {len(c['trailers']) - 8} more (git show {c['commit']})" if len(c["trailers"]) > 8 else ""))
         elif args.cmd == "discover":
             d = system_dir(args.system)
             found = [over_ssh(t, ["__discover"]) for t in args.ssh] if args.ssh else [discover_here()]
@@ -3572,9 +4085,9 @@ def main(argv: list[str] | None = None) -> int:
                                env=args.env)
         elif args.cmd == "check":
             if args.control:
-                res = read_json(system_dir(args.system) / "runs" / "checks-latest.json") or {}
                 want = args.control.lower()
-                hit = next((r for r in (res.get("controls") or {}).values() if want in (r["control"], r["label"].lower())), None)
+                hit = next((r for r in load_controls(system_dir(args.system)).values()
+                            if want in (r["control"], r.get("label", "").lower())), None)
                 if not hit:
                     raise AtoneError(f"no results for {args.control}: atone check {args.system}")
                 print(json.dumps(hit, indent=1))
@@ -3585,7 +4098,7 @@ def main(argv: list[str] | None = None) -> int:
             paths = [Path(p) for p in args.drafts] or sorted((d / "drafts").glob("*.json"))
             for p in paths:
                 v = verify_narrative(d, read_json(p))
-                write_json(d / "drafts" / "verified" / p.name, v)
+                save_statement(d, v)
                 cov = v["coverage"]
                 print(f"{p.name}: {cov['evidence']} claims on evidence, {cov['person']} on a person's word, "
                       f"{cov['dropped']} dropped" + "".join(f"\n  dropped: {x['text'][:80]} ({x['why']})"

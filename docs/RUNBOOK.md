@@ -42,33 +42,38 @@ It sets the system up and makes **the plan**, then asks for what it needs. Answe
 ## By hand (to see each step)
 
 ```sh
-atone init SYSTEM --store s3://bucket/atone           # or a folder
+atone init SYSTEM --store s3://bucket/atone --remote GIT_URL   # the codex; or --from GIT_URL on a second machine
 atone discover SYSTEM --ssh user@host1 --ssh user@host2
-#   draft systems/SYSTEM/system.json from discovery.json (hosts, components, config files), and review it
+#   draft system.json from discovery.json (hosts, components, config files), and review it
+atone commit SYSTEM "the system spec, from discovery"
 atone collect SYSTEM --ssh user@host1 --ssh user@host2
 cp results.xml rapid7.csv trellix.csv ~/atone/systems/SYSTEM/imports/
 atone import SYSTEM --sample ~/atone/systems/SYSTEM/imports/rapid7.csv
-#   write imports/rapid7.mapping.json from its columns (and the same for trellix)
+#   write mappings/scanners/rapid7.mapping.json from its columns (and the same for trellix)
 atone import SYSTEM
 atone import SYSTEM --eaveswatch s3://bucket/eaveswatch --ew-system NAME     # if eaveswatch runs
 #   tailoring.json: the baseline, parameter values, the inherited controls
 atone check SYSTEM
 cp SSP.xlsx POAM.xlsx ~/atone/systems/SYSTEM/workbooks/
 atone workbook inspect ~/atone/systems/SYSTEM/workbooks/SSP.xlsx
-#   write workbooks/ssp.mapping.json (sheet, header row, columns, status_values in the workbook's own words)
-atone fill SYSTEM --out package/
-atone draw SYSTEM --out package/
-atone oscal SYSTEM --out package/oscal/
-atone report SYSTEM --out package/
+#   write mappings/workbooks/ssp.mapping.json (sheet, header row, columns, status_values in the workbook's own words)
+atone commit SYSTEM "mappings and tailoring"
 atone plan SYSTEM
+atone package SYSTEM --tag first-look          # fill, draw, oscal, report into packages/first-look/, tagged
+atone history SYSTEM                           # what changed, and why
+git -C ~/atone/systems/SYSTEM push --all; git -C ~/atone/systems/SYSTEM push --tags
 ```
+
+Everything lands in the codex as commits (evidence only when it changes; check results as status changes with
+trailers). Drafts by an agent go on branches; people approve by merging, and review and decide with `atone review`
+and `atone decide`.
 
 ## What to look at
 
-- **`package/report.html`:** coverage, what needs a person, drift, the architecture, each control's evidence.
-- **`package/NAME.changes.json`:** every cell atone set in each workbook, and every flag (where the paperwork and the
+- **`packages/first-look/report.html`:** coverage, what needs a person, drift, the architecture, each control's evidence.
+- **`packages/first-look/NAME.changes.json`:** every cell atone set in each workbook, and every flag (where the paperwork and the
   evidence disagree). Open the filled `.xlsx` copies in Excel: they should look like the originals, filled in.
-- **`package/network.drawio`:** open it in draw.io. Dashed lines are open rules nothing uses; red ones are connections
+- **`packages/first-look/network.drawio`:** open it in draw.io. Dashed lines are open rules nothing uses; red ones are connections
   the SSP doesn't mention.
 - **`atone check SYSTEM CONTROL`:** for any control that looks wrong, its checks and the exact lines they read.
 

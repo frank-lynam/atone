@@ -104,19 +104,19 @@
   [
    "flows",
    "web01",
-   "/proc/net (connected)",
+   "connections",
    [
     {
      "proto": "tcp",
-     "state": "established",
+     "direction": "in",
      "local": "10.0.1.10:443",
-     "remote": "34.200.1.7:51515",
+     "remote": "34.200.1.7",
      "process": "nginx"
     },
     {
      "proto": "tcp",
-     "state": "established",
-     "local": "10.0.1.10:40000",
+     "direction": "out",
+     "local": "10.0.1.10",
      "remote": "10.0.2.20:9000",
      "process": "nginx"
     }
@@ -125,26 +125,26 @@
   [
    "flows",
    "app01",
-   "/proc/net (connected)",
+   "connections",
    [
     {
      "proto": "tcp",
-     "state": "established",
+     "direction": "in",
      "local": "10.0.2.20:9000",
-     "remote": "10.0.1.10:40000",
+     "remote": "10.0.1.10",
      "process": "java"
     },
     {
      "proto": "tcp",
-     "state": "established",
-     "local": "10.0.2.20:41000",
+     "direction": "out",
+     "local": "10.0.2.20",
      "remote": "10.0.3.30:1521",
      "process": "java"
     },
     {
      "proto": "tcp",
-     "state": "established",
-     "local": "10.0.2.20:42000",
+     "direction": "out",
+     "local": "10.0.2.20",
      "remote": "52.94.0.10:443",
      "process": "java"
     }
@@ -153,13 +153,13 @@
   [
    "flows",
    "db01",
-   "/proc/net (connected)",
+   "connections",
    [
     {
      "proto": "tcp",
-     "state": "established",
+     "direction": "in",
      "local": "10.0.3.30:1521",
-     "remote": "10.0.2.20:41000",
+     "remote": "10.0.2.20",
      "process": "oracle"
     }
    ]

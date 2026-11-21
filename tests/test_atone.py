@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -54,13 +55,35 @@ class Evidence(unittest.TestCase):
         rec["content"] += "tampered"
         self.assertFalse(atone.check_record(rec))
 
-    def test_the_store_lays_records_out_by_system_kind_day_and_host(self):
-        store = atone.Store(str(self.tmp / "store"))
-        rec = atone.make_record("tst", "accounts", "h1", "passwd entries", [{"user": "root"}])
-        key = atone.record_key(rec)
-        self.assertRegex(key, r"^system=tst/kind=accounts/dt=\d{4}-\d\d-\d\d/host=h1/\d{8}T\d{6}Z_[0-9a-f]{6}\.json\.gz$")
-        store.put(key, gzip.compress(json.dumps(rec).encode()))
-        self.assertEqual(json.loads(gzip.decompress(store.get(key)))["sha256"], rec["sha256"])
+    def test_evidence_in_the_codex_at_stable_paths_committed_only_when_it_changes(self):
+        d = atone.init_system("codexev", None)
+        mk = lambda text: atone.make_record("codexev", "file", "h1", "/etc/app.conf", text)
+        changed = atone.save_records(d, [mk("port=8443\n")])
+        self.assertRegex(changed[0]["path"], r"^evidence/h1/file/etc_app\.conf(-[0-9a-f]{6})?\.txt$")
+        self.assertEqual((d / changed[0]["path"]).read_text(), "port=8443\n")           # as it is: readable in a diff
+        commits = lambda: atone.git(d, "rev-list", "--count", "HEAD").stdout.strip()
+        n = commits()
+        self.assertEqual(atone.save_records(d, [mk("port=8443\n")]), [])                 # the same again: nothing
+        self.assertEqual(commits(), n)
+        atone.save_records(d, [mk("port=9443\n")])                                       # the system changed
+        self.assertEqual(int(commits()), int(n) + 1)
+        diff = atone.git(d, "show", "HEAD", "--", changed[0]["path"]).stdout
+        self.assertIn("-port=8443", diff)
+        self.assertIn("+port=9443", diff)
+        rec = atone.load_record(d, atone.current_index(d)[0])
+        self.assertTrue(atone.check_record(rec) and not rec.get("tampered"))
+
+    def test_the_codex_refuses_a_secret_whoever_commits_it(self):
+        d = atone.init_system("guarded", None)
+        (d / "decisions" / "oops.json").write_text('{"note": "the db password=hunter2 for now"}\n')
+        with self.assertRaises(atone.AtoneError) as e:
+            atone.codex_commit(d, "a note")
+        self.assertIn("redaction floor", str(e.exception))
+        atone.git(d, "add", "-A")                                                          # a person, with plain git
+        r = subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
+                           capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)                                               # the hook refuses it
+        self.assertIn("redaction floor", r.stderr)
 
     def test_collectors_run_here_and_one_failing_is_evidence_of_that(self):
         parts = atone.collect_here(["accounts", "listeners"], {})
@@ -162,8 +185,9 @@ class Imports(unittest.TestCase):
 
     def test_imports_add_to_the_current_evidence_alongside_collected(self):
         d = atone.init_system("imp", None)
-        for f in ("oscap-results.xml", "vulns-export.csv", "vulns.mapping.json"):
+        for f in ("oscap-results.xml", "vulns-export.csv"):
             shutil.copy(FIX / f, d / "imports" / f)
+        shutil.copy(FIX / "vulns.mapping.json", d / "mappings" / "scanners" / "vulns.mapping.json")
         atone.collect("imp", ["accounts"], log=lambda *a: None)
         atone.import_results("imp", log=lambda *a: None)
         kinds = {(e["kind"], e["source"].split(" (")[0]) for e in atone.current_index(d)}
@@ -316,8 +340,9 @@ class Workbooks(unittest.TestCase):
 
     def system(self, name):
         d = evidence_system(name, [("file", "app01.example.internal", "/etc/audit/auditd.conf", AUDITD)])
-        for f in ("oscap-results.xml", "vulns-export.csv", "vulns.mapping.json"):
+        for f in ("oscap-results.xml", "vulns-export.csv"):
             shutil.copy(FIX / f, d / "imports" / f)
+        shutil.copy(FIX / "vulns.mapping.json", d / "mappings" / "scanners" / "vulns.mapping.json")
         atone.import_results(name, log=lambda *a: None)
         t = atone.read_json(d / "tailoring.json")
         t["inherited"] = {"pe-3": {"from": "AWS GovCloud"}}
@@ -325,13 +350,13 @@ class Workbooks(unittest.TestCase):
         atone.check_system(name, log=lambda *a: None)
         for f, m in (("ssp-matrix.xlsx", SSP_MAP), ("poam.xlsx", POAM_MAP)):
             shutil.copy(FIX / f, d / "workbooks" / f)
-            atone.write_json(d / "workbooks" / (f.split(".")[0] + ".mapping.json"), m)
+            atone.write_json(d / "mappings" / "workbooks" / (f.split(".")[0] + ".mapping.json"), m)
         return d
 
     def test_filling_the_ssp_keeps_whats_there_and_flags_disagreements(self):
         d = self.system("fillssp")
         eid = next(e["id"] for e in atone.current_index(d) if e["kind"] == "file")
-        atone.write_json(d / "drafts" / "verified" / "ac-11.json", atone.verify_narrative(d, {"control": "ac-11", "claims": [
+        atone.save_statement(d, atone.verify_narrative(d, {"control": "ac-11", "claims": [
             {"text": "Rotated audit logs are kept.", "cites": [{"evidence": eid, "quote": "max_log_file_action = keep_logs"}]}]}))
         out = Path(tempfile.mkdtemp())
         [ssp] = [r for r in atone.fill_workbooks("fillssp", out, log=lambda *a: None) if r["workbook"] == "ssp-matrix.xlsx"]
@@ -361,7 +386,7 @@ class Workbooks(unittest.TestCase):
 
     def test_a_status_the_workbooks_drop_down_doesnt_have_is_refused(self):
         d = self.system("badstatus")
-        atone.write_json(d / "workbooks" / "ssp-matrix.mapping.json",
+        atone.write_json(d / "mappings" / "workbooks" / "ssp-matrix.mapping.json",
                          {**SSP_MAP, "status_values": {**SSP_MAP["status_values"], "met": "Compliant"}})
         with self.assertRaises(atone.AtoneError) as e:
             atone.fill_workbooks("badstatus", Path(tempfile.mkdtemp()), [str(d / "workbooks" / "ssp-matrix.xlsx")],
@@ -377,7 +402,7 @@ class Architecture(unittest.TestCase):
         fx = json.loads((FIX / "architecture.json").read_text())
         cls.d = atone.init_system("arch", None)
         atone.write_json(cls.d / "system.json", fx["spec"])
-        atone.write_json(cls.d / "documented.json", fx["documented"])
+        atone.write_json(cls.d / "interfaces.json", fx["documented"])
         atone.save_records(cls.d, [atone.make_record("arch", k, h, src, c) for k, h, src, c in fx["records"]])
         cls.out = Path(tempfile.mkdtemp())
         cls.g = atone.draw_system("arch", cls.out, log=lambda *a: None)
@@ -456,25 +481,28 @@ class Architecture(unittest.TestCase):
         self.assertTrue(any("dashed=1" in (c.get("style") or "") for c in cells if c.get("source")))
         ET.parse(self.out / "network.svg")
 
-    def test_a_connection_seen_once_in_the_window_still_counts(self):
-        import time as _t
+    def test_connections_are_a_set_that_grows_and_recent_ones_count(self):
         d = atone.init_system("overtime", None)
         fx = json.loads((FIX / "architecture.json").read_text())
         atone.write_json(d / "system.json", fx["spec"])
+        batch = {"proto": "tcp", "direction": "out", "local": "10.0.2.20", "remote": "10.0.3.30:5433", "process": "nightly batch"}
         recs = [atone.make_record("overtime", k, h, src, c) for k, h, src, c in fx["records"] if k != "flows"]
-        recs.append(atone.make_record("overtime", "flows", "app01", "/proc/net (connected)",
-                                      [{"proto": "tcp", "state": "established", "local": "10.0.2.20:43000",
-                                        "remote": "10.0.3.30:1521", "process": "nightly batch"}]))
+        recs.append(atone.make_record("overtime", "flows", "app01", "connections", [batch]))
         atone.save_records(d, recs)
-        _t.sleep(1.1)                                       # the next collect: the batch connection has closed
-        atone.save_records(d, [atone.make_record("overtime", "flows", "app01", "/proc/net (connected)", [])])
-        g = atone.build_graph("overtime")
-        e = next(e for e in g["edges"] if (e["from"], e["to"], e["port"]) == ("app01", "db01", "tcp/1521"))
-        self.assertIn("actual", e["layers"])                # not "unused": it was seen, once
-        self.assertEqual(e["seen"], 1)
+        n = atone.git(d, "rev-list", "--count", "HEAD").stdout
+        atone.save_records(d, [atone.make_record("overtime", "flows", "app01", "connections", [])])  # closed since
+        self.assertEqual(atone.git(d, "rev-list", "--count", "HEAD").stdout, n)          # nothing new: no commit
+        e = {(x["from"], x["to"], x["port"]): x for x in atone.build_graph("overtime")["edges"]}
+        self.assertIn("actual", e[("app01", "db01", "tcp/5433")]["layers"])                # seen, in the window
+        seen = atone.read_json(d / "runs" / "connections-seen.json")
+        for k in seen:
+            seen[k] -= 40 * 86400                                                            # last seen long ago
+        atone.write_json(d / "runs" / "connections-seen.json", seen)
+        e = {(x["from"], x["to"], x["port"]): x for x in atone.build_graph("overtime")["edges"]}
+        self.assertNotIn(("app01", "db01", "tcp/5433"), e)                                  # not seen recently
 
     def test_what_changed_since_the_last_drawing(self):
-        atone.write_json(self.d / "documented.json", json.loads((FIX / "architecture.json").read_text())["documented"]
+        atone.write_json(self.d / "interfaces.json", json.loads((FIX / "architecture.json").read_text())["documented"]
                          + [{"from": "app", "to": "db", "port": "tcp/1521"}])
         out = Path(tempfile.mkdtemp())
         atone.draw_system("arch", out, log=lambda *a: None)
@@ -623,6 +651,64 @@ class Oscal(unittest.TestCase):
         self.assertEqual(json.loads((again / "ssp.json").read_text())["system-security-plan"]["uuid"], ssp["uuid"])
 
 
+class Codex(unittest.TestCase):
+    """The codex: the model and the history. Reviews, decisions, the POA&M, packages, and a fresh machine."""
+
+    def test_draft_review_decide_package_and_the_history_of_it(self):
+        d = Workbooks().system("hist")                    # evidence, scans, PE-3 inherited, checks, workbooks
+        self.assertTrue(atone.codex_commit(d, "the tailoring, mappings and workbooks"))   # a person's edits, committed
+        eid = next(e["id"] for e in atone.current_index(d) if e["kind"] == "file")
+        atone.save_statement(d, atone.verify_narrative(d, {"control": "au-11", "claims": [
+            {"text": "Rotated audit logs are kept.", "cites": [{"evidence": eid, "quote": "max_log_file_action = keep_logs"}]}]}))
+        ctl = atone.read_json(atone.control_path(d, "au-11"))
+        self.assertEqual((ctl["statement"]["text"], ctl["statement"]["reviewed_by"]), ("Rotated audit logs are kept.", None))
+        atone.review_statements(d, ["au-11"], "Jane Doe (ISSE)")
+        self.assertEqual(atone.read_json(atone.control_path(d, "au-11"))["statement"]["reviewed_by"], "Jane Doe (ISSE)")
+        h = atone.history(d, control="au-11")
+        self.assertEqual([c["subject"] for c in h[:2]], ["review: AU-11", "AU-11: implementation statement drafted"])
+        self.assertIn("Reviewed-by: Jane Doe (ISSE)", h[0]["trailers"])
+        self.assertIn(f"Evidence: {eid}", h[1]["trailers"])
+        atone.check_system("hist", log=lambda *a: None)                     # checks keep the statement and review
+        self.assertEqual(atone.read_json(atone.control_path(d, "au-11"))["statement"]["reviewed_by"], "Jane Doe (ISSE)")
+        # decisions: a risk acceptance; the POA&M schedule approved; an item closed
+        atone.decide(d, "risk-acceptance", "TLS 1.0 stays on the legacy port until the vendor upgrade", "Sam Roe (ISSO)",
+                     ["sc-8"], "2027-03-01")
+        poam = {x["key"]: x for x in (atone.read_json(p) for p in (d / "poam").glob("*.json"))}
+        key = next(k for k, x in poam.items() if x["weakness"] == "Oracle JDK out of date")
+        atone.write_json(d / "drafts" / "poam-schedule.json", {key: "2027-01-15"})
+        atone.codex_commit(d, "poam: a proposed schedule")                              # the agent's proposal
+        self.assertEqual(atone.approved_schedule(d), {})                    # proposed isn't approved
+        atone.decide(d, "poam-schedule", "dates as proposed", "Sam Roe (ISSO)")
+        self.assertEqual(atone.approved_schedule(d), {key: "2027-01-15"})
+        atone.decide(d, "poam-close", "patched and rescanned", "Sam Roe (ISSO)", items=[key])
+        closed = next(atone.read_json(p) for p in (d / "poam").glob("*.json") if atone.read_json(p)["key"] == key)
+        self.assertEqual((closed["status"], closed["closed_by"]), ("closed", "Sam Roe (ISSO)"))
+        self.assertTrue(any("Decided-by: Sam Roe (ISSO)" in c["trailers"] for c in atone.history(d, path="decisions")))
+        # a package: generated into packages/TAG, committed and tagged; never replaced
+        out = atone.package("hist", "conmon-2026-11", "November", log=lambda *a: None)
+        for f in ("ssp-matrix.xlsx", "poam.xlsx", "network.drawio", "report.html", "oscal/ssp.json"):
+            self.assertTrue((out / f).exists(), f)
+        self.assertEqual(atone.git(d, "tag", "-l").stdout.split(), ["conmon-2026-11"])
+        self.assertEqual(atone.git(d, "status", "--porcelain").stdout.strip(), "")       # everything committed
+        with self.assertRaises(atone.AtoneError):
+            atone.package("hist", "conmon-2026-11", log=lambda *a: None)
+
+    def test_a_fresh_machine_clones_the_codex(self):
+        d = evidence_system("orig", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        bare = Path(tempfile.mkdtemp()) / "orig.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(d), str(bare)], check=True)
+        other = Path(tempfile.mkdtemp())
+        old = atone.HOME
+        try:
+            atone.HOME = other                                                    # another machine's ~/atone
+            d2 = atone.init_system("orig", from_url=str(bare))
+            self.assertEqual([e["id"] for e in atone.current_index(d2)], [e["id"] for e in atone.current_index(d)])
+            self.assertTrue((d2 / ".git" / "hooks" / "pre-commit").exists())     # the guard, on this machine too
+            self.assertIsNone(atone.current_index(d2)[0]["last_seen"])           # it hasn't collected here yet
+        finally:
+            atone.HOME = old
+
+
 class PlanAndReport(unittest.TestCase):
     def test_the_plan_says_who_does_what_and_ticks_what_is_done(self):
         d = evidence_system("plan", [("file", "app01", "/etc/audit/auditd.conf", AUDITD)])
@@ -652,10 +738,10 @@ class PlanAndReport(unittest.TestCase):
 
     def test_the_report_escapes_what_it_shows(self):
         d = evidence_system("rep", [("file", "h1", "/etc/audit/auditd.conf", AUDITD + "<script>alert(1)</script>\n")])
-        m = atone.read_json(d / "mappings" / "starter.json")
+        m = atone.read_json(d / "mappings" / "controls" / "starter.json")
         m.append({"control": "ac-11", "evidence": [{"name": "f", "kind": "file"}],
                   "checks": [{"id": "x", "type": "present", "evidence": "f", "pattern": "script"}]})
-        atone.write_json(d / "mappings" / "starter.json", m)
+        atone.write_json(d / "mappings" / "controls" / "starter.json", m)
         atone.check_system("rep", log=lambda *a: None)
         html = atone.report("rep", Path(tempfile.mkdtemp()), log=lambda *a: None).read_text()
         self.assertNotIn("<script>alert", html)
@@ -684,7 +770,7 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(code, 0)
         code, out = run("collect", "cli", "--kind", "accounts")
         self.assertEqual(code, 0)
-        self.assertIn("records in run", out)
+        self.assertIn("pieces of evidence", out)
         code, out = run("evidence", "cli")
         first = out.split()[0]
         self.assertTrue(first.startswith("accounts."))

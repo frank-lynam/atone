@@ -33,7 +33,8 @@ due, so a quiet day costs no model calls. Its skills (atone-become-expert, -syst
 ## By hand
 
 ```sh
-atone init tst [--store s3://bucket/prefix]     # ~/atone/systems/tst: spec, tailoring, site file, mappings...
+atone init tst [--store s3://bucket/prefix] [--remote URL]   # the codex: ~/atone/systems/tst
+atone init tst --from URL                      # or clone it on another machine
 atone controls lore                            # the shipped catalog as a lore, word for word (lorewell install it)
 atone controls fetch --from DIR                # a newer copy of NIST's files, brought in by hand (optional)
 atone discover tst [--ssh user@host]...        # what runs: for drafting system.json
@@ -50,26 +51,38 @@ atone draw tst --out package/                  # the architecture: configured, s
 atone oscal tst --out package/oscal/           # the SSP, assessment results and POA&M as OSCAL 1.1.2
 atone plan tst                                 # the plan (PLAN.md)
 atone report tst --out package/ [--conmon]     # report.html
+atone commit tst "why" [--control AC-2]        # commit your own edits to the codex, guarded
+atone review tst AC-2 --by NAME                # a person reviews a statement
+atone decide tst risk-acceptance "why" --by NAME --control RA-5   # a person decides
+atone package tst --tag conmon-2026-11         # generate everything into packages/TAG, commit and tag
+atone history tst --control AC-2               # what changed, who decided, when
 ```
 
 The first run on a real system, step by step (offline, no sudo): [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
-## A system's folder
+## The codex
 
-`~/atone/systems/NAME/` (`$ATONE_HOME`):
+Each system is a git repository, **the codex** (`~/atone/systems/NAME/`, `$ATONE_HOME`): the single source of truth,
+and its history is the system's security history. atone commits what it changes, with trailers saying what and why
+(`atone history NAME [--control AC-2] [--since "1 month ago"]`); a pre-commit guard refuses anything secret. Drafts go
+on branches, merging is approval, and each package is a tag.
 
-| File | What it is | Whose |
+| Path | What it is | Whose |
 |---|---|---|
 | `system.json` | the system spec: hosts, components, the config files that define their connections, what to collect | drafted by the agent, reviewed by the ISSE |
+| `interfaces.json` | the flows the SSP describes | drafted from the SSP, reviewed |
 | `tailoring.json` | the baseline, controls added and removed, parameter values, inherited and shared controls | a person's |
 | `site.json` | commands atone doesn't have, and extra redaction patterns; evidence from them is marked as such | a person's, never the agent's |
-| `mappings/*.json` | control mappings: the evidence that bears on each control, checks as data, what a person must supply (`starter.json` to begin from) | drafted by the agent, owned by the ISSE |
-| `imports/` | scanner exports, and `TOOL.mapping.json` for any that isn't OpenSCAP | a person's (the exports), the agent's (the mappings) |
-| `workbooks/` | the working documents, and `NAME.mapping.json` for each | the customer's (the files) |
-| `documented.json` | the flows the SSP describes | drafted from the SSP, reviewed |
-| `drafts/` | narratives (claims with citations), `verified/` (what `atone verify` kept), `poam-schedule.json`, `examples/` | the agent's, approved by people |
-| `runs/` | evidence indexes, check results, drawings, fills | atone's |
-| `PLAN.md` | the plan, worked out from all of the above | atone's |
+| `mappings/controls/` | the evidence that bears on each control, checks as data (`starter.json` to begin from) | drafted by the agent, owned by the ISSE |
+| `mappings/scanners/`, `mappings/workbooks/` | how to read each scanner export and fill each working document | drafted by the agent, confirmed by the ISSE |
+| `evidence/HOST/KIND/` | redacted evidence at stable paths, committed only when it changes | atone's |
+| `controls/` | each control's status, findings and implementation statement (drafted, verified, reviewed) | atone's and the reviewers' |
+| `poam/` | the POA&M items, opened as findings appear | atone's; closed by decisions |
+| `decisions/` | risk acceptances, deviations, false positives, the approved POA&M schedule | people's (`atone decide`) |
+| `workbooks/` | the customer's working documents | the customer's |
+| `packages/TAG/` | what was delivered: workbooks, diagrams, OSCAL, the report | atone's (`atone package`) |
+| `drafts/` | narratives (claims with citations), the proposed schedule, `examples/` | the agent's |
+| `imports/`, `runs/`, `PLAN.md` | scanner exports to import, local caches and indexes, the plan (not committed) | local |
 
 ## The rules it keeps
 

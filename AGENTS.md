@@ -22,6 +22,9 @@ DESIGN.md is the design; read the section you're working on. The rules that hold
   template is in the code: they arrive as reviewed data at run time.
 - **Workbooks are the customer's:** write into a copy, change only cell values, keep everything else byte for byte
   where it can be. Status values come from the workbook, never from atone.
+- **The codex is the source of truth** (DESIGN.md §4b): one git repository per system. atone commits what it changes,
+  with trailers (Control, Status, Evidence, Drafted-by, Reviewed-by, Decided-by, Package); every artifact is
+  generated from it. `runs/` is local and ignored: nothing in it may be the only copy of anything.
 - **No auto-updates or migrations.**
 - **Tests:** `python3 tests/test_atone.py` (fixtures only: no AWS, no network, no model). Add a check for what you
   change; run what you changed, CI runs the rest.

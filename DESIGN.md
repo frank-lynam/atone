@@ -217,7 +217,7 @@ matrix. `atone fill` fills them in without wrecking them:
    gateway) and public addresses. An internet-facing load balancer's listeners and its target groups are
    configuration: they're the intended way in. (Network ACLs are collected, not yet evaluated; host firewall rules
    likewise.)
-4. **Documented:** the boundary and data flows the SSP describes (documented.json, reviewed).
+4. **Documented:** the boundary and data flows the SSP describes (interfaces.json in the codex, reviewed).
 
 | Class | Means |
 |---|---|
@@ -262,7 +262,9 @@ with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture s
 
 ## 4b. The atone codex: the system's security history, as a git history
 
-*Designed, not built yet.*
+*Built in 0.1.0: evidence at stable paths, the control model (`controls/`, `poam/`, `decisions/`), trailers, the
+pre-commit guard, `review`, `decide`, `package` (tagged) and `history`. The components live in `system.json`, the
+intended flows in `interfaces.json`; raw scanner exports are archived by hash in the store, not the codex.*
 
 Everything atone knows about a system lives in one git repository per system: **the codex**. The authorization
 boundary is the repository, so access is the repository's permissions. It's the single source of truth: every
