@@ -1204,8 +1204,12 @@ imports/*
 !imports/.keep
 PLAN.md
 plan.json
+discovery.json
 *.part
 *.tmp
+# an agent's working notes, if it works from here
+CHECKLIST.md
+HANDOFF.md
 """
 CODEX_MD = """# The atone codex for {name}
 
@@ -3862,6 +3866,8 @@ says on trust, so being right matters more than being complete: when in doubt, s
   the evidence disagrees, atone flags it for a person.
 - **People decide.** The ISSE owns the system spec and the mappings; the ISSO owns the package. You draft, prove,
   and propose.
+- **Only the access you're given.** A key, token or password you come across on a host isn't yours to use, even
+  to unblock yourself (and it's a finding: tell the ISSE where it is, never what it is). Ask for what you need.
 
 ## The codex
 
@@ -3907,10 +3913,14 @@ SKILLS = {
 1. The controls, word for word (NIST's files ship with atone: no internet needed): `atone controls lore`, then
    `lorewell install` the lore it writes. This is what you cite and quote for a control's text: never a paraphrase.
 2. Guidance (help for you, never cited as a control): `atone sources` lists it, with the paths of the texts atone
-   ships. Build what this system needs: `lorewell build NAME FILE`, then have the ISSE look it over with `lorewell
-   review`. For STIGs, use the SCAP Security Guide content on the hosts, for the components the system spec names.
+   ships. They're plain text: grep them as they are. A lore of one is better (ranked search, an outline), but
+   building one takes a model: `lorewell build NAME FILE` reads LORE_BASE_URL, LORE_MODEL and LORE_API_KEY, and your
+   own model's key isn't yours to use, so ask your people for those (in your secrets.env). Then `lorewell review
+   packs/NAME` (the ISSE looks it over), `lorewell compile packs/NAME`, and `lorewell install NAME.lore.db`. For
+   STIGs, use the SCAP Security Guide content on the hosts, for the components the system spec names.
 3. The customer's own documents (policies, procedures, past packages, interconnection agreements), as they come up:
-   ask which to use, `lorewell build` them into a private lore here, and never send them anywhere else.
+   ask which to use; read them with `atone doc FILE` (or `lorewell build` them into a private lore here, the same
+   way), and never send them anywhere else.
 4. What you learn about the system and its people (voice, quirks, owners) goes in your field lore; the mappings
    don't: they're files the ISSE reviews."""),
     "atone-system-spec": ("Draft the system spec (system.json) and the intended flows (interfaces.json) for the "
