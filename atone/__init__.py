@@ -16,7 +16,8 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone verify SYSTEM [DRAFT]...   a drafted narrative's citations, each checked against the evidence it quotes
     atone workbook inspect FILE   a workbook's sheets, headers and drop-downs: for drafting its template mapping
     atone fill SYSTEM --out DIR   copies of the working documents, filled in, with what changed and why
-    atone draw SYSTEM --out DIR   the architecture as it is: actual, allowed and documented paths (draw.io, SVG)
+    atone connections SYSTEM      what each config file says its host connects to, and listens on
+    atone draw SYSTEM --out DIR   the architecture: configured, seen, allowed and documented paths (draw.io, SVG)
     atone plan SYSTEM             the engagement plan: every piece of the effort, who can do it, what's done
     atone due SYSTEM              what's due by the cadence (nothing printed when nothing is: a hobkin's watch)
     atone report SYSTEM --out DIR [--conmon]   report.html, for people
@@ -2056,12 +2057,118 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
 # ---- architecture: one graph of actual, allowed and documented paths; drawn as draw.io and SVG, with what differs
 
 EDGE_CLASSES = {
-    "normal": "seen, and allowed or documented",
-    "unused": "allowed but never seen: unused attack surface (tighten the rule)",
-    "undocumented": "seen but not documented: the SSP is out of date, or something is talking that shouldn't be",
-    "not allowed": "seen, but no rule we can see allows it (a rule we can't see, or a gap in the evidence)",
-    "documented only": "documented but not seen in the evidence",
+    "normal": "configured (or documented, or allowed) and seen",
+    "idle": "configured but not seen in the window: intended, just quiet (a DR link, a monthly job)",
+    "unused": "allowed by a rule, but nothing configures it and nothing used it: attack surface (tighten the rule)",
+    "undocumented": "configured or seen, but not in the SSP: the SSP is out of date, or something shouldn't be there",
+    "unexpected": "seen, but no config, rule or document explains it",
+    "blocked": "configured, but no rule we can see allows it: it would fail (or a rule we can't see)",
+    "documented only": "in the SSP, but neither configured nor seen",
 }
+
+
+DEFAULT_PORTS = {"http": 80, "https": 443, "ldap": 389, "ldaps": 636, "smtp": 25, "smtps": 465, "ftp": 21, "sftp": 22,
+                 "ssh": 22, "amqp": 5672, "amqps": 5671, "redis": 6379, "rediss": 6380, "mongodb": 27017,
+                 "postgresql": 5432, "postgres": 5432, "mysql": 3306, "mariadb": 3306, "sqlserver": 1433, "oracle": 1521,
+                 "t3": 7001, "t3s": 7002, "iiop": 7001, "kafka": 9092, "nfs": 2049, "syslog": 514}
+HOST_RE = r"(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+NOT_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "example.com", "schemas.xmlsoap.org", "www.w3.org",
+             "java.sun.com", "xmlns.oracle.com", "xmlns.jcp.org", "www.oracle.com", "apache.org", "www.apache.org"}
+
+
+def extract_endpoints(text: str, patterns: list[dict] | None = None) -> dict:
+    """What a config file says its program connects to, and listens on, with generic readers that know no product:
+    URLs (and a scheme's usual port), JDBC and Oracle thin strings, Oracle TNS (HOST, PORT) pairs, host and port
+    settings near each other, host:port values of host-ish settings, and listen directives; plus a system spec's own
+    patterns (regexes with named groups host and port, reviewed by a person) for what these miss.
+    {"connects": [{host, port, proto, how, line}], "listens": [{port, how, line}]}"""
+    lines = text.splitlines()
+    connects, listens, seen = [], [], set()
+
+    def add(host, port, how, i, proto="tcp"):
+        host = (host or "").strip("[]").strip().lower()
+        if not host or host in NOT_HOSTS or host.startswith("127.") or "$" in host or "{" in host or "%" in host:
+            return
+        if not re.search(r"[a-z0-9]", host) or not str(port).isdigit() or not 0 < int(port) < 65536:
+            return
+        if (host, int(port)) in seen:
+            return
+        seen.add((host, int(port)))
+        connects.append({"host": host, "port": int(port), "proto": proto, "how": how, "line": i + 1,
+                         "quote": lines[i].strip()[:300] if i < len(lines) else ""})
+
+    for i, line in enumerate(lines):
+        if re.match(r"\s*(#|//|;|<!--)", line):                  # comments say what was, or could be
+            continue
+        for m in re.finditer(r"\b([a-z][a-z0-9+.-]*)://(?:[^@/\s\"'<>]+@)?" + HOST_RE + r"(?::(\d{1,5}))?", line, re.I):
+            scheme = m.group(1).lower().split("+")[-1].split(":")[-1]
+            port = m.group(3) or DEFAULT_PORTS.get(scheme)
+            if port and not scheme.startswith("file"):
+                add(m.group(2), port, f"a {scheme} URL", i)
+        for m in re.finditer(r"jdbc:oracle:thin:[^@\s]*@(?://)?" + HOST_RE + r":(\d{1,5})", line, re.I):
+            add(m.group(1), m.group(2), "an Oracle JDBC string", i)
+        for m in re.finditer(r"\(\s*HOST\s*=\s*" + HOST_RE + r"\s*\)\s*\(\s*PORT\s*=\s*(\d{1,5})\s*\)", line, re.I):
+            add(m.group(1), m.group(2), "an Oracle TNS address", i)
+        m = re.search(r"(?i)\b[\w.-]*(host|server|address|hostname|endpoint|target)\b[\w.-]*\s*[=:]\s*[\"']?"
+                      + HOST_RE + r":(\d{1,5})\b", line)
+        if m:
+            add(m.group(2), m.group(3), "a host:port setting", i)
+        m = (re.match(r"(?i)\s*listen\s+(?:\S+:)?(\d{2,5})\b[^;]*;", line)          # listen 443 ssl;
+             or re.match(r"(?i)\s*(?:Listen|ListenAddress|server\.port|http\.port|https\.port|port)\s*[=:\s]\s*"
+                         r"(?:[\d.]+:|\[[0-9a-f:]+\]:)?(\d{2,5})\b\s*;?\s*$", line))
+        if m:
+            listens.append({"port": int(m.group(1)), "how": "a listen directive", "line": i + 1, "quote": line.strip()[:300]})
+        for m in re.finditer(r"(?i)<((?:ssl-)?listen-port|port)>\s*(\d{2,5})\s*</", line):
+            listens.append({"port": int(m.group(2)), "how": f"<{m.group(1)}>", "line": i + 1, "quote": line.strip()[:300]})
+    hostish = re.compile(r"(?i)^\s*<?([\w.-]*(?:host|server|hostname|address)[\w.-]*)>?\s*[=:>]?\s*[\"']?" + HOST_RE
+                         + r"[\"']?\s*(?:</[^>]+>)?\s*;?\s*$")
+    portish = re.compile(r"(?i)^\s*<?([\w.-]*port)>?\s*[=:>]?\s*[\"']?(\d{2,5})[\"']?\s*(?:</[^>]+>)?\s*;?\s*$")
+    for i, line in enumerate(lines):                           # a host setting with a port setting near it
+        m = hostish.match(line)
+        if not m or re.fullmatch(r"\d+", m.group(2)):
+            continue
+        stem = re.sub(r"(?i)(host|server|hostname|address).*$", "", m.group(1))
+        for j in range(max(0, i - 3), min(len(lines), i + 4)):
+            pm = portish.match(lines[j])
+            if pm and re.sub(r"(?i)port.*$", "", pm.group(1)) == stem:
+                add(m.group(2), pm.group(2), f"settings {m.group(1)} and {pm.group(1)}", i)
+                break
+    for pat in patterns or []:                                 # the system spec's own, reviewed by a person
+        try:
+            rx = re.compile(pat["pattern"], re.M)
+        except (re.error, KeyError, TypeError):
+            continue
+        for m in rx.finditer(text):
+            g = m.groupdict()
+            i = text.count("\n", 0, m.start())
+            if g.get("host") and g.get("port"):
+                add(g["host"], g["port"], pat.get("about") or "the system spec's pattern", i, pat.get("proto", "tcp"))
+            elif g.get("port") and pat.get("listens"):
+                listens.append({"port": int(g["port"]), "how": pat.get("about") or "the spec's pattern", "line": i + 1,
+                                "quote": lines[i].strip()[:300] if i < len(lines) else ""})
+    return {"connects": connects, "listens": listens}
+
+
+def configured_endpoints(d: Path, spec: dict) -> list[dict]:
+    """For each config file in the current evidence: what it says its host connects to and listens on."""
+    pats = {}
+    for c in spec.get("components") or []:
+        for f in c.get("files") or []:
+            if f.get("connects"):
+                pats.setdefault(f.get("path"), []).extend(f["connects"])
+    out = []
+    for e in current_index(d):
+        if e["kind"] != "file":
+            continue
+        rec = load_record(d, e) or {}
+        text = rec.get("content") or ""
+        if NOT_READ.match(text.strip()):
+            continue
+        mine = [p for glob_, ps in pats.items() for p in ps if fnmatch.fnmatch(e["source"], os.path.expanduser(glob_ or ""))]
+        found = extract_endpoints(text, mine)
+        if found["connects"] or found["listens"]:
+            out.append({"host": e["host"], "file": e["source"], "evidence": e["id"], **found})
+    return out
 
 
 def _json_content(d: Path, e: dict):
@@ -2207,6 +2314,42 @@ def build_graph(name: str) -> dict:
                 edge(peer(rip), e["host"], f"{proto}/{lport}", "actual", process=r.get("process"), evidence=e["id"])
             else:
                 edge(e["host"], peer(rip), f"{proto}/{rport}", "actual", process=r.get("process"), evidence=e["id"])
+    # configured: what the hosts' config files say they connect to (and listen on): the intentional connections
+    by_name = {}
+    for nid, n in list(nodes.items()):
+        if n["kind"] == "host":
+            by_name[nid.lower()] = nid
+            by_name.setdefault(nid.lower().split(".")[0], nid)
+    for h in spec.get("hosts") or []:
+        if isinstance(h, dict):
+            for alias in h.get("names") or []:
+                by_name[alias.lower()] = h.get("name")
+
+    def resolve(target: str) -> str:
+        t = target.lower()
+        if t in addr:
+            return addr[t]
+        if t in by_name:
+            return by_name[t]
+        if t.split(".")[0] in by_name and not re.fullmatch(r"[\d.]+", t):
+            return by_name[t.split(".")[0]]
+        if re.fullmatch(r"[\d.]+|[0-9a-f:]+", t):
+            return peer(t)
+        return node(t, label=t, kind="peer", inside=False)["id"]
+    configured = configured_endpoints(d, spec)
+    for f in configured:
+        src = f["host"]
+        node(src, inside=True, component=comp_of.get(src))
+        for c in f["connects"]:
+            dst = resolve(c["host"])
+            if dst == src:
+                continue
+            edge(src, dst, f"{c['proto']}/{c['port']}", "configured", evidence=f["evidence"],
+                 config={"file": f["file"], "line": c["line"], "quote": c["quote"], "how": c["how"]})
+        for l in f["listens"]:
+            nodes[src].setdefault("configured_listens", [])
+            if l["port"] not in nodes[src]["configured_listens"]:
+                nodes[src]["configured_listens"].append(l["port"])
     # documented: the flows the SSP describes (documented.json, reviewed by a person)
     hosts_of = {c.get("name"): c.get("hosts") or [] for c in spec.get("components") or []}
     for f in documented:                                # a component stands for each of its hosts
@@ -2236,17 +2379,32 @@ def build_graph(name: str) -> dict:
         return False
 
     docs = [e for e in edges.values() if "documented" in e["layers"]]
+    confs = [e for e in edges.values() if "configured" in e["layers"]]
+    seen_edges = [e for e in edges.values() if "actual" in e["layers"]]
     for e in edges.values():
         L = e["layers"]
-        if "actual" in L:
-            e["allowed_by_rule"] = "allowed" in L or covered(e, allowed)
-            e["documented"] = "documented" in L or covered(e, docs)
-            e["class"] = ("undocumented" if documented and not e["documented"] else
-                          "not allowed" if instances and not e["allowed_by_rule"] and nodes[e["to"]]["inside"] and
-                          not nodes[e["from"]]["inside"] else "normal")
+        seen = "actual" in L
+        conf = "configured" in L or (seen and covered(e, confs))
+        doc = "documented" in L or covered(e, docs)
+        allowed_rule = "allowed" in L or covered(e, allowed)
+        e.update(configured=conf, documented=doc, allowed_by_rule=allowed_rule)
+        if seen or "configured" in L:                # the most urgent first
+            to_inside, from_outside = nodes[e["to"]]["inside"], not nodes[e["from"]]["inside"]
+            if seen and not (conf or allowed_rule or doc):
+                e["class"] = "unexpected"                # nothing explains it
+            elif "configured" in L and instances and to_inside and nodes[e["to"]]["kind"] == "host" \
+                    and not allowed_rule and not seen:
+                e["class"] = "blocked"                   # it would fail
+            elif seen and instances and to_inside and from_outside and not allowed_rule:
+                e["class"] = "unexpected"
+            elif documented and not doc:
+                e["class"] = "undocumented"
+            else:
+                e["class"] = "normal" if seen else "idle"
         elif "allowed" in L:
-            seen = any("actual" in x["layers"] and x["to"] == e["to"] and covered(x, [e]) for x in edges.values())
-            e["class"] = "normal" if seen else "unused"
+            used = any(x["to"] == e["to"] and covered(x, [e]) for x in seen_edges)
+            wanted = any(x["to"] == e["to"] and covered(x, [e]) for x in confs)
+            e["class"] = "normal" if used else "idle" if wanted else "unused"
         else:
             e["class"] = "documented only"
     out = {"system": name, "at": time.time(), "nodes": list(nodes.values()),
@@ -2288,8 +2446,10 @@ def layout(graph: dict) -> dict[str, tuple[int, int]]:
     return pos
 
 
-EDGE_STYLE = {"normal": ("#333333", ""), "unused": ("#888888", "dashed=1;"), "undocumented": ("#d62728", "strokeWidth=2;"),
-              "not allowed": ("#ff7f0e", "strokeWidth=2;"), "documented only": ("#1f77b4", "dashed=1;dashPattern=1 4;")}
+EDGE_STYLE = {"normal": ("#333333", ""), "idle": ("#2ca02c", "dashed=1;dashPattern=8 3 2 3;"),
+              "unused": ("#888888", "dashed=1;"), "undocumented": ("#d62728", "strokeWidth=2;"),
+              "unexpected": ("#ff7f0e", "strokeWidth=2;"), "blocked": ("#9467bd", "dashed=1;strokeWidth=2;"),
+              "documented only": ("#1f77b4", "dashed=1;dashPattern=1 4;")}
 
 
 def edge_ends(pos: dict, e: dict, k: int, n: int) -> tuple[float, float, float, float]:
@@ -2905,13 +3065,18 @@ SKILLS = {
     "atone-system-spec": ("Draft the system spec (system.json) and the documented flows (documented.json) for the "
                           "ISSE to review.", """
 1. `atone discover {{system}}` (with `--ssh USER@HOST` for each host you have access to). Read discovery.json.
-2. In system.json: the hosts (name, addresses), the components (which hosts run them; the config files that define
-   their connections and audit settings, from discovery's config list: `{"path": ...}`; never credential files),
-   what to collect (`collect`: kinds from atone's menu), and `aws.region` if it runs in AWS. Keep the generic linux
-   component's files.
-3. In documented.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
+2. In system.json: the hosts (name, addresses, other `names` it's known by), the components (which hosts run them;
+   every config file that defines what they connect to or listen on, and their audit settings, from discovery's
+   config list: `{"path": ...}`; never credential files), what to collect (`collect`: kinds from atone's menu), and
+   `aws.region` if it runs in AWS. Keep the generic linux component's files.
+3. The intentional connections come from those files: after `atone collect`, `atone connections {{system}}` shows
+   what atone's generic readers found in each (URLs, JDBC and TNS strings, host and port settings, listen
+   directives), with the line. Where a product's format hides a connection from them, add a pattern to that file's
+   entry: `"connects": [{"pattern": "a regex with named groups host and port", "about": "what it is"}]` (or
+   `"listens": true` with a port group), and check it finds what it should.
+4. In documented.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
    component name (or "internet"). Quote the SSP's section for each in "about".
-4. Ask the ISSE to review both; when they have, set `"reviewed": "who, when"` in system.json."""),
+5. Ask the ISSE to review both; when they have, set `"reviewed": "who, when"` in system.json."""),
     "atone-mappings": ("Draft control mappings, scanner mappings and workbook template mappings: data the ISSE "
                        "owns, run by atone's code.", """
 - **Control mappings** (mappings/*.json): for each control, the evidence that bears on it (`kind` from atone's menu,
@@ -2938,8 +3103,9 @@ SKILLS = {
    from the checks."""),
     "atone-drift": ("Investigate where the paperwork and the system disagree, and propose the fix.", """
 - Sources: flags in the fill's NAME.changes.json, failing checks (`atone plan` lists them), and the architecture
-  (`atone draw`): unused paths (a rule to tighten), undocumented ones (the SSP or the system is wrong), not allowed
-  ones, documented-only ones.
+  (`atone draw`): unexpected paths (seen, and nothing explains them: first), blocked ones (configured, no rule allows
+  them: they'll fail), undocumented ones (the SSP or the system is wrong), unused rules (attack surface to tighten),
+  idle ones (intended but quiet: worth a word in the SSP), documented-only ones.
 - For each: what the paperwork says, what the evidence shows (cite it), the likely cause, and two fixes: to the
   system (the exact change) and to the paperwork (the exact words). People choose.
 - Never change the system or the workbooks yourself to make them agree."""),
@@ -3055,6 +3221,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: the system's workbooks/*.xlsx")
     p.add_argument("--out", required=True, help="the folder for the filled copies and their change reports")
+    p = sub.add_parser("connections", help="what each config file says its host connects to and listens on")
+    p.add_argument("system")
     p = sub.add_parser("draw", help="the architecture: actual, allowed and documented paths, as draw.io and SVG")
     p.add_argument("system")
     p.add_argument("--out", required=True)
@@ -3145,6 +3313,17 @@ def main(argv: list[str] | None = None) -> int:
             print(inspect_workbook(Path(args.file)))
         elif args.cmd == "fill":
             fill_workbooks(args.system, Path(args.out), args.files)
+        elif args.cmd == "connections":
+            d = system_dir(args.system)
+            found = configured_endpoints(d, read_json(d / "system.json", {}))
+            for f in found:
+                print(f"{f['host']}  {f['file']}  ({f['evidence']})")
+                for c in f["connects"]:
+                    print(f"  -> {c['host']}:{c['port']}  line {c['line']}, {c['how']}: {c['quote'][:100]}")
+                for l in f["listens"]:
+                    print(f"  listens {l['port']}  line {l['line']}, {l['how']}")
+            print(f"{len(found)} config files with connections" if found else
+                  "no connections found in the collected config files (does the system spec name them?)")
         elif args.cmd == "draw":
             draw_system(args.system, Path(args.out))
         elif args.cmd == "plan":

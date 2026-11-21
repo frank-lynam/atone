@@ -388,7 +388,17 @@ class Architecture(unittest.TestCase):
         self.assertEqual(self.edges[("web01", "app01", "tcp/9000")], "normal")           # all three agree
         self.assertEqual(self.edges[("internet", "web01", "tcp/22")], "unused")           # open, never used
         self.assertEqual(self.edges[("app01", "db01", "tcp/1521")], "undocumented")       # allowed, used, not in the SSP
-        self.assertEqual(self.edges[("app01", "52.94.0.10", "tcp/443")], "undocumented")
+        self.assertEqual(self.edges[("app01", "52.94.0.10", "tcp/443")], "unexpected")      # nothing explains it
+
+    def test_intentional_connections_come_from_the_config_files(self):
+        e = {(x["from"], x["to"], x["port"]): x for x in self.g["edges"]}
+        self.assertIn("configured", e[("web01", "app01", "tcp/9000")]["layers"])           # nginx's proxy_pass
+        self.assertEqual(e[("app01", "db01", "tcp/1521")]["config"]["file"], "/opt/app/application.properties")
+        self.assertEqual(self.edges[("app01", "smtp.example.internal", "tcp/25")], "idle")      # intended, documented, quiet
+        self.assertEqual(self.edges[("app01", "backup.example.internal", "tcp/443")], "undocumented")
+        self.assertEqual(self.edges[("app01", "db01", "tcp/5432")], "blocked")                # configured; no rule allows it
+        web = next(n for n in self.g["nodes"] if n["id"] == "web01")
+        self.assertEqual(web["configured_listens"], [443])
         self.assertEqual(self.edges[("db01", "backup.example.internal", "tcp/443")], "documented only")
         self.assertEqual(self.edges[("34.200.1.7", "web01", "tcp/443")], "normal")         # covered by 0.0.0.0/0
 
@@ -516,6 +526,36 @@ class MoreEvidence(unittest.TestCase):
         self.assertEqual(atone.run_check(chk, recs, "au-11", {"au-11_odp": "365 days"})["status"], "fail")
         spec = [atone.load_record(d, idx["eaveswatch interpreter v2"])]
         self.assertEqual(atone.run_check(m["au-6"]["checks"][1], spec, "au-6", {})["status"], "pass")
+
+
+class Configured(unittest.TestCase):
+    """Intentional connections, from config files, with readers that know no product."""
+
+    def ends(self, text, patterns=None):
+        r = atone.extract_endpoints(text, patterns)
+        return [(c["host"], c["port"]) for c in r["connects"]], [l["port"] for l in r["listens"]]
+
+    def test_urls_jdbc_tns_and_nearby_settings(self):
+        conn, listen = self.ends("server.port=9000\nspring.datasource.url=jdbc:oracle:thin:@//db01.ex.internal:1521/P\n"
+                                 "ldap.url=ldaps://ldap.ex.internal\nmail.host=smtp.ex.internal\nmail.port=25\n")
+        self.assertEqual(conn, [("db01.ex.internal", 1521), ("ldap.ex.internal", 636), ("smtp.ex.internal", 25)])
+        self.assertEqual(listen, [9000])
+        self.assertEqual(self.ends("PROD=(ADDRESS=(PROTOCOL=TCP)(HOST=db01)(PORT=1521))")[0], [("db01", 1521)])
+        self.assertEqual(self.ends("<url>jdbc:oracle:thin:@db01:1521:PROD</url>")[0], [("db01", 1521)])
+
+    def test_what_isnt_a_connection(self):
+        conn, _ = self.ends("# proxy_pass http://old.ex.internal:8080;\ncache=redis://localhost:6379\n"
+                            "<domain xmlns=\"http://xmlns.oracle.com/weblogic/domain\">\nAPI=https://${API_HOST}/v1\n")
+        self.assertEqual(conn, [])
+
+    def test_listeners_in_their_usual_forms(self):
+        for text, want in (("    listen 443 ssl;", [443]), ("listen [::]:8443 ssl http2;", [8443]), ("Port 22", [22]),
+                           ("<listen-port>7001</listen-port><ssl-listen-port>7002</ssl-listen-port>", [7001, 7002])):
+            self.assertEqual(self.ends(text)[1], want, text)
+
+    def test_a_system_specs_own_pattern(self):
+        pat = [{"pattern": r"WSL=//(?P<host>[\w.-]+):(?P<port>\d+)", "about": "a WSL address"}]
+        self.assertEqual(self.ends("WSL=//jolt01:9100\n", pat)[0], [("jolt01", 9100)])
 
 
 class Oscal(unittest.TestCase):

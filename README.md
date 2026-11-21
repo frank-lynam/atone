@@ -5,8 +5,9 @@ Keeps a system's authorization (ATO) true to the system.
 atone is an **expert pack for [hobkin](https://github.com/frank-lynam/hobkin)**: install it, and a hobkin becomes a
 compliance engineer's apprentice. It's also a deterministic toolkit anyone can run without an agent. It collects
 evidence from the real system, checks NIST SP 800-53 controls against it, verifies every claim a drafted narrative
-cites, fills in the customer's own workbooks, and draws the architecture as it really is (draw.io), with the drift
-between the paperwork and the system called out. People decide; atone drafts and proves. It never declares
+cites, fills in the customer's own workbooks, and draws the architecture as it really is (draw.io): the
+connections its configuration intends, the ones seen, the ones rules allow and the ones the SSP documents, with
+where they disagree called out. People decide; atone drafts and proves. It never declares
 anything compliant. The design is in [DESIGN.md](DESIGN.md).
 
 Standard library only (plus [lorewell](https://github.com/frank-lynam/lorewell) for lores), one file of code, no
@@ -43,7 +44,8 @@ atone evidence tst search keep_logs            # ranked full-text search over th
 atone check tst                                # every control: met, partly, not met, unknown, inherited
 atone verify tst                               # drafted narratives: each claim's citation checked
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why
-atone draw tst --out package/                  # the architecture: actual, allowed, documented (draw.io, SVG)
+atone connections tst                          # the intentional connections each config file defines
+atone draw tst --out package/                  # the architecture: configured, seen, allowed, documented (draw.io)
 atone oscal tst --out package/oscal/           # the SSP, assessment results and POA&M as OSCAL 1.1.2
 atone plan tst                                 # the plan (PLAN.md)
 atone report tst --out package/ [--conmon]     # report.html

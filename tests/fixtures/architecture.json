@@ -25,12 +25,22 @@
     "name": "web",
     "hosts": [
      "web01"
+    ],
+    "files": [
+     {
+      "path": "/etc/nginx/nginx.conf"
+     }
     ]
    },
    {
     "name": "app",
     "hosts": [
      "app01"
+    ],
+    "files": [
+     {
+      "path": "/opt/app/application.properties"
+     }
     ]
    },
    {
@@ -282,6 +292,18 @@
      }
     ]
    }
+  ],
+  [
+   "file",
+   "web01",
+   "/etc/nginx/nginx.conf",
+   "server {\n    listen 443 ssl;\n    location / { proxy_pass http://app01.example.internal:9000; }\n}\n"
+  ],
+  [
+   "file",
+   "app01",
+   "/opt/app/application.properties",
+   "server.port=9000\nspring.datasource.url=jdbc:oracle:thin:@//db01.example.internal:1521/PROD\nbackup.target=https://backup.example.internal/upload\nmail.host=smtp.example.internal\nmail.port=25\nreports.url=postgresql://db01.example.internal:5432/reports\n"
   ]
  ],
  "documented": [
@@ -303,6 +325,12 @@
    "to": "backup.example.internal",
    "port": "tcp/443",
    "data": "backups"
+  },
+  {
+   "from": "app",
+   "to": "smtp.example.internal",
+   "port": "tcp/25",
+   "data": "notifications"
   }
  ]
 }

@@ -200,26 +200,34 @@ matrix. `atone fill` fills them in without wrecking them:
 - each filled cell's evidence goes in an added column or a companion sheet, and every run writes a **diff report**:
   what changed, why, and what proves it.
 
-### 4.7 Architecture: actual, possible, documented
+### 4.7 Architecture: configured, seen, allowed, documented
 
-`atone draw` builds one graph of the system from three layers:
+`atone draw` builds one graph of the system from four layers:
 
-1. **Actual:** connections seen (the `flows` collector over time, eaveswatch, VPC Flow Logs where they're on).
-2. **Possible:** what's allowed: security groups, network ACLs, routes, load balancer listeners, host firewalls, and
-   the paths the components' config files define (from the system spec).
-3. **Documented:** the boundary and data flows the SSP describes.
+1. **Configured:** the intentional connections. The config files the system spec names are read for what each
+   program connects to and listens on, by generic readers that know no product (URLs and a scheme's usual port, JDBC
+   and Oracle TNS strings, host and port settings near each other, listen directives), plus patterns in the system
+   spec (regexes, drafted by the agent, reviewed) for formats they miss. Each path keeps its file, line and evidence.
+   `atone connections` lists what was found.
+2. **Seen:** connections observed (the `flows` collector, every snapshot in the freshness window; eaveswatch;
+   VPC Flow Logs where they're on).
+3. **Allowed:** security groups (ranges and other groups), and host firewalls.
+4. **Documented:** the boundary and data flows the SSP describes (documented.json, reviewed).
 
-| Line | Means |
+| Class | Means |
 |---|---|
-| solid | seen and allowed: normal |
-| dashed | allowed but never seen: unused attack surface, with the rule to tighten |
-| red | seen but not documented or not allowed: the SSP is out of date, or something is talking that shouldn't be |
+| unexpected | seen, but no config, rule or document explains it (first to look at) |
+| blocked | configured, but no rule allows it: it would fail |
+| undocumented | configured or seen, but not in the SSP |
+| unused | allowed by a rule, but nothing configures or uses it: attack surface, with the rule to tighten |
+| idle | configured but not seen in the window: intended, just quiet |
+| documented only | in the SSP, but neither configured nor seen |
+| normal | configured (or documented, or allowed), and seen |
 
 The authorization boundary is computed, not drawn by hand, so interconnections can't hide outside it. The diagrams
 are first for the engineering team: accurate and useful for understanding the system, not just for the package.
-Output is **draw.io** files (editable, and readable by most tools) plus SVG, laid out by tier: the boundary diagram, the network
-diagram, and a data flow diagram per data type, regenerated every run with a diff. They feed SC-7, AC-4, CA-3,
-CM-7, CM-8 and the SSP's architecture sections.
+Output is **draw.io** files (editable, and readable by most tools) plus SVG, laid out by tier, regenerated every run
+with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture sections.
 
 ### 4.8 Drift and the POA&M
 
