@@ -799,6 +799,16 @@ class CommandLine(unittest.TestCase):
                          [True, True, False, False, True])
         self.assertTrue(atone.in_boundary({})("anything"))                     # until the spec names hosts
 
+    def test_each_mapping_format_is_written_once_and_checked(self):
+        for kind, fmt in atone.mapping_formats().items():
+            self.assertEqual(atone.format_problems(fmt, fmt["example"]), [], kind)   # its own example holds
+            self.assertIn("example:", atone.describe_format(kind))
+        self.assertEqual(atone.format_problems(atone.SCANNER_MAPPING, json.loads((FIX / "vulns.mapping.json").read_text())), [])
+        bad = {**atone.SSP_MAPPING["example"], "header-row": 3, "status_values": {"met": "Implemented", "done": "X"}}
+        probs = atone.format_problems(atone.SSP_MAPPING, bad)
+        self.assertTrue(any("'header-row'" in p for p in probs) and any("'done'" in p for p in probs))
+        self.assertTrue(all(atone.format_problems(atone.CONTROL_MAPPING, m) == [] for m in atone.STARTER_MAPPINGS))
+
     def test_a_word_document_reads_as_text_headings_lists_and_tables(self):
         t = atone.doc_text(FIX / "ssp.docx")                                    # made by LibreOffice, as Word saves
         self.assertIn("## 9.3 Interconnections", t)

@@ -25,6 +25,9 @@ DESIGN.md is the design; read the section you're working on. The rules that hold
 - **The codex is the source of truth** (DESIGN.md §4b): one git repository per system. atone commits what it changes,
   with trailers (Control, Status, Evidence, Drafted-by, Reviewed-by, Decided-by, Package); every artifact is
   generated from it. `runs/` is local and ignored: nothing in it may be the only copy of anything.
+- **Write a fact once, in the code.** A format, a field list or a menu lives beside the code that reads it (as
+  `SCANNER_MAPPING`, `CHECK_TYPES` and `COLLECTORS` do), and the CLI prints it (`atone mappings --example`). Skills
+  and docs say what to do and why, and point there for the how: never a second copy that can drift.
 - **No auto-updates or migrations.**
 - **Tests:** `python3 tests/test_atone.py` (fixtures only: no AWS, no network, no model). Add a check for what you
   change; run what you changed, CI runs the rest.

@@ -759,10 +759,34 @@ def severity_of(value: str, rules: dict) -> str:
     return v or "unknown"
 
 
+# A mapping format: what each key means, what's required, an example. The readers check mappings against these, and
+# `atone mappings --example KIND` prints them: the one place a format is written down.
+SCANNER_MAPPING = {
+    "file": "mappings/scanners/TOOL.mapping.json", "about": "how to read one scanner's exports",
+    "keys": {"tool": "the scanner's name (it names the evidence)", "format": "csv or xml",
+             "match": "a glob for its export files' names", "record": "xml only: the path to each finding",
+             "fields": "{atone's field: the export's column (csv) or path (xml)}",
+             "severity": "{critical|high|moderate|low: the export's words, or \">=N\" for a numeric score}"},
+    "required": ["tool", "match", "fields"],
+    "fields": {"host": "the asset's name (required)", "address": "its IP address", "finding": "what's wrong "
+               "(required)", "id": "the scanner's id for it", "severity": "its severity", "cve": "CVE ids",
+               "first_seen": "when it was first found", "solution": "the fix", "status": "open, fixed..."},
+    "required_fields": ["host", "finding"],
+    "open_fields": "any other field is kept as it is in each finding, for checks to read (agent_version, policy...)",
+    "example": {"tool": "vulnscanner", "format": "csv", "match": "vulns-*.csv",
+                "fields": {"host": "Asset Names", "address": "Asset IP Address", "finding": "Vulnerability Title",
+                           "id": "Vulnerability ID", "severity": "Severity Level", "cve": "CVE IDs",
+                           "first_seen": "First Found", "solution": "Solution"},
+                "severity": {"critical": ">=9", "high": ">=7", "moderate": ">=4", "low": ">=0"}},
+}
+
+
 def import_mapped(path: Path, mapping: dict) -> list[dict]:
-    """A scanner's export read through its mapping file: {"tool", "format": "csv"|"xml", "record" (xml: the path to each
-    finding), "fields": {host, finding, id, severity, cve, first_seen, solution, status: the column or path of each},
-    "severity": {name: values or ">=N"}}. One piece of evidence per host."""
+    """A scanner's export read through its mapping file (SCANNER_MAPPING says what's in one). One piece of evidence
+    per host."""
+    probs = format_problems(SCANNER_MAPPING, mapping)
+    if probs:
+        raise AtoneError(f"{mapping.get('_file', 'the mapping')}: " + "; ".join(probs))
     fields = mapping.get("fields") or {}
     if not fields.get("host") or not fields.get("finding"):
         raise AtoneError(f"{mapping.get('_file', 'the mapping')}: fields needs at least host and finding")
@@ -1606,6 +1630,17 @@ CHECK_TYPES = {
     "security_groups": "the account's security groups reviewed (AWS evidence): fails on findings at the severities in "
                        "fail_on (default high, moderate); public_ports are the ports meant to be open to the world",
 }
+CONTROL_MAPPING = {
+    "file": "mappings/controls/NAME.json (one mapping or a list)", "about": "the evidence that bears on a control, "
+    "and the checks atone runs on it",
+    "keys": {"control": "its id, lower case (au-11)", "about": "what it covers, in a line",
+             "evidence": "[{name, kind (a collector, scan, logs or site), source (a glob), component, host, tool}]",
+             "checks": "[{id, what, type (CHECK_TYPES), evidence (an evidence name), pattern, op, value, "
+                       "field_patterns, fail_on, public_ports, controls}]",
+             "needs_person": "[what only a person can supply, citing the control's parts]"},
+    "required": ["control"],
+    "example": next(m for m in STARTER_MAPPINGS if m["control"] == "au-11"),
+}
 STATUSES = ("met", "partly", "not met", "unknown", "inherited")
 NOT_READ = re.compile(r"^(not collected|not readable here|.*: not installed here|.*collector failed)", re.I)
 
@@ -1621,9 +1656,25 @@ def load_mappings(d: Path) -> dict[str, dict]:
     return out
 
 
+def format_problems(fmt: dict, m: dict) -> list[str]:
+    """What a mapping has that its format doesn't (a misspelt key is otherwise silently ignored), or lacks."""
+    out = [f"no {k!r}" for k in fmt.get("required") or [] if not m.get(k)]
+    out += [f"{k!r} isn't a key atone reads (it reads {', '.join(fmt['keys'])})" for k in m
+            if not k.startswith("_") and k not in fmt["keys"]]
+    for part in ("fields", "columns"):
+        if part in fmt and isinstance(m.get(part), dict):
+            out += [f"{part}: {k!r} isn't one atone reads (it reads {', '.join(fmt[part])})" for k in m[part]
+                    if k not in fmt[part] and not fmt.get("open_" + part)]
+            out += [f"{part} needs {k!r}" for k in fmt.get("required_" + part) or [] if not m[part].get(k)]
+    if "status_values" in fmt and isinstance(m.get("status_values"), dict):
+        out += [f"status_values: {k!r} isn't one of atone's ({', '.join(fmt['status_values'])})"
+                for k in m["status_values"] if k not in fmt["status_values"]]
+    return out
+
+
 def mapping_problems(m: dict) -> list[str]:
-    """What's wrong with a mapping (an empty list: nothing)."""
-    out, names = [], {e.get("name") for e in m.get("evidence") or []}
+    """What's wrong with a control mapping (an empty list: nothing)."""
+    out, names = format_problems(CONTROL_MAPPING, m), {e.get("name") for e in m.get("evidence") or []}
     for e in m.get("evidence") or []:
         if e.get("kind") not in set(COLLECTORS) | {"scan", "site", "logs"}:
             out.append(f"evidence {e.get('name')!r}: kind {e.get('kind')!r} isn't a collector, scan, logs or site")
@@ -2509,6 +2560,67 @@ def check_status_values(wb: Workbook, sheet: str, ref: str, mapping: dict) -> li
             for k, v in (mapping.get("status_values") or {}).items() if v and v not in allowed]
 
 
+_WORKBOOK_KEYS = {"match": "a glob for the workbook's file name", "kind": "ssp or poam", "sheet": "the sheet's name",
+                  "header_row": "the row the column headers are on (1 is the first)",
+                  "columns": "{atone's field: the column's header text, exactly (or its letters: C)}",
+                  "status_values": "{atone's status: the workbook's own drop-down value, exactly as written}"}
+SSP_MAPPING = {
+    "file": "mappings/workbooks/NAME.mapping.json", "about": "where an SSP control matrix keeps each control's status "
+    "and implementation statement", "keys": _WORKBOOK_KEYS, "required": ["match", "kind", "sheet", "columns"],
+    "columns": {"control": "the control id (required)", "status": "its implementation status",
+                "statement": "its implementation statement", "evidence": "where atone notes its evidence"},
+    "required_columns": ["control"], "status_values": ["met", "partly", "not met", "inherited"],
+    "example": {"match": "ssp-*.xlsx", "kind": "ssp", "sheet": "Controls", "header_row": 3,
+                "columns": {"control": "Control ID", "status": "Status", "statement": "Implementation Statement",
+                            "evidence": "Evidence"},
+                "status_values": {"met": "Implemented", "partly": "Partially Implemented", "not met": "Planned",
+                                  "inherited": "Inherited"}},
+}
+POAM_MAPPING = {
+    "file": "mappings/workbooks/NAME.mapping.json", "about": "a POA&M's item rows, for adding what's open",
+    "keys": {**_WORKBOOK_KEYS, "id_format": "the ids of rows atone adds (default ATONE-{n:04d})"},
+    "required": ["match", "kind", "sheet", "columns"],
+    "columns": {"id": "the item's id", "weakness": "its name (required)", "description": "what it is",
+                "control": "the control", "severity": "its severity", "detected": "when it was found",
+                "due": "its scheduled completion (only from an approved schedule)", "status": "open or closed",
+                "source": "what found it", "asset": "where (required)", "evidence": "atone's evidence id"},
+    "required_columns": ["weakness", "asset"], "status_values": ["open", "closed"],
+    "example": {"match": "poam*.xlsx", "kind": "poam", "sheet": "POA&M Items", "header_row": 1,
+                "columns": {"id": "POA&M ID", "weakness": "Weakness Name", "description": "Weakness Description",
+                            "control": "Security Control", "severity": "Severity", "detected": "Detection Date",
+                            "due": "Scheduled Completion Date", "status": "Status", "source": "Source",
+                            "asset": "Asset"},
+                "status_values": {"open": "Open", "closed": "Closed"}},
+}
+
+
+def mapping_formats() -> dict:
+    return {"controls": CONTROL_MAPPING, "scanner": SCANNER_MAPPING, "ssp": SSP_MAPPING, "poam": POAM_MAPPING}
+
+
+def describe_format(kind: str) -> str:
+    """A mapping format as text: the same definitions the readers check mappings against."""
+    formats = mapping_formats()
+    if kind not in formats:
+        return "mapping formats: " + ", ".join(f"{k} ({f['about']})" for k, f in formats.items()) + \
+               "\n  atone mappings --example KIND"
+    f = formats[kind]
+    out = [f"# {kind}: {f['about']}", f"file: {f['file']}", "", "keys:"]
+    out += [f"  {k}{' (required)' if k in f.get('required', []) else ''}: {v}" for k, v in f["keys"].items()]
+    for part in ("fields", "columns"):
+        if part in f:
+            out += ["", f"{part}:"] + [f"  {k}: {v}" for k, v in f[part].items()]
+            if f.get("open_" + part):
+                out.append(f"  (others: {f['open_' + part]})")
+    if "status_values" in f:
+        out += ["", "status_values: atone's " + ", ".join(f["status_values"]) + " (map each to the workbook's own)"]
+    if kind == "controls":
+        out += ["", "check types:"] + [f"  {k}: {v}" for k, v in CHECK_TYPES.items()]
+        out += ["", "evidence kinds: " + ", ".join(list(COLLECTORS) + ["scan", "logs", "site"])]
+    out += ["", "example:", json.dumps(f["example"], indent=2)]
+    return "\n".join(out)
+
+
 def plan_ssp(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
     """The cells to set in an SSP control matrix, from the latest checks and the verified narratives: (edits, changes,
     flags). What's already filled in is kept; where the evidence disagrees with it, that's a flag, not an edit."""
@@ -2657,6 +2769,9 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
         if not m:
             raise AtoneError(f"{path.name}: no template mapping matches it (mappings/workbooks/NAME.mapping.json, "
                              "\"match\": a glob)")
+        probs = format_problems(POAM_MAPPING if m.get("kind") == "poam" else SSP_MAPPING, m)
+        if probs:
+            raise AtoneError(f"{m['_file']}: " + "; ".join(probs))
         wb = Workbook(path)
         styles = None
         if m.get("kind") == "poam":
@@ -3997,25 +4112,17 @@ SKILLS = {
    them; when they have, they set `"reviewed": "who, when"` in system.json and merge."""),
     "atone-mappings": ("Draft control mappings, scanner mappings and workbook template mappings: data the ISSE "
                        "owns, run by atone's code.", """
-- **Control mappings** (mappings/controls/*.json): for each control, the evidence that bears on it (`kind` from atone's menu,
-  `source` as a glob, `component`), checks (`present`, `absent`, `value` with `op` against a value or `{param:ID}`,
-  `count` with `field_patterns`, `scan`, `findings`, `exists`), and `needs_person` (what only a person can supply).
-  Start from mappings/controls/starter.json; look the control up in the controls lore (its objective says what to check).
-  `atone mappings {{system}}` shows what's wrong with any.
-- **Scanner mappings** (mappings/scanners/TOOL.mapping.json): `atone import {{system}} --sample FILE` shows the columns; map
-  host, finding, id, severity (in the customer's words), cve, first_seen, solution. For example:
-  `{"tool": "vulnscanner", "format": "csv", "match": "vulns-*.csv", "fields": {"host": "Asset Names", "address":
-  "Asset IP Address", "finding": "Vulnerability Title", "id": "Vulnerability ID", "severity": "Severity Level",
-  "cve": "CVE IDs", "first_seen": "First Found", "solution": "Solution"}, "severity": {"critical": ">=9", "high":
-  ">=7", "moderate": ">=4", "low": ">=0"}}` (`severity` maps a numeric score; leave it out if the column is words).
-- **Template mappings** (mappings/workbooks/NAME.mapping.json): `atone workbook inspect FILE`; map the sheet, the header row,
-  the columns, and `status_values` (atone's met, partly, not met, inherited, open, closed) to the workbook's own
-  drop-down values, exactly as written there. For example, an SSP matrix: `{"match": "ssp-*.xlsx", "kind": "ssp",
-  "sheet": "Controls", "header_row": 3, "columns": {"control": "Control ID", "status": "Status", "statement":
-  "Implementation Statement", "evidence": "Evidence"}, "status_values": {"met": "Implemented", "partly": "Partially
-  Implemented", "not met": "Planned", "inherited": "Inherited"}}`; a POA&M (`"kind": "poam"`) maps the columns id,
-  weakness, description, control, severity, detected, due, status, source and asset, and `status_values` open and
-  closed. Columns are named by their header text, exactly.
+Each kind's format (its keys, what each means, an example) is `atone mappings --example KIND`: the definitions atone's
+readers check mappings against, so it's always current. How a mapping is used is in the code beside it
+(`python3 -c "import atone; help(atone.import_mapped)"`, or `grep -n '^# ----'` in atone's file for its sections).
+- **Control mappings** (mappings/controls/*.json; `--example controls`): for each control, the evidence that bears
+  on it, checks as data, and `needs_person` (what only a person can supply). Start from mappings/controls/starter.json;
+  look the control up in the controls lore (its objective says what to check).
+- **Scanner mappings** (mappings/scanners/TOOL.mapping.json; `--example scanner`): `atone import {{system}} --sample
+  FILE` shows the export's columns; map them to atone's fields, severity in the customer's words.
+- **Template mappings** (mappings/workbooks/NAME.mapping.json; `--example ssp`, `--example poam`): `atone workbook
+  inspect FILE` shows the sheets, header rows and drop-downs; `status_values` are the workbook's own words, exactly.
+- `atone mappings {{system}}` checks every mapping against its format: a misspelt key is caught, never ignored.
 - Commit them on a branch (`atone commit {{system}} "..."`) and ask the ISSE to confirm each; mappings are drafts
   until they're merged."""),
     "atone-narratives": ("Write implementation statements as cited claims, and verify them.", """
@@ -4152,8 +4259,10 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("verify", help="check the citations in drafted narratives (drafts/*.json)")
     p.add_argument("system")
     p.add_argument("drafts", nargs="*", help="default: every draft in drafts/")
-    p = sub.add_parser("mappings", help="the system's control mappings, and anything wrong with them")
-    p.add_argument("system")
+    p = sub.add_parser("mappings", help="a system's mappings and anything wrong with them; --example KIND: a format")
+    p.add_argument("system", nargs="?")
+    p.add_argument("--example", nargs="?", const="", metavar="KIND",
+                   help="a mapping format (controls, scanner, ssp, poam): its keys, what each means, an example")
     p = sub.add_parser("workbook", help="inspect FILE: a workbook's sheets, headers and drop-downs (for its mapping)")
     p.add_argument("what", choices=["inspect"])
     p.add_argument("file")
@@ -4313,11 +4422,23 @@ def main(argv: list[str] | None = None) -> int:
                       f"{cov['dropped']} dropped" + "".join(f"\n  dropped: {x['text'][:80]} ({x['why']})"
                                                           for x in v["dropped"]))
         elif args.cmd == "mappings":
-            maps = load_mappings(system_dir(args.system))
-            for cid, m in maps.items():
-                probs = mapping_problems(m)
-                print(f"{cid:<10} {m.get('about', '')[:60]:<60} {m['_file']}" + "".join(f"\n  ! {x}" for x in probs))
-            print(f"{len(maps)} mappings")
+            if args.example is not None:
+                print(describe_format(args.example))
+            elif not args.system:
+                raise AtoneError("which system? (or --example KIND for a mapping format)")
+            else:
+                d = system_dir(args.system)
+                maps = load_mappings(d)
+                for cid, m in maps.items():
+                    probs = mapping_problems(m)
+                    print(f"{cid:<10} {m.get('about', '')[:60]:<60} {m['_file']}" + "".join(f"\n  ! {x}" for x in probs))
+                print(f"{len(maps)} control mappings")
+                for kind, folder in (("scanner", "scanners"), ("workbook", "workbooks")):
+                    for f in sorted((d / "mappings" / folder).glob("*.mapping.json")):
+                        m = read_json(f, {})
+                        fmt = SCANNER_MAPPING if kind == "scanner" else POAM_MAPPING if m.get("kind") == "poam" else SSP_MAPPING
+                        probs = format_problems(fmt, m)
+                        print(f"{kind:<10} {f.relative_to(d)}" + ("".join(f"\n  ! {x}" for x in probs) or "  ok"))
         elif args.cmd == "workbook":
             print(inspect_workbook(Path(args.file)))
         elif args.cmd == "fill":
