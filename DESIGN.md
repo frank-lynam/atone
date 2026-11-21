@@ -260,6 +260,89 @@ with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture s
   a click away;
 - `oscal/`: the SSP, assessment results and POA&M as OSCAL, for whoever takes machine-readable packages.
 
+## 4b. The atone codex: the system's security history, as a git history
+
+*Designed, not built yet.*
+
+Everything atone knows about a system lives in one git repository per system: **the codex**. The authorization
+boundary is the repository, so access is the repository's permissions. It's the single source of truth: every
+artifact (the workbooks, the POA&M, OSCAL, the diagrams, the report) is generated from it, never edited by hand.
+Its history is the system's security history: every change to the system, to what we understand and assert about
+it, and to what was decided and delivered is a commit.
+
+### Three layers
+
+| Layer | What it is | Changes when |
+|---|---|---|
+| **Evidence** | what the system is: collected and imported, normalized, redacted, never edited | the system changes |
+| **The model** | what we understand and assert: curated, reviewed | someone decides something |
+| **Artifacts** | the packages people and assessors receive | regenerated from the two; kept at each delivery |
+
+Drift is exact: the model says X, the latest evidence says Y.
+
+### The repository
+
+| Path | Holds | A commit there means |
+|---|---|---|
+| `system.json`, `components/`, `interfaces/`, `boundary.json`, `roles.json` | what the system is: purpose, owners, FIPS 199 categorization and data types, components, intended flows (with the data each carries), interconnections, user roles | the understanding of the system changed |
+| `controls/ac-2.json`... | each control: responsibility (system, inherited, shared), status, its implementation as claims with citations, review | a statement or status changed, and who reviewed it |
+| `decisions/` | tailoring, risk acceptances, deviations, false positives, approved dates, each with who and why | someone decided something |
+| `poam/` | one file per item, from opened to closed | a weakness was found, scheduled, fixed |
+| `mappings/` | the ISSE's control, scanner and workbook mappings | how the system is assessed changed |
+| `evidence/HOST/KIND/SOURCE.json` | the latest observed state at stable paths, normalized and redacted | **the system itself changed** |
+| `packages/TAG/` | exactly what was delivered | a package went out |
+| `CODEX.md` | what's here and how to read it | |
+
+**Evidence snapshots:** each collect overwrites `evidence/` and commits only what changed, so its history is the real
+system's: a package updated, an account added, a security group opened, a certificate renewed, each a dated diff.
+Unchanged content costs nothing (git stores it once). Raw scanner exports and other big files stay in the store (S3
+or a folder); the codex records their hashes and holds what's normalized from them.
+
+**Provenance in every fact and every commit.** A fact is *observed* (evidence id), *configured* (file and line),
+*asserted* (a named person, a date) or *drafted* (the agent; a draft until reviewed). Commits carry it as trailers,
+so `git log` is the audit trail:
+
+```
+AC-2: implementation statement drafted from evidence
+
+Control: ac-2
+Status: unknown -> partly
+Evidence: accounts.app01.20261121T1746Z.4952e9f8
+Drafted-by: hobkin bodkin
+Reviewed-by: Jane Doe (ISSE)
+```
+
+People commit as themselves, the agent as itself; commits can be signed (git's SSH or GPG signing) where the
+customer wants non-repudiation.
+
+### Change control is the git workflow
+
+- **`main`** is the system as currently understood and approved.
+- **The agent works on branches:** drafted narratives, a proposed POA&M schedule, a security impact analysis for a
+  change. Merging is approval; the merge names who approved (CM-3, CM-4).
+- **Tags** mark milestones (`ato-2026-12`, `conmon-2026-11`, `assessment-2027`); `packages/TAG/` holds what was
+  delivered, and checking a tag out regenerates the package as it stood.
+
+### What the history answers
+
+- When was SSH opened to the world, and what changed just before? (`atone history`, or `git log` on the evidence)
+- Who wrote and who approved AC-2's statement, on what evidence? (`git blame`, the trailers)
+- What did the assessor see at the ATO, and what's changed since? (a diff against the tag)
+- Which POA&M items were open on March 1?
+
+### Safeguards
+
+- **Nothing secret gets committed:** the redaction floor before anything is written, and a second scan at commit
+  time that refuses the commit; a documented purge procedure for the worst case (git history is forever).
+- **Summaries only,** per system or per kind of evidence, where full snapshots are too sensitive: hashes and what
+  changed, without the content.
+
+### Settled
+
+- Evidence in git: full normalized snapshots by default (summaries where a system needs them).
+- The remote: the team's internal git server (configurable; there's no internet).
+- Commit signing: optional.
+
 ## 5. The engagement: a plan first
 
 The first thing the hobkin does on a new system is make **the plan**: one big to-do list of every piece of the
