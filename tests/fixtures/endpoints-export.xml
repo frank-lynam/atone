@@ -1,0 +1,4 @@
+<report><systems>
+  <system name="app01.example.internal"><agent version="5.8.1" status="managed"/><dat>11240</dat><policy>Server Baseline</policy><threat count="0"/></system>
+  <system name="db01.example.internal"><agent version="5.7.9" status="unmanaged"/><dat>11102</dat><policy>Server Baseline</policy><threat count="2"/></system>
+</systems></report>

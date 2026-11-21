@@ -128,6 +128,53 @@ class Controls(unittest.TestCase):
         self.assertIn(nist, body)                              # exactly NIST's words
 
 
+class Imports(unittest.TestCase):
+    def test_control_references(self):
+        self.assertEqual(atone.control_ids("AC-17(a),CM-7(a)"), ["ac-17", "cm-7"])   # parts: the control
+        self.assertEqual(atone.control_ids("AC-2(1)"), ["ac-2.1"])                 # enhancements
+        self.assertEqual(atone.control_ids("IA-5(1)(a)"), ["ia-5.1"])
+
+    def test_openscap_results_with_their_controls(self):
+        [rec] = atone.import_oscap(FIX / "oscap-results.xml")
+        self.assertEqual(rec["host"], "app01.example.internal")
+        rules = {r["title"]: r for r in rec["content"]["results"]}
+        self.assertEqual(rules["Set Interactive Session Timeout"]["result"], "fail")
+        self.assertEqual(rules["Set Interactive Session Timeout"]["controls"], ["ac-12", "sc-10"])
+        self.assertNotIn("Uninstall telnet", rules)             # not selected: not a result
+
+    def test_a_csv_export_through_its_mapping(self):
+        mapping = json.loads((FIX / "vulns.mapping.json").read_text())
+        recs = {r["host"]: r for r in atone.import_file(FIX / "vulns-export.csv", [mapping])}
+        app = recs["app01.example.internal"]["content"]["findings"]
+        self.assertEqual([f["severity"] for f in app], ["critical", "moderate"])    # the customer's words
+        self.assertEqual(recs["db01.example.internal"]["content"]["findings"][0]["cve"], ["CVE-2026-2222", "CVE-2026-2223"])
+
+    def test_an_xml_export_through_its_mapping(self):
+        mapping = json.loads((FIX / "endpoints.mapping.json").read_text())
+        recs = {r["host"]: r["content"]["findings"][0] for r in atone.import_file(FIX / "endpoints-export.xml", [mapping])}
+        self.assertEqual(recs["db01.example.internal"]["finding"], "unmanaged")
+        self.assertEqual(recs["app01.example.internal"]["agent_version"], "5.8.1")
+
+    def test_a_file_nothing_can_read_says_how_to_make_a_mapping(self):
+        with self.assertRaises(atone.AtoneError) as e:
+            atone.import_file(FIX / "vulns-export.csv", [])
+        self.assertIn("--sample", str(e.exception))
+
+    def test_imports_add_to_the_current_evidence_alongside_collected(self):
+        d = atone.init_system("imp", None)
+        for f in ("oscap-results.xml", "vulns-export.csv", "vulns.mapping.json"):
+            shutil.copy(FIX / f, d / "imports" / f)
+        atone.collect("imp", ["accounts"], log=lambda *a: None)
+        atone.import_results("imp", log=lambda *a: None)
+        kinds = {(e["kind"], e["source"].split(" (")[0]) for e in atone.current_index(d)}
+        self.assertIn(("accounts", "passwd entries"), kinds)              # still current after the import
+        self.assertIn(("scan", "openscap stig"), kinds)
+        self.assertIn(("scan", "vulnscanner"), kinds)
+        self.assertTrue(all("file_sha256" in e for e in atone.current_index(d) if e["kind"] == "scan"))
+        atone.collect("imp", ["accounts"], log=lambda *a: None)          # collected again: the newest one counts
+        self.assertEqual(len([e for e in atone.current_index(d) if e["source"] == "passwd entries"]), 1)
+
+
 class CommandLine(unittest.TestCase):
     def test_init_collect_and_look_at_the_evidence(self):
         code, out = run("init", "cli")

@@ -1,0 +1,2 @@
+{"tool": "endpoint", "format": "xml", "match": "endpoints-*.xml", "record": ".//system",
+ "fields": {"host": "@name", "finding": "agent/@status", "agent_version": "agent/@version", "definitions": "dat", "policy": "policy"}}

@@ -1,0 +1,4 @@
+Asset IP Address,Asset Names,Vulnerability Title,Vulnerability ID,Vulnerability Severity Level,Vulnerability CVE IDs,First Found,Solution
+10.0.1.15,app01.example.internal,OpenSSL: CVE-2026-1111 buffer overread,openssl-cve-2026-1111,9,CVE-2026-1111,2026-11-01,Upgrade OpenSSL
+10.0.1.15,app01.example.internal,TLS 1.0 enabled,tls-v1-0,5,,2026-10-15,Disable TLS 1.0
+10.0.1.20,db01.example.internal,Oracle JDK out of date,oracle-jdk-old,7,CVE-2026-2222 CVE-2026-2223,2026-09-30,Update the JDK

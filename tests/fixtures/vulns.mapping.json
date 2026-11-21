@@ -1,0 +1,5 @@
+{"tool": "vulnscanner", "format": "csv", "match": "vulns-*.csv",
+ "fields": {"host": "Asset Names", "address": "Asset IP Address", "finding": "Vulnerability Title", "id": "Vulnerability ID",
+            "severity": "Vulnerability Severity Level", "cve": "Vulnerability CVE IDs", "first_seen": "First Found",
+            "solution": "Solution"},
+ "severity": {"critical": ">=9", "high": ">=7", "moderate": ">=4", "low": ">=0"}}

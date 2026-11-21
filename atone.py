@@ -9,7 +9,8 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone init SYSTEM [--store s3://bucket/prefix | DIR]   a folder for a system (its spec, tailoring, mappings)
     atone discover SYSTEM [--ssh user@host]...   what runs on the hosts: for drafting the system spec
     atone collect SYSTEM [--kind K]... [--ssh user@host]...   evidence, from the built-in collectors
-    atone evidence SYSTEM [list | show ID | search WORDS]
+    atone import SYSTEM [FILE]... [--sample FILE]   scanner results (OpenSCAP natively; others through a mapping)
+    atone evidence SYSTEM [list | show ID | search WORDS]   the current evidence
     atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -48,6 +49,7 @@ __version__ = "0.1.0"
 #   store         where evidence goes: a folder, or S3 through the AWS CLI
 #   evidence      records (source, time, hash, redacted content), the run index, finding evidence
 #   collectors    the built-in, read-only menu (COLLECTORS), run here or over ssh; discovery
+#   imports       scanner results: OpenSCAP natively, anything else through a mapping file
 #   controls      NIST's OSCAL catalog and baselines, the system's tailoring, the exact lore
 #   system        a system's folder: spec, tailoring, site file
 #   command line  argument parsing, main
@@ -435,6 +437,166 @@ def over_ssh(target: str, args: list[str], timeout: float = 600) -> dict:
     return json.loads(r.stdout)
 
 
+# ---- imports: scanner results: OpenSCAP natively, anything else through a mapping file
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def control_ids(ref: str) -> list[str]:
+    """800-53 control ids from a reference's text: "AC-2(1)" -> ac-2.1, "CM-6(a)" -> cm-6 (a statement part, not an
+    enhancement), "AC-17(a),CM-7(a)" -> both."""
+    out = []
+    for m in re.finditer(r"\b([A-Z]{2})-(\d+)((?:\(\w+\))*)", ref.upper()):
+        cid = f"{m.group(1).lower()}-{int(m.group(2))}"
+        for sub in re.findall(r"\((\w+)\)", m.group(3)):
+            if sub.isdigit():
+                cid += f".{int(sub)}"
+            else:
+                break                                   # (a), (b): a part of the statement; the control is enough
+        if cid not in out:
+            out.append(cid)
+    return out
+
+
+def is_oscap(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "checklists.nist.gov/xccdf" in head or "scap.nist.gov/schema/asset-reporting-format" in head
+
+
+def import_oscap(path: Path) -> list[dict]:
+    """OpenSCAP results (XCCDF results, or ARF): one piece of evidence per test result (a host and a profile), each
+    rule's result with the 800-53 controls the SCAP Security Guide says it bears on."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    rules = {}
+    for el in root.iter():
+        if _local(el.tag) != "Rule":
+            continue
+        refs, title = [], ""
+        for child in el:
+            name = _local(child.tag)
+            if name == "title":
+                title = "".join(child.itertext()).strip()
+            elif name == "reference" and "800-53" in (child.get("href") or ""):
+                refs += control_ids("".join(child.itertext()))
+        rules[el.get("id")] = {"title": title, "controls": refs, "severity": el.get("severity")}
+    out = []
+    for tr in (el for el in root.iter() if _local(el.tag) == "TestResult"):
+        target = next(("".join(c.itertext()).strip() for c in tr if _local(c.tag) == "target"), "") or "unknown"
+        profile = next((c.get("idref") for c in tr if _local(c.tag) == "profile"), "") or ""
+        results = []
+        for rr in (c for c in tr if _local(c.tag) == "rule-result"):
+            rid = rr.get("idref")
+            result = next(("".join(c.itertext()).strip() for c in rr if _local(c.tag) == "result"), "")
+            if result in ("notselected", "notapplicable"):
+                continue
+            r = rules.get(rid) or {}
+            results.append({"rule": rid, "title": r.get("title", ""), "result": result,
+                            "severity": rr.get("severity") or r.get("severity"), "controls": r.get("controls") or []})
+        out.append({"kind": "scan", "host": target,
+                    "source": f"openscap {profile.rsplit('_profile_', 1)[-1] or 'results'} ({path.name})",
+                    "content": {"tool": "openscap", "profile": profile, "target": target,
+                                "start": tr.get("start-time"), "end": tr.get("end-time"), "results": results}})
+    if not out:
+        raise AtoneError(f"{path.name}: OpenSCAP output with no test results in it")
+    return out
+
+
+def _rows_csv(path: Path) -> list[dict]:
+    import csv
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        return list(csv.DictReader(f))
+
+
+def _rows_xml(path: Path, record: str, fields: dict) -> list[dict]:
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    rows = []
+    for el in root.iterfind(record):
+        row = {}
+        for name, where in fields.items():
+            if not isinstance(where, str):
+                continue
+            if "@" in where:                        # an attribute: "@name", or a child's: "agent/@status"
+                path, _, attr = where.rpartition("@")
+                node = el.find(path.rstrip("/")) if path.rstrip("/") else el
+                row[where] = node.get(attr, "") if node is not None else ""
+            else:
+                found = el.find(where)
+                row[where] = "".join(found.itertext()).strip() if found is not None else el.get(where, "")
+        rows.append(row)
+    return rows
+
+
+def severity_of(value: str, rules: dict) -> str:
+    """A scanner's severity as the customer's words: rules map a name to the scanner's values ("critical": ["Critical"])
+    or a numeric floor ("high": ">=7")."""
+    v = (value or "").strip()
+    for name, rule in rules.items():
+        if isinstance(rule, list) and v.lower() in (str(x).lower() for x in rule):
+            return name
+        if isinstance(rule, str) and rule.startswith(">="):
+            try:
+                if float(v) >= float(rule[2:]):
+                    return name
+            except ValueError:
+                pass
+    return v or "unknown"
+
+
+def import_mapped(path: Path, mapping: dict) -> list[dict]:
+    """A scanner's export read through its mapping file: {"tool", "format": "csv"|"xml", "record" (xml: the path to each
+    finding), "fields": {host, finding, id, severity, cve, first_seen, solution, status: the column or path of each},
+    "severity": {name: values or ">=N"}}. One piece of evidence per host."""
+    fields = mapping.get("fields") or {}
+    if not fields.get("host") or not fields.get("finding"):
+        raise AtoneError(f"{mapping.get('_file', 'the mapping')}: fields needs at least host and finding")
+    rows = _rows_xml(path, mapping["record"], fields) if mapping.get("format") == "xml" else _rows_csv(path)
+    if rows and mapping.get("format") != "xml":
+        missing = [c for c in fields.values() if isinstance(c, str) and c not in rows[0]]
+        if missing:
+            raise AtoneError(f"{path.name} has no column {', '.join(map(repr, missing))} "
+                             f"(it has: {', '.join(list(rows[0])[:30])})")
+    by_host: dict[str, list] = {}
+    for row in rows:
+        f = {k: (row.get(v) or "").strip() for k, v in fields.items() if isinstance(v, str)}
+        if not f.get("host") or not f.get("finding"):
+            continue
+        f["severity"] = severity_of(f.get("severity", ""), mapping.get("severity") or {})
+        f["cve"] = re.findall(r"CVE-\d{4}-\d{4,}", f.get("cve", "") or f.get("finding", ""))
+        by_host.setdefault(f["host"], []).append(f)
+    tool = mapping.get("tool") or "scanner"
+    return [{"kind": "scan", "host": host, "source": f"{tool} ({path.name})",
+             "content": {"tool": tool, "findings": found}} for host, found in sorted(by_host.items())]
+
+
+def import_file(path: Path, mappings: list[dict]) -> list[dict]:
+    """One file: OpenSCAP if it is, else the first mapping whose "match" (a glob) fits its name."""
+    if is_oscap(path):
+        return import_oscap(path)
+    for m in mappings:
+        if fnmatch.fnmatch(path.name, m.get("match") or ""):
+            return import_mapped(path, m)
+    raise AtoneError(f"{path.name}: not OpenSCAP output, and no scanner mapping matches it. Draft one from its "
+                     f"columns (atone import SYSTEM --sample {path}) as imports/TOOL.mapping.json")
+
+
+def sample(path: Path, n: int = 5) -> str:
+    """A file's columns and first rows, redacted: what an agent drafts a scanner mapping from."""
+    if is_oscap(path):
+        return f"{path.name} is OpenSCAP output: read natively, no mapping needed"
+    if path.suffix.lower() == ".xml":
+        text, note = read_text(str(path), 16 * 1024)
+        return redact(text or note)
+    rows = _rows_csv(path)
+    return redact(json.dumps({"columns": list(rows[0]) if rows else [], "rows": rows[:n]}, indent=1))
+
+
 # ---- controls: NIST's OSCAL catalog and baselines, the system's tailoring, the exact lore
 
 OSCAL = "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/"
@@ -715,7 +877,8 @@ def save_records(d: Path, recs: list[dict]) -> str:
         for rec in recs:
             key = record_key(rec)
             store.put(key, gzip.compress(json.dumps(rec).encode()))
-            f.write(json.dumps({k: rec[k] for k in ("id", "kind", "host", "at", "source", "site", "sha256")}
+            f.write(json.dumps({k: rec[k] for k in ("id", "kind", "host", "at", "source", "site", "sha256")
+                                if k in rec} | ({"file_sha256": rec["file_sha256"]} if "file_sha256" in rec else {})
                                | {"key": key, "bytes": len(rec["content"])}) + "\n")
     (d / "runs" / "latest").write_text(run + "\n")
     return run
@@ -728,6 +891,21 @@ def run_index(d: Path, run: str | None = None) -> list[dict]:
         return []
     path = d / "runs" / run / "evidence.jsonl"
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
+
+
+def current_index(d: Path, fresh_days: float | None = None) -> list[dict]:
+    """The evidence that's current: for each (kind, host, source), its newest record, if it's no older than the
+    system's fresh_days (atone.json; default 30). Collecting and importing add to it, run by run."""
+    days = fresh_days if fresh_days is not None else float(read_json(d / "atone.json", {}).get("fresh_days") or 30)
+    cut = time.time() - days * 86400
+    newest: dict[tuple, dict] = {}
+    runs = sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []
+    for run in runs:
+        for e in run_index(d, run):
+            k = (e["kind"], e["host"], e["source"])
+            if e["at"] >= cut and (k not in newest or e["at"] >= newest[k]["at"]):
+                newest[k] = {**e, "run": run}
+    return sorted(newest.values(), key=lambda e: (e["kind"], e["host"], e["source"]))
 
 
 def load_record(d: Path, entry: dict) -> dict | None:
@@ -767,11 +945,37 @@ def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None
     return run
 
 
+def import_results(name: str, files: list[str] | None = None, log=print) -> str:
+    """Scanner results into evidence: the files given, or everything in the system's imports/ folder."""
+    d = system_dir(name)
+    site = read_json(d / "site.json", {})
+    mappings = []
+    for mp in sorted((d / "imports").glob("*.mapping.json")):
+        m = read_json(mp, {})
+        mappings.append({**m, "_file": mp.name})
+    paths = [Path(f) for f in files] if files else sorted(p for p in (d / "imports").iterdir()
+                                                           if p.is_file() and not p.name.endswith(".mapping.json"))
+    if not paths:
+        raise AtoneError(f"nothing to import: put scanner exports in {d / 'imports'}, or name them")
+    recs = []
+    for path in paths:
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        for part in import_file(path, mappings):
+            rec = make_record(name, part["kind"], part["host"], part["source"], part["content"],
+                              extra_redact=site.get("redact"))
+            rec["file_sha256"] = sha                     # the export it came from, as it was
+            recs.append(rec)
+        log(f"{path.name}: {sum(1 for r in recs if r['file_sha256'] == sha)} hosts")
+    run = save_records(d, recs)
+    log(f"{len(recs)} records in run {run}")
+    return run
+
+
 # ---- command line: argument parsing, main
 
 def cmd_evidence(args) -> str:
     d = system_dir(args.system)
-    idx = run_index(d, args.run)
+    idx = run_index(d, args.run) if args.run else current_index(d)
     if args.what in (None, "list"):
         return "\n".join(f"{e['id']}  {e['source']}  ({e['bytes']} bytes{', SITE' if e['site'] else ''})"
                          for e in idx) or "no evidence yet: atone collect " + args.system
@@ -835,7 +1039,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("--kind", action="append", choices=list(COLLECTORS), help="only these collectors")
     p.add_argument("--ssh", action="append", default=[], help="user@host (repeatable; default: this host)")
-    p = sub.add_parser("evidence", help="a run's evidence: list, show ID, search WORDS")
+    p = sub.add_parser("import", help="scanner results into evidence (OpenSCAP; others through imports/*.mapping.json)")
+    p.add_argument("system")
+    p.add_argument("files", nargs="*", help="default: everything in the system's imports/ folder")
+    p.add_argument("--sample", metavar="FILE", help="a file's columns and first rows, for drafting its mapping")
+    p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
     p.add_argument("words", nargs="*")
@@ -873,6 +1081,11 @@ def main(argv: list[str] | None = None) -> int:
                               f"{len(h['configs'])} config files)" for h in found) + f"\n  in {out}")
         elif args.cmd == "collect":
             collect(args.system, args.kind, args.ssh)
+        elif args.cmd == "import":
+            if args.sample:
+                print(sample(Path(args.sample)))
+            else:
+                import_results(args.system, args.files)
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":
