@@ -696,7 +696,8 @@ class Codex(unittest.TestCase):
     def test_a_fresh_machine_clones_the_codex(self):
         d = evidence_system("orig", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
         bare = Path(tempfile.mkdtemp()) / "orig.git"
-        subprocess.run(["git", "clone", "-q", "--bare", str(d), str(bare)], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(bare)], check=True)   # a server's default
+        subprocess.run(["git", "-C", str(d), "push", "-q", str(bare), "main"], check=True)
         other = Path(tempfile.mkdtemp())
         old = atone.HOME
         try:
@@ -705,6 +706,7 @@ class Codex(unittest.TestCase):
             self.assertEqual([e["id"] for e in atone.current_index(d2)], [e["id"] for e in atone.current_index(d)])
             self.assertTrue((d2 / ".git" / "hooks" / "pre-commit").exists())     # the guard, on this machine too
             self.assertIsNone(atone.current_index(d2)[0]["last_seen"])           # it hasn't collected here yet
+            self.assertIn("codex: orig set up", atone.git(d2, "log", "--format=%s").stdout)     # its history, not a new one
         finally:
             atone.HOME = old
 
@@ -779,14 +781,24 @@ class CommandLine(unittest.TestCase):
         code, out = run("evidence", "cli", "search", "root")
         self.assertIn("passwd entries", out)
 
+    def test_a_word_document_reads_as_text_headings_lists_and_tables(self):
+        t = atone.doc_text(FIX / "ssp.docx")                                    # made by LibreOffice, as Word saves
+        self.assertIn("## 9.3 Interconnections", t)
+        self.assertIn("- web to app on tcp/8443", t)
+        self.assertIn("| internet | web | tcp/443 |", t)
+        self.assertIn("db_password=<redacted>", t)
+        self.assertIn("3: A=Control ID | B=Control Name", atone.doc_text(FIX / "ssp-matrix.xlsx"))
+
     def test_discover_lists_config_files_but_never_reads_them(self):
         run("init", "disc")
         code, out = run("discover", "disc")
         self.assertEqual(code, 0)
         found = atone.read_json(atone.system_dir("disc") / "discovery.json")["hosts"][0]
         self.assertTrue(found["processes"])
-        self.assertTrue(all(isinstance(c, str) for c in found["configs"]))   # paths only
-        self.assertFalse(any(atone.denied(c) for c in found["configs"]))
+        paths = found["configs"]["named by running processes"] + [
+            f"{k}/{f}" for k, fs in found["configs"]["in /etc, by directory"].items() for f in fs]
+        self.assertTrue(all(isinstance(c, str) for c in paths))                                # paths only
+        self.assertFalse(any(atone.denied(c) for c in paths))
 
 
 if __name__ == "__main__":

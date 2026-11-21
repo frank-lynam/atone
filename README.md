@@ -42,6 +42,7 @@ atone collect tst [--ssh user@host]...         # evidence, from the built-in rea
 atone import tst                               # scans in imports/: OpenSCAP natively, others through a mapping
 atone import tst --eaveswatch s3://bucket/ew   # logging evidence (AU) from an eaveswatch store
 atone evidence tst search keep_logs            # ranked full-text search over the current evidence
+atone doc SSP.docx --out ssp.txt               # a Word or Excel document as text: headings, lists, tables
 atone check tst                                # every control: met, partly, not met, unknown, inherited
 atone verify tst                               # drafted narratives: each claim's citation checked
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why

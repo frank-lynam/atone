@@ -70,7 +70,7 @@ __version__ = "0.1.0"
 #   controls      NIST's OSCAL catalog and baselines, the system's tailoring, the exact lore
 #   system        a system's folder: spec, tailoring, site file; collecting and importing into it
 #   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
-#   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed
+#   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed; Word as text
 #   architecture  one graph of actual, allowed and documented paths; draw.io and SVG, with what differs
 #   plan          the engagement plan (what's left, who does it), what's due, the report people read
 #   oscal         the SSP, assessment results and POA&M as OSCAL 1.1.2
@@ -92,12 +92,14 @@ REDACT = [
     (r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}", "<redacted>"),                          # JWTs
     (r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}", r"\1 <redacted>"),                     # Authorization: Bearer ...
     (r"(?i)(\b[\w.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|"
-     r"session[_-]?id|authorization))([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;<]+", r"\1\2<redacted>"),
+     r"session[_-]?id|authorization))([\"']?\s*[:=]\s*[\"']?)(?!<redacted|\()[^\s&\"',;<]+", r"\1\2<redacted>"),
      # (any prefix: db_password=, jdbc.password:, AWS_SECRET_ACCESS_KEY=)
     (r"(?i)(<(?:password|passwd|credential|secret)[^>]*>)[^<]+(</)", r"\1<redacted>\2"),   # XML config values
     (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
-    (r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[G-Zg-z+/])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),  # base64
-    # (a long base64 blob, a key or token; not a hex hash like a SHA-256 or a commit id, which is all 0-9a-f)
+    (r"(?<![\w/+=])(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{40,}={0,2}"
+     r"(?![\w/+=])", "<redacted blob>"),  # base64
+    # (a long base64 blob, a key or token: upper and lower case and digits, as random ones all but always have; not
+    # a hex hash like a SHA-256 or a commit id, nor a path, which almost never mix all three)
 ]
 _REDACT = [(re.compile(p, re.S), r) for p, r in REDACT]
 
@@ -401,7 +403,14 @@ def c_aws(spec: dict) -> list[tuple[str, object]]:
         return [("aws", "no AWS CLI here")]
     conf = spec.get("aws") or {}
     regions = conf.get("regions") or ([conf["region"]] if conf.get("region") else [None])
-    out = []
+    code, text = run_cmd(["aws", "sts", "get-caller-identity", "--output", "json"] +
+                         (["--region", regions[0]] if regions[0] else []), timeout=60)
+    if code != 0:      # no credentials (or no way to AWS): say so once, rather than every call failing slowly
+        return [("aws", "no AWS access from here: " + (text.strip().splitlines() or ["(no output)"])[-1])]
+    try:
+        out = [("sts get-caller-identity", json.loads(text))]   # which account, and as whom (no secrets in it)
+    except json.JSONDecodeError:
+        out = [("sts get-caller-identity", text)]
 
     def call(args, label, region):
         argv = ["aws", *args, "--output", "json"] + (["--region", region] if region else [])
@@ -457,8 +466,7 @@ def c_certs(spec: dict) -> list[tuple[str, object]]:
     import ssl
     ports = sorted({(r["local"].rpartition(":")[0], int(r["local"].rpartition(":")[2]))
                     for r in proc_net() if r["proto"] == "tcp" and r["state"] == "listen"}, key=lambda x: x[1])
-    found, plain = [], []
-    for ip, port in ports:
+    def probe(ip, port):
         hosts = ["127.0.0.1"] if ip in ("0.0.0.0", "") else ["::1", "127.0.0.1"] if ip == "::" else [ip]
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
@@ -466,14 +474,16 @@ def c_certs(spec: dict) -> list[tuple[str, object]]:
             try:
                 with socket.create_connection((host, port), timeout=3) as raw, ctx.wrap_socket(raw) as tls:
                     der = tls.getpeercert(binary_form=True)
-                    found.append({"port": port, "address": ip, "protocol": tls.version(),
-                                  "cipher": (tls.cipher() or [""])[0],
-                                  **(decode_cert(der) if der else {"certificate": "none offered"})})
-                break
+                    return {"port": port, "address": ip, "protocol": tls.version(),
+                            "cipher": (tls.cipher() or [""])[0],
+                            **(decode_cert(der) if der else {"certificate": "none offered"})}
             except (ssl.SSLError, ConnectionError, socket.timeout, OSError):
                 continue
-        else:
-            plain.append(port)
+        return port
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(16) as pool:            # a port that doesn't speak TLS can take its whole timeout
+        got = list(pool.map(lambda a: probe(*a), ports))
+    found, plain = [g for g in got if isinstance(g, dict)], [g for g in got if not isinstance(g, dict)]
     return [("TLS on listeners", found), ("listeners not speaking TLS (from here)", sorted(set(plain)))]
 
 
@@ -508,8 +518,10 @@ def collect_here(kinds: list[str], spec: dict) -> list[dict]:
 
 
 def discover_here() -> dict:
-    """What runs on this host, for drafting a system spec: the OS, processes, listeners, services, and which
-    configuration files exist (listed, never read out)."""
+    """What runs on this host, for drafting a system spec, compact enough to read whole: the OS, the processes (alike
+    ones counted once), the listeners (with the process behind each, where this account can see it), the running
+    services, and which configuration files exist (listed, never read out): first the ones a running process names,
+    then the rest of /etc by directory."""
     osr, _ = read_text("/etc/os-release")
     procs = []
     for pid in sorted((p for p in os.listdir("/proc") if p.isdigit()), key=int):
@@ -528,6 +540,8 @@ def discover_here() -> dict:
         for a in p["argv"]:
             for m in re.findall(r"(/[\w./@+-]+\.(?:xml|conf|cfg|ini|properties|yaml|yml|json|toml|ora|env|cnf))", a):
                 configs.add(m)
+    named = sorted(c for c in configs if not denied(c) and os.path.exists(c))
+    configs = set()
     for d in ("/etc",):
         for root, dirs, files in os.walk(d):
             dirs[:] = [x for x in dirs if not denied(os.path.join(root, x) + "/x")]
@@ -536,11 +550,26 @@ def discover_here() -> dict:
             for f in files:
                 if re.search(r"\.(conf|cfg|ini|xml|properties|yaml|yml|cnf)$", f):
                     configs.add(os.path.join(root, f))
-    return {"host": socket.gethostname(), "os": osr or "", "processes": procs,
-            "listeners": [r for r in proc_net() if r["state"] == "listen"],
+    by_dir = {}
+    for c in sorted(c for c in configs - set(named) if not denied(c) and os.path.exists(c)):
+        by_dir.setdefault(os.path.dirname(c), []).append(os.path.basename(c))
+    alike = {}
+    for p in procs:
+        cmd = clip_text(" ".join(p["argv"]), 240)
+        alike.setdefault((p["user"], cmd), {"user": p["user"], "command": cmd, "count": 0})["count"] += 1
+    listeners = {}
+    for r in proc_net():
+        if r["state"] == "listen":
+            row = {"proto": r["proto"], "local": r["local"], "process": clip_text(r.get("process") or "", 160),
+                   "user": r.get("user", "")}
+            listeners[(row["proto"], row["local"])] = row
+    return {"host": socket.gethostname(), "os": " ".join(l.split("=", 1)[1].strip('"') for l in (osr or "").splitlines()
+                                                     if l.startswith("PRETTY_NAME=")) or (osr or "")[:200],
+            "listeners": sorted(listeners.values(), key=lambda r: (r["proto"], int(r["local"].rpartition(":")[2]))),
             "services": run_cmd(["systemctl", "list-units", "--type=service", "--state=running", "--no-pager",
                                  "--plain", "--no-legend"])[1],
-            "configs": sorted(c for c in configs if not denied(c) and os.path.exists(c))}
+            "processes": sorted(alike.values(), key=lambda p: (p["user"], p["command"])),
+            "configs": {"named by running processes": named, "in /etc, by directory": by_dir}}
 
 
 def over_ssh(target: str, args: list[str], timeout: float = 600) -> dict:
@@ -1280,6 +1309,17 @@ def init_system(name: str, store: str | None = None, remote: str | None = None, 
         r = subprocess.run(["git", "clone", "-q", from_url, str(d)], capture_output=True, text=True)
         if r.returncode:
             raise AtoneError(f"git clone {from_url}: {r.stderr.strip()}")
+        if git(d, "rev-parse", "-q", "--verify", "HEAD", check=False).returncode:
+            # the remote's HEAD names a branch it doesn't have (a bare repository made with another default branch):
+            # take main, or its only branch, rather than starting a second history
+            heads = git(d, "for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin").stdout.split()
+            heads = [h for h in heads if h != "HEAD"]
+            pick = "main" if "main" in heads else heads[0] if len(heads) == 1 else None
+            if pick:
+                git(d, "checkout", "-q", "-B", pick, f"origin/{pick}")
+            elif heads:
+                raise AtoneError(f"{from_url} has branches {', '.join(heads)} but no main: say which to use "
+                                 "(git -C {d} checkout BRANCH)")
     d.mkdir(parents=True, exist_ok=True)
     if not (d / ".git").exists():
         git(d, "init", "-q", "-b", "main")
@@ -1493,9 +1533,10 @@ def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None
             recs.append(make_record(name, p["kind"], host, p["source"], p["content"], extra_redact=site.get("redact")))
         log(f"{host}: {len(parts)} pieces of evidence ({', '.join(local)})")
     if "aws" in kinds:
-        for source, content in c_aws(spec):
+        got = c_aws(spec)
+        for source, content in got:
             recs.append(make_record(name, "aws", "aws", source, content, extra_redact=site.get("redact")))
-        log("aws: done")
+        log(f"aws: {got[0][1]}" if len(got) == 1 and isinstance(got[0][1], str) else f"aws: {len(got)} calls")
     for label, cmd in (site.get("commands") or {}).items():         # a person's own, marked as such
         code, text = run_cmd(shlex.split(cmd), timeout=300)
         recs.append(make_record(name, "site", socket.gethostname(), f"site command {label}: {cmd}",
@@ -2048,7 +2089,8 @@ def clip_text(text: str, n: int) -> str:
     return one if len(one) <= n else one[:n - 3] + "..."
 
 
-# ---- workbooks: the customer's Excel files: read them, fill them in (a copy, only cell values), say what changed
+# ---- workbooks: the customer's Excel files: read them, fill them in (a copy, only cell values), say what changed;
+#      their Word documents, as text
 
 NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 NS_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -2087,6 +2129,79 @@ def in_sqref(ref: str, sqref: str) -> bool:
         if col_index(ca) <= c <= col_index(cb) and ra <= r <= rb:
             return True
     return False
+
+
+def doc_text(path) -> str:
+    """A working document as plain text, for reading or searching: a .docx's paragraphs in order, its headings as
+    '#' lines (by the document's own heading styles), list items as '- ', and its tables as '|' rows; an .xlsx's
+    sheets, row by row. Read with the standard library; redacted like everything else atone writes."""
+    import xml.etree.ElementTree as ET
+    import zipfile
+    path = Path(path)
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        wb = Workbook(path)
+        out = []
+        for sheet in wb.sheets:
+            out.append(f"# {sheet}")
+            for n, row in sorted(wb.rows(sheet).items()):
+                vals = [f"{k}={v}" for k, v in sorted(row.items(), key=lambda kv: (len(kv[0]), kv[0])) if str(v).strip()]
+                if vals:
+                    out.append(f"{n}: " + " | ".join(vals))
+            out.append("")
+        return redact("\n".join(out))
+    try:
+        z = zipfile.ZipFile(path)
+        body = ET.fromstring(z.read("word/document.xml"))
+    except (zipfile.BadZipFile, KeyError):
+        raise AtoneError(f"{path.name} isn't a .docx or .xlsx (save it as Word Document (.docx))")
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    mc = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+    level = {}                                       # style id -> heading level, from the document's own styles
+    try:
+        for st in ET.fromstring(z.read("word/styles.xml")).iter(w + "style"):
+            name = st.find(w + "name")
+            m = re.match(r"(?i)heading\s*(\d)$|^title$", (name.get(w + "val") if name is not None else "") or "")
+            if m:
+                level[st.get(w + "styleId")] = int(m.group(1) or 1)
+    except KeyError:
+        pass
+
+    def text(el):
+        parts = []
+        for e in el.iter():
+            if e.tag == mc + "Fallback":                 # the same text again, for older readers
+                continue
+            if e.tag == w + "t":
+                parts.append(e.text or "")
+            elif e.tag == w + "tab":
+                parts.append("\t")
+            elif e.tag in (w + "br", w + "cr"):
+                parts.append("\n")
+        return "".join(parts).strip()
+
+    def para(p):
+        t = text(p)
+        if not t:
+            return None
+        ppr = p.find(w + "pPr")
+        sid = ppr.find(w + "pStyle").get(w + "val") if ppr is not None and ppr.find(w + "pStyle") is not None else ""
+        if sid in level or re.match(r"(?i)heading(\d)$", sid or ""):
+            return "#" * (level.get(sid) or int(re.match(r"(?i)heading(\d)", sid).group(1))) + " " + t
+        if ppr is not None and ppr.find(w + "numPr") is not None:
+            return "- " + t
+        return t
+    out = []
+    for el in body.find(w + "body"):
+        if el.tag == w + "p":
+            t = para(el)
+            if t:
+                out.append(("\n" if t.startswith("#") else "") + t)
+        elif el.tag == w + "tbl":
+            for tr in el.iter(w + "tr"):
+                cells = [" ".join(filter(None, (para(p) or "" for p in tc.iter(w + "p")))) for tc in tr.findall(w + "tc")]
+                out.append("| " + " | ".join(c.replace("\n", " ") for c in cells) + " |")
+            out.append("")
+    return redact("\n".join(out).strip() + "\n")
 
 
 class Workbook:
@@ -2493,7 +2608,7 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
             edits, changes, flags = plan_ssp(d, wb, m)
         dest = out / path.name
         skipped = write_cells(path, dest, edits, styles)
-        report = {"workbook": path.name, "output": str(dest), "mapping": m["_file"], "changes": changes,
+        report = {"workbook": path.name, "output": dest.name, "mapping": m["_file"], "changes": changes,
                   "flags": flags, "skipped_formulas": skipped, "at": time.time()}
         write_json(out / (path.stem + ".changes.json"), report)
         write_json(d / "runs" / f"fill-{path.stem}.changes.json", report)
@@ -3434,9 +3549,10 @@ def due(name: str) -> list[str]:
     d = system_dir(name)
     cad = {**CADENCE, **(read_json(d / "atone.json", {}).get("cadence") or {})}
     now = time.time()
-    newest = max([e["at"] for e in current_index(d)] or [0])
+    newest = int(max([e["at"] for e in current_index(d)] or [0]))        # whole seconds, as git's commit times are
     checks = d / "runs" / "checks-latest.json"
-    checked = checks.stat().st_mtime if checks.exists() else 0
+    committed = git(d, "log", "-1", "--format=%ct", "--grep=^checks: ", check=False).stdout.strip()
+    checked = max(checks.stat().st_mtime if checks.exists() else 0, float(committed or 0))   # here, or any machine
     conmon = d / "runs" / "conmon-latest"
     out = []
     if now - newest > duration(cad["collect"]):
@@ -3649,8 +3765,8 @@ def oscal_results(name: str) -> dict:
         for c in r.get("checks") or []:
             ou = _uuid(name, "obs", cid, c["check"])
             related.append({"observation-uuid": ou})
-            obs.append({"uuid": ou, "title": f"{r['label']}: {c['check']}", "description": f"{c.get('what') or c['check']}: "
-                        f"{c['status']} ({c['detail']})", "methods": ["TEST"], "collected": _iso(res.get("at")),
+            obs.append({"uuid": ou, "title": f"{r['label']}: {c['check']}", "description": f"{c.get('what') or c['check']} "
+                        f"(the check: {c['status']}; {c['detail']})", "methods": ["TEST"], "collected": _iso(res.get("at")),
                         **({"relevant-evidence": [{"href": f"#{e}", "description": f"{(by_id.get(e) or {}).get('source', e)} "
                                                   f"(sha256 {(by_id.get(e) or {}).get('sha256', '?')})"}
                                                  for e in c.get("evidence") or []]} if c.get("evidence") else {})})
@@ -3770,6 +3886,9 @@ in the order that unblocks the most. For the rest, tell the people exactly what 
 permission (the least that works), the file, the decision. The first things to ask for are always the working
 documents, the inherited-controls matrix, example narratives, and access.
 
+Their documents are Word and Excel files: `atone doc FILE --out runs/NAME.txt` turns one into text you can read and
+search (headings, lists and tables kept; runs/ stays on this machine, so it's never committed).
+
 ## The cadence
 
 Your watch runs `atone due {{system}}` every hour and wakes you only when something's due: collecting (daily),
@@ -3808,7 +3927,7 @@ SKILLS = {
    directives), with the line. Where a product's format hides a connection from them, add a pattern to that file's
    entry: `"connects": [{"pattern": "a regex with named groups host and port", "about": "what it is"}]` (or
    `"listens": true` with a port group), and check it finds what it should.
-4. In interfaces.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
+4. In interfaces.json: the flows the SSP describes (`atone doc SSP.docx --out runs/ssp.txt` to read it): `{"from", "to", "port": "tcp/443", "data", "about"}`, by
    component name (or "internet"). Quote the SSP's section for each in "about".
 5. Commit them on a branch (`atone commit {{system}} "the system spec, from discovery"`) and ask the ISSE to review
    them; when they have, they set `"reviewed": "who, when"` in system.json and merge."""),
@@ -3961,6 +4080,9 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("workbook", help="inspect FILE: a workbook's sheets, headers and drop-downs (for its mapping)")
     p.add_argument("what", choices=["inspect"])
     p.add_argument("file")
+    p = sub.add_parser("doc", help="a .docx or .xlsx as plain text (headings, lists, tables), to read or search")
+    p.add_argument("file")
+    p.add_argument("--out", help="write it here (else it's printed)")
     p = sub.add_parser("fill", help="fill copies of the working documents from the checks and verified narratives")
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: the system's workbooks/*.xlsx")
@@ -4073,8 +4195,17 @@ def main(argv: list[str] | None = None) -> int:
             out = d / "discovery.json"
             write_json(out, {"at": time.time(), "hosts": found})
             print(f"{len(found)} host{'s' if len(found) != 1 else ''}: "
-                  + ", ".join(f"{h['host']} ({len(h['processes'])} processes, {len(h['listeners'])} listeners, "
-                              f"{len(h['configs'])} config files)" for h in found) + f"\n  in {out}")
+                  + ", ".join(f"{h['host']} ({sum(p['count'] for p in h['processes'])} processes, "
+                              f"{len(h['listeners'])} listeners, {len(h['configs']['named by running processes'])} "
+                              f"config files named by them, {sum(map(len, h['configs']['in /etc, by directory'].values()))}"
+                              " more in /etc)" for h in found) + f"\n  in {out} ({out.stat().st_size // 1024} KB)")
+        elif args.cmd == "doc":
+            t = doc_text(args.file)
+            if args.out:
+                Path(args.out).write_text(t)
+                print(f"{args.file}: {len(t.splitlines())} lines, {len(t) // 1024} KB -> {args.out}")
+            else:
+                sys.stdout.write(t)
         elif args.cmd == "collect":
             collect(args.system, args.kind, args.ssh)
         elif args.cmd == "import":
