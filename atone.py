@@ -14,6 +14,8 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone mappings SYSTEM         the control mappings (the ISSE's), and anything wrong with them
     atone check SYSTEM [CONTROL]  every control against its mapping and the evidence: met, partly, not met, unknown
     atone verify SYSTEM [DRAFT]...   a drafted narrative's citations, each checked against the evidence it quotes
+    atone workbook inspect FILE   a workbook's sheets, headers and drop-downs: for drafting its template mapping
+    atone fill SYSTEM --out DIR   copies of the working documents, filled in, with what changed and why
     atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -56,6 +58,7 @@ __version__ = "0.1.0"
 #   controls      NIST's OSCAL catalog and baselines, the system's tailoring, the exact lore
 #   system        a system's folder: spec, tailoring, site file; collecting and importing into it
 #   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
+#   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed
 #   command line  argument parsing, main
 
 
@@ -1350,6 +1353,457 @@ def clip_text(text: str, n: int) -> str:
     return one if len(one) <= n else one[:n - 3] + "..."
 
 
+# ---- workbooks: the customer's Excel files: read them, fill them in (a copy, only cell values), say what changed
+
+NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+NS_REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+CELL_MAX = 32000                 # Excel's limit is 32,767 characters in a cell
+
+
+def col_index(col: str) -> int:
+    n = 0
+    for ch in col.upper():
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+def col_letters(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def split_ref(ref: str) -> tuple[str, int]:
+    m = re.fullmatch(r"\$?([A-Z]+)\$?(\d+)", ref.upper())
+    if not m:
+        raise AtoneError(f"not a cell reference: {ref}")
+    return m.group(1), int(m.group(2))
+
+
+def in_sqref(ref: str, sqref: str) -> bool:
+    col, row = split_ref(ref)
+    c, r = col_index(col), row
+    for part in sqref.split():
+        a, _, b = part.partition(":")
+        ca, ra = split_ref(a)
+        cb, rb = split_ref(b or a)
+        if col_index(ca) <= c <= col_index(cb) and ra <= r <= rb:
+            return True
+    return False
+
+
+class Workbook:
+    """An .xlsx, read (never written: see write_cells): its sheets, cells (shared strings, inline strings, numbers,
+    formulas), merged cells and drop-down lists."""
+
+    def __init__(self, path):
+        import xml.etree.ElementTree as ET
+        import zipfile
+        self.path = Path(path)
+        try:
+            self.zip = zipfile.ZipFile(self.path)
+        except zipfile.BadZipFile:
+            raise AtoneError(f"{self.path.name} isn't an .xlsx (a zip file): save it as Excel Workbook (.xlsx)")
+        self.ET = ET
+        wb = ET.fromstring(self.zip.read("xl/workbook.xml"))
+        rels = ET.fromstring(self.zip.read("xl/_rels/workbook.xml.rels"))
+        targets = {r.get("Id"): r.get("Target") for r in rels}
+        self.sheets = {}
+        for s in wb.iter(NS_MAIN + "sheet"):
+            t = targets.get(s.get(NS_REL + "id"), "")
+            self.sheets[s.get("name")] = t.lstrip("/") if t.startswith("/") else "xl/" + t
+        self.names = {n.get("name"): (n.text or "") for n in wb.iter(NS_MAIN + "definedName")}
+        self.strings = []
+        if "xl/sharedStrings.xml" in self.zip.namelist():
+            for si in ET.fromstring(self.zip.read("xl/sharedStrings.xml")).iter(NS_MAIN + "si"):
+                self.strings.append("".join(t.text or "" for t in si.iter(NS_MAIN + "t")))
+        self._cells = {}
+
+    def sheet_xml(self, sheet: str) -> bytes:
+        if sheet not in self.sheets:
+            raise AtoneError(f"{self.path.name} has no sheet {sheet!r} (it has: {', '.join(self.sheets)})")
+        return self.zip.read(self.sheets[sheet])
+
+    def cells(self, sheet: str) -> dict[str, dict]:
+        """{ref: {"value": text, "style": s, "formula": bool}}"""
+        if sheet in self._cells:
+            return self._cells[sheet]
+        root = self.ET.fromstring(self.sheet_xml(sheet))
+        out = {}
+        for c in root.iter(NS_MAIN + "c"):
+            t, v = c.get("t"), c.find(NS_MAIN + "v")
+            if t == "s" and v is not None:
+                value = self.strings[int(v.text)]
+            elif t == "inlineStr":
+                value = "".join(x.text or "" for x in c.iter(NS_MAIN + "t"))
+            else:
+                value = v.text if v is not None and v.text is not None else ""
+            out[c.get("r")] = {"value": value, "style": c.get("s"), "formula": c.find(NS_MAIN + "f") is not None}
+        self._cells[sheet] = out
+        return out
+
+    def value(self, sheet: str, ref: str) -> str:
+        return (self.cells(sheet).get(ref) or {}).get("value", "")
+
+    def rows(self, sheet: str) -> dict[int, dict[str, str]]:
+        """{row: {column letters: value}} for every non-empty cell."""
+        out: dict[int, dict[str, str]] = {}
+        for ref, c in self.cells(sheet).items():
+            col, row = split_ref(ref)
+            if str(c["value"]).strip():
+                out.setdefault(row, {})[col] = c["value"]
+        return dict(sorted(out.items()))
+
+    def merged(self, sheet: str) -> list[str]:
+        root = self.ET.fromstring(self.sheet_xml(sheet))
+        return [m.get("ref") for m in root.iter(NS_MAIN + "mergeCell")]
+
+    def _range_values(self, ref: str) -> list[str]:
+        sheet, _, rng = ref.rpartition("!")
+        sheet = sheet.strip("'") if sheet else None
+        a, _, b = rng.replace("$", "").partition(":")
+        ca, ra = split_ref(a)
+        cb, rb = split_ref(b or a)
+        vals = []
+        for r in range(ra, rb + 1):
+            for c in range(col_index(ca), col_index(cb) + 1):
+                v = self.value(sheet, f"{col_letters(c)}{r}") if sheet else ""
+                if str(v).strip():
+                    vals.append(str(v).strip())
+        return vals
+
+    def validations(self, sheet: str) -> list[tuple[str, list[str]]]:
+        """The drop-down lists on a sheet: [(the cells they cover, their values)], whether the values are inline
+        ("A,B"), a range (Lists!$A$1:$A$5) or a defined name."""
+        root = self.ET.fromstring(self.sheet_xml(sheet))
+        out = []
+        for dv in root.iter(NS_MAIN + "dataValidation"):
+            if dv.get("type") != "list":
+                continue
+            f = dv.find(NS_MAIN + "formula1")
+            formula = (f.text or "").strip() if f is not None else ""
+            if formula.startswith('"'):
+                vals = [v.strip() for v in formula.strip('"').split(",") if v.strip()]
+            else:
+                ref = self.names.get(formula.lstrip("="), formula.lstrip("="))
+                try:
+                    vals = self._range_values(ref)
+                except (AtoneError, KeyError):
+                    vals = []
+            out.append((dv.get("sqref") or "", vals))
+        return out
+
+    def allowed(self, sheet: str, ref: str) -> list[str] | None:
+        """The drop-down values a cell allows, or None if it has no list."""
+        for sqref, vals in self.validations(sheet):
+            if in_sqref(ref, sqref):
+                return vals
+        return None
+
+
+def _xml_text(value: str) -> str:
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value))
+    if len(value) > CELL_MAX:
+        value = value[:CELL_MAX - 40] + " [... continued in atone's report]"
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _cell_xml(ref: str, style: str | None, value) -> str:
+    s = f' s="{style}"' if style is not None else ""
+    return f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{_xml_text(value)}</t></is></c>'
+
+
+def edit_sheet_xml(xml: str, edits: dict[str, object], styles_by_col: dict[str, str] | None = None) -> tuple[str, list]:
+    """Set cells' values in a sheet's XML as text, touching nothing else: the cell's own element is replaced (its
+    style kept); a missing cell or row is inserted in order. A formula cell is never written. Returns the new XML and
+    the refs skipped (formulas)."""
+    skipped = []
+    styles_by_col = styles_by_col or {}
+    for ref, value in sorted(edits.items(), key=lambda kv: (split_ref(kv[0])[1], col_index(split_ref(kv[0])[0]))):
+        col, rown = split_ref(ref)
+        row_re = re.compile(r'<row\b[^>]*\br="%d"[^>]*?(?:/>|>.*?</row>)' % rown, re.S)
+        m = row_re.search(xml)
+        if not m:                                     # a new row, in order
+            new_row = f'<row r="{rown}">{_cell_xml(ref, styles_by_col.get(col), value)}</row>'
+            later = [r for r in re.finditer(r'<row\b[^>]*\br="(\d+)"', xml) if int(r.group(1)) > rown]
+            if later:
+                xml = xml[:later[0].start()] + new_row + xml[later[0].start():]
+            elif "<sheetData/>" in xml:
+                xml = xml.replace("<sheetData/>", f"<sheetData>{new_row}</sheetData>")
+            else:
+                i = xml.index("</sheetData>")
+                xml = xml[:i] + new_row + xml[i:]
+            continue
+        row = m.group(0)
+        if row.endswith("/>"):
+            row = row[:-2] + "></row>"
+        cell_re = re.compile(r'<c\b[^>]*\br="%s"[^>]*?(?:/>|>.*?</c>)' % ref, re.S)
+        cm = cell_re.search(row)
+        if cm:
+            old = cm.group(0)
+            if "<f>" in old or "<f " in old:
+                skipped.append(ref)
+                continue
+            sm = re.search(r'\bs="(\d+)"', old[:old.find(">") + 1])
+            new = row[:cm.start()] + _cell_xml(ref, sm.group(1) if sm else styles_by_col.get(col), value) + row[cm.end():]
+        else:
+            cells = list(re.finditer(r'<c\b[^>]*\br="([A-Z]+)\d+"', row))
+            after = next((c for c in cells if col_index(c.group(1)) > col_index(col)), None)
+            at = after.start() if after else row.rindex("</row>")
+            new = row[:at] + _cell_xml(ref, styles_by_col.get(col), value) + row[at:]
+        xml = xml[:m.start()] + new + xml[m.end():]
+    dim = re.search(r'<dimension ref="([A-Z]+\d+)(?::([A-Z]+\d+))?"', xml)
+    if dim and edits:
+        maxc = max([col_index(split_ref(r)[0]) for r in edits] + [col_index(split_ref(dim.group(2) or dim.group(1))[0])])
+        maxr = max([split_ref(r)[1] for r in edits] + [split_ref(dim.group(2) or dim.group(1))[1]])
+        xml = xml[:dim.start()] + f'<dimension ref="{dim.group(1)}:{col_letters(maxc)}{maxr}"' + xml[dim.end():]
+    return xml, skipped
+
+
+def write_cells(src: Path, dst: Path, edits: dict[str, dict[str, object]], styles: dict[str, dict] | None = None) -> list:
+    """A copy of the workbook with these cells set ({sheet: {ref: value}}): every other part of the file is copied
+    byte for byte. Returns the refs skipped (formula cells, never overwritten)."""
+    import zipfile
+    wb = Workbook(src)
+    parts = {wb.sheets[s]: s for s in edits}
+    skipped = []
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".part")
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, "w") as zout:
+        for info in zin.infolist():
+            data = zin.read(info)
+            if info.filename in parts:
+                sheet = parts[info.filename]
+                xml, sk = edit_sheet_xml(data.decode("utf-8"), edits[sheet], (styles or {}).get(sheet))
+                skipped += [f"{sheet}!{r}" for r in sk]
+                data = xml.encode("utf-8")
+            zout.writestr(info, data, compress_type=info.compress_type)
+    os.replace(tmp, dst)
+    return skipped
+
+
+def resolve_columns(wb: Workbook, sheet: str, header_row: int, columns: dict) -> dict[str, str]:
+    """A template mapping's columns ({field: header text or column letters}) as column letters."""
+    headers = {re.sub(r"\s+", " ", str(v)).strip().lower(): col for col, v in wb.rows(sheet).get(header_row, {}).items()}
+    out = {}
+    for field, want in columns.items():
+        if re.fullmatch(r"[A-Z]{1,3}", str(want)):
+            out[field] = want
+        elif str(want).strip().lower() in headers:
+            out[field] = headers[str(want).strip().lower()]
+        else:
+            raise AtoneError(f"{wb.path.name}!{sheet}: no column headed {want!r} in row {header_row} "
+                             f"(the headers: {', '.join(repr(h) for h in headers)})")
+    return out
+
+
+def normalize_control(text: str) -> str | None:
+    """A workbook's control id as atone's: "AC-2(1)", "AC-02 (01)", "ac-2.1" -> ac-2.1."""
+    m = re.match(r"\s*([A-Za-z]{2})-0*(\d+)\s*(?:\(\s*0*(\d+)\s*\)|\.0*(\d+))?\s*$", str(text or ""))
+    if not m:
+        return None
+    enh = m.group(3) or m.group(4)
+    return f"{m.group(1).lower()}-{int(m.group(2))}" + (f".{int(enh)}" if enh else "")
+
+
+def inspect_workbook(path: Path) -> str:
+    """What an agent drafts a template mapping from: each sheet's likely header row, its columns, the drop-down lists
+    and what they cover, merged cells, and a few rows."""
+    wb = Workbook(path)
+    out = [f"{wb.path.name}: sheets {', '.join(wb.sheets)}"]
+    for sheet in wb.sheets:
+        rows = wb.rows(sheet)
+        header = next((r for r, cells in rows.items() if len(cells) >= 3), None)
+        out.append(f"\n## {sheet}: {len(rows)} rows" + (f"; header row {header}" if header else ""))
+        if header:
+            out.append("columns: " + "; ".join(f"{c} = {v!r}" for c, v in rows[header].items()))
+            for r in [r for r in rows if r > header][:4]:
+                out.append(f"  row {r}: " + "; ".join(f"{c}={clip_text(redact(str(v)), 50)!r}" for c, v in rows[r].items()))
+        for sqref, vals in wb.validations(sheet):
+            out.append(f"drop-down on {sqref}: {vals}")
+        if wb.merged(sheet):
+            out.append(f"merged: {', '.join(wb.merged(sheet)[:10])}")
+    return "\n".join(out)
+
+
+def _status_value(mapping: dict, status: str) -> str | None:
+    return (mapping.get("status_values") or {}).get(status)
+
+
+def check_status_values(wb: Workbook, sheet: str, ref: str, mapping: dict) -> list[str]:
+    """Status values come from the workbook: each one the mapping uses must be in the column's drop-down."""
+    allowed = wb.allowed(sheet, ref)
+    if allowed is None:
+        return []
+    return [f"status value {v!r} (for {k}) isn't in the workbook's drop-down ({', '.join(allowed)})"
+            for k, v in (mapping.get("status_values") or {}).items() if v and v not in allowed]
+
+
+def plan_ssp(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
+    """The cells to set in an SSP control matrix, from the latest checks and the verified narratives: (edits, changes,
+    flags). What's already filled in is kept; where the evidence disagrees with it, that's a flag, not an edit."""
+    sheet, hdr = mapping["sheet"], int(mapping.get("header_row", 1))
+    cols = resolve_columns(wb, sheet, hdr, mapping["columns"])
+    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    edits, changes, flags = {}, [], []
+    probs = check_status_values(wb, sheet, f"{cols['status']}{hdr + 1}", mapping) if "status" in cols else []
+    if probs:
+        raise AtoneError(f"{wb.path.name}: " + "; ".join(probs))
+
+    def setcell(ref, value, why, evidence=()):
+        old = wb.value(sheet, ref)
+        if str(old).strip() == str(value).strip():
+            return
+        if str(old).strip():
+            flags.append({"cell": f"{sheet}!{ref}", "has": old, "atone": value, "why": why, "evidence": list(evidence)})
+            return
+        edits[ref] = value
+        changes.append({"cell": f"{sheet}!{ref}", "was": old, "now": value, "why": why, "evidence": list(evidence)})
+
+    for rown, cells in wb.rows(sheet).items():
+        if rown <= hdr:
+            continue
+        cid = normalize_control(cells.get(cols["control"], ""))
+        if not cid:
+            continue
+        res = checks.get(cid)
+        draft = read_json(d / "drafts" / "verified" / f"{cid}.json", None)
+        ev = sorted({e for c in (res or {}).get("checks") or [] for e in c.get("evidence") or []})
+        if res and "status" in cols:
+            v = _status_value(mapping, res["status"])
+            if v:
+                detail = "; ".join(f"{c['check']}: {c['status']}" for c in res.get("checks") or []) or res.get("why", "")
+                setcell(f"{cols['status']}{rown}", v, f"atone's checks: {res['status']} ({detail})", ev)
+        if "statement" in cols:
+            if draft and draft.get("statement"):
+                cites = sorted({c["evidence"] for cl in draft["claims"] for c in cl.get("cites") or []})
+                setcell(f"{cols['statement']}{rown}", draft["statement"], "a verified narrative", cites)
+            elif res and res["status"] == "inherited":
+                prov = (res.get("provider") or {}).get("from") or "the provider"
+                setcell(f"{cols['statement']}{rown}", f"Inherited from {prov}.", "inherited, per the system's tailoring")
+        if "evidence" in cols and (res or draft):
+            ids = sorted(set(ev) | {c["evidence"] for cl in (draft or {}).get("claims") or [] for c in cl.get("cites") or []})
+            text = "atone: " + ("; ".join(ids) if ids else "no evidence yet") + (
+                f" ({res['status']})" if res else "")
+            ref = f"{cols['evidence']}{rown}"
+            if str(wb.value(sheet, ref)).startswith("atone:") or not str(wb.value(sheet, ref)).strip():
+                if wb.value(sheet, ref) != text:
+                    edits[ref] = text
+                    changes.append({"cell": f"{sheet}!{ref}", "was": wb.value(sheet, ref), "now": text,
+                                    "why": "atone's evidence for this row", "evidence": ids})
+            else:
+                flags.append({"cell": f"{sheet}!{ref}", "has": wb.value(sheet, ref), "atone": text,
+                              "why": "the evidence column has someone's own words: left as it is", "evidence": ids})
+    return {sheet: edits}, changes, flags
+
+
+def poam_items(d: Path) -> list[dict]:
+    """What belongs on a POA&M, from the current evidence and the latest checks: imported findings, failed OpenSCAP
+    rules, and failed checks. Each with a key, so a row already on the POA&M is recognized."""
+    items = []
+    for e in current_index(d):
+        if e["kind"] != "scan":
+            continue
+        rec = load_record(d, e) or {}
+        try:
+            data = json.loads(rec.get("content") or "{}")
+        except json.JSONDecodeError:
+            continue
+        for f in data.get("findings") or []:
+            items.append({"key": f"{data.get('tool')}|{f.get('id') or f.get('finding')}|{e['host']}",
+                          "weakness": f.get("finding"), "description": f.get("solution") or "", "control": "RA-5",
+                          "severity": f.get("severity"), "detected": f.get("first_seen") or "", "source": data.get("tool"),
+                          "asset": e["host"], "evidence": e["id"]})
+        for r in data.get("results") or []:
+            if r.get("result") in ("fail", "error"):
+                items.append({"key": f"openscap|{r['rule']}|{e['host']}", "weakness": r.get("title") or r["rule"],
+                              "description": f"OpenSCAP rule {r['rule']} {r['result']}s",
+                              "control": ", ".join(c.upper() for c in r.get("controls") or []) or "CM-6",
+                              "severity": r.get("severity") or "", "detected": time.strftime("%Y-%m-%d", time.gmtime(e["at"])),
+                              "source": "openscap", "asset": e["host"], "evidence": e["id"]})
+    return items
+
+
+def plan_poam(d: Path, wb: Workbook, mapping: dict) -> tuple[dict, list, list]:
+    """New POA&M rows for what's open and not on it yet (each with its evidence), and flags for rows still open whose
+    finding isn't in the latest evidence. Dates come from the schedule a person approved (drafts/poam-schedule.json:
+    {key: date}); none are made up."""
+    sheet, hdr = mapping["sheet"], int(mapping.get("header_row", 1))
+    cols = resolve_columns(wb, sheet, hdr, mapping["columns"])
+    probs = check_status_values(wb, sheet, f"{cols['status']}{hdr + 1}", mapping) if "status" in cols else []
+    if probs:
+        raise AtoneError(f"{wb.path.name}: " + "; ".join(probs))
+    rows = {r: c for r, c in wb.rows(sheet).items() if r > hdr}
+    have = {(str(c.get(cols.get("weakness", ""), "")).strip().lower(), str(c.get(cols.get("asset", ""), "")).strip().lower()): r
+            for r, c in rows.items()}
+    schedule = read_json(d / "drafts" / "poam-schedule.json", {}) or {}
+    items = poam_items(d)
+    last = max(rows) if rows else hdr
+    styles = {col: (wb.cells(sheet).get(f"{col}{last}") or {}).get("style") for col in cols.values()}
+    edits, changes, flags = {}, [], []
+    fmt = mapping.get("id_format") or "ATONE-{n:04d}"
+    n = sum(1 for c in rows.values() if str(c.get(cols.get("id", ""), "")).startswith(fmt.split("{")[0])) + 1
+    seen = set()
+    for it in items:
+        k = (str(it["weakness"]).strip().lower(), str(it["asset"]).strip().lower())
+        seen.add(k)
+        if k in have:
+            continue
+        last += 1
+        row = {"id": fmt.format(n=n), "weakness": it["weakness"], "description": it["description"],
+               "control": it["control"], "severity": it["severity"], "detected": it["detected"],
+               "due": schedule.get(it["key"], ""), "status": _status_value(mapping, "open") or "", "source": it["source"],
+               "asset": it["asset"], "evidence": f"atone: {it['evidence']}"}
+        n += 1
+        for field, col in cols.items():
+            if row.get(field) not in (None, ""):
+                edits[f"{col}{last}"] = row[field]
+        changes.append({"cell": f"{sheet}!A{last}", "now": row["id"], "why": f"new: {it['weakness']} on {it['asset']}",
+                        "evidence": [it["evidence"]], "key": it["key"]})
+    open_v = (_status_value(mapping, "open") or "").lower()
+    for k, r in have.items():
+        status = str(rows[r].get(cols.get("status", ""), "")).strip().lower()
+        if status == open_v and k not in seen and any(it["asset"].lower() == k[1] for it in items):
+            flags.append({"cell": f"{sheet}!{cols.get('status', 'A')}{r}", "has": rows[r].get(cols.get("status", "")),
+                          "atone": _status_value(mapping, "closed"), "why": f"{rows[r].get(cols.get('weakness', ''))!r} is "
+                          f"no longer in the latest evidence for {k[1]}: it looks closed (a person decides)", "evidence": []})
+    return {sheet: edits}, changes, {"flags": flags, "styles": {sheet: styles}}
+
+
+def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=print) -> list[dict]:
+    """Fill copies of the system's working documents (workbooks/*.xlsx, each with its WORKBOOK.mapping.json) into
+    `out`, with a NAME.changes.json beside each: every change (cell, was, now, why, evidence) and every flag."""
+    d = system_dir(name)
+    mappings = [{**read_json(p, {}), "_file": p.name} for p in sorted((d / "workbooks").glob("*.mapping.json"))]
+    paths = [Path(f) for f in files] if files else sorted((d / "workbooks").glob("*.xlsx"))
+    if not paths:
+        raise AtoneError(f"no working documents: put them in {d / 'workbooks'} (with a mapping each: atone workbook "
+                         f"inspect FILE shows what to map)")
+    reports = []
+    for path in paths:
+        m = next((m for m in mappings if fnmatch.fnmatch(path.name, m.get("match") or "")), None)
+        if not m:
+            raise AtoneError(f"{path.name}: no template mapping matches it (workbooks/NAME.mapping.json, \"match\": a glob)")
+        wb = Workbook(path)
+        styles = None
+        if m.get("kind") == "poam":
+            edits, changes, extra = plan_poam(d, wb, m)
+            flags, styles = extra["flags"], extra["styles"]
+        else:
+            edits, changes, flags = plan_ssp(d, wb, m)
+        dest = out / path.name
+        skipped = write_cells(path, dest, edits, styles)
+        report = {"workbook": path.name, "output": str(dest), "mapping": m["_file"], "changes": changes,
+                  "flags": flags, "skipped_formulas": skipped, "at": time.time()}
+        write_json(out / (path.stem + ".changes.json"), report)
+        log(f"{path.name}: {len(changes)} changes, {len(flags)} flags" + (f", {len(skipped)} formula cells left alone"
+                                                                        if skipped else "") + f" -> {dest}")
+        reports.append(report)
+    return reports
+
+
 # ---- command line: argument parsing, main
 
 def cmd_evidence(args) -> str:
@@ -1430,6 +1884,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("drafts", nargs="*", help="default: every draft in drafts/")
     p = sub.add_parser("mappings", help="the system's control mappings, and anything wrong with them")
     p.add_argument("system")
+    p = sub.add_parser("workbook", help="inspect FILE: a workbook's sheets, headers and drop-downs (for its mapping)")
+    p.add_argument("what", choices=["inspect"])
+    p.add_argument("file")
+    p = sub.add_parser("fill", help="fill copies of the working documents from the checks and verified narratives")
+    p.add_argument("system")
+    p.add_argument("files", nargs="*", help="default: the system's workbooks/*.xlsx")
+    p.add_argument("--out", required=True, help="the folder for the filled copies and their change reports")
     p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
@@ -1499,6 +1960,10 @@ def main(argv: list[str] | None = None) -> int:
                 probs = mapping_problems(m)
                 print(f"{cid:<10} {m.get('about', '')[:60]:<60} {m['_file']}" + "".join(f"\n  ! {x}" for x in probs))
             print(f"{len(maps)} mappings")
+        elif args.cmd == "workbook":
+            print(inspect_workbook(Path(args.file)))
+        elif args.cmd == "fill":
+            fill_workbooks(args.system, Path(args.out), args.files)
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":

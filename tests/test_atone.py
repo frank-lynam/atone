@@ -273,6 +273,102 @@ class Verify(unittest.TestCase):
         self.assertIn("superseded", v["dropped"][0]["why"])
 
 
+SSP_MAP = {"match": "ssp-*.xlsx", "kind": "ssp", "sheet": "Controls", "header_row": 3,
+           "columns": {"control": "Control ID", "status": "Status", "statement": "Implementation Statement",
+                       "evidence": "Evidence"},
+           "status_values": {"met": "Implemented", "partly": "Partially Implemented", "not met": "Planned",
+                             "inherited": "Inherited"}}
+POAM_MAP = {"match": "poam*.xlsx", "kind": "poam", "sheet": "POA&M Items", "header_row": 1,
+            "columns": {"id": "POA&M ID", "weakness": "Weakness Name", "description": "Weakness Description",
+                        "control": "Security Control", "severity": "Severity", "detected": "Detection Date",
+                        "due": "Scheduled Completion Date", "status": "Status", "source": "Source", "asset": "Asset"},
+            "status_values": {"open": "Open", "closed": "Closed"}}
+
+
+class Workbooks(unittest.TestCase):
+    """The customer's workbooks: read as they are (shared strings, drop-downs from a range), filled in a copy."""
+
+    def test_reading_a_workbook_as_excel_and_libreoffice_save_them(self):
+        wb = atone.Workbook(FIX / "ssp-matrix.xlsx")
+        self.assertEqual(list(wb.sheets), ["Instructions", "Controls", "Lists"])
+        self.assertEqual(wb.value("Controls", "A5"), "AC-2(1)")                # a shared string
+        self.assertEqual(wb.allowed("Controls", "C10"), ["Implemented", "Partially Implemented", "Planned", "Inherited",
+                                                         "Not Applicable"])   # from Lists!$A$1:$A$5
+        self.assertEqual(atone.Workbook(FIX / "poam.xlsx").allowed("POA&M Items", "H2"), ["Open", "Closed", "Risk Accepted"])
+        self.assertEqual(wb.merged("Controls"), ["A1:F1"])
+
+    def test_control_ids_as_workbooks_write_them(self):
+        for text, want in (("AC-2(1)", "ac-2.1"), ("AC-02 (01)", "ac-2.1"), ("ac-2.1", "ac-2.1"), ("AU-11", "au-11"),
+                           ("Control ID", None)):
+            self.assertEqual(atone.normalize_control(text), want)
+
+    def test_cells_set_in_place_and_formulas_never_overwritten(self):
+        xml = ('<worksheet><dimension ref="A1:B2"/><sheetData><row r="1"><c r="A1" s="3" t="s"><v>0</v></c>'
+               '<c r="B1"><f>SUM(A2:A9)</f><v>4</v></c></row><row r="3"><c r="C3" s="5"/></row></sheetData></worksheet>')
+        out, skipped = atone.edit_sheet_xml(xml, {"A1": "new <one> & co", "B1": "x", "B3": "beside", "D3": "after", "A2": "row"})
+        self.assertEqual(skipped, ["B1"])
+        self.assertIn('<c r="A1" s="3" t="inlineStr"><is><t xml:space="preserve">new &lt;one&gt; &amp; co</t></is></c>', out)
+        self.assertIn("<f>SUM(A2:A9)</f>", out)
+        self.assertLess(out.index('r="A2"'), out.index('r="C3"'))                 # the new row, in order
+        self.assertLess(out.index('r="B3"'), out.index('r="C3"'))                 # a new cell, in column order
+        self.assertLess(out.index('r="C3"'), out.index('r="D3"'))
+        self.assertIn('<dimension ref="A1:D3"', out)
+
+    def system(self, name):
+        d = evidence_system(name, [("file", "app01.example.internal", "/etc/audit/auditd.conf", AUDITD)])
+        for f in ("oscap-results.xml", "vulns-export.csv", "vulns.mapping.json"):
+            shutil.copy(FIX / f, d / "imports" / f)
+        atone.import_results(name, log=lambda *a: None)
+        t = atone.read_json(d / "tailoring.json")
+        t["inherited"] = {"pe-3": {"from": "AWS GovCloud"}}
+        atone.write_json(d / "tailoring.json", t)
+        atone.check_system(name, log=lambda *a: None)
+        for f, m in (("ssp-matrix.xlsx", SSP_MAP), ("poam.xlsx", POAM_MAP)):
+            shutil.copy(FIX / f, d / "workbooks" / f)
+            atone.write_json(d / "workbooks" / (f.split(".")[0] + ".mapping.json"), m)
+        return d
+
+    def test_filling_the_ssp_keeps_whats_there_and_flags_disagreements(self):
+        d = self.system("fillssp")
+        eid = next(e["id"] for e in atone.current_index(d) if e["kind"] == "file")
+        atone.write_json(d / "drafts" / "verified" / "ac-11.json", atone.verify_narrative(d, {"control": "ac-11", "claims": [
+            {"text": "Rotated audit logs are kept.", "cites": [{"evidence": eid, "quote": "max_log_file_action = keep_logs"}]}]}))
+        out = Path(tempfile.mkdtemp())
+        [ssp] = [r for r in atone.fill_workbooks("fillssp", out, log=lambda *a: None) if r["workbook"] == "ssp-matrix.xlsx"]
+        wb = atone.Workbook(out / "ssp-matrix.xlsx")
+        self.assertEqual(wb.value("Controls", "E6"), "Rotated audit logs are kept.")          # the verified narrative
+        self.assertEqual(wb.value("Controls", "C8"), "Inherited")
+        self.assertEqual(wb.value("Controls", "E8"), "Inherited from AWS GovCloud.")
+        self.assertEqual(wb.value("Controls", "C7"), "Implemented")                            # kept...
+        self.assertTrue(any(f["cell"] == "Controls!C7" and f["atone"] == "Partially Implemented" for f in ssp["flags"]))
+        self.assertTrue(wb.value("Controls", "F7").startswith("atone: "))
+        import zipfile
+        a, b = zipfile.ZipFile(FIX / "ssp-matrix.xlsx"), zipfile.ZipFile(out / "ssp-matrix.xlsx")
+        self.assertEqual([i.filename for i in a.infolist() if a.read(i) != b.read(i.filename)], ["xl/worksheets/sheet2.xml"])
+        self.assertTrue((out / "ssp-matrix.changes.json").exists())
+
+    def test_filling_the_poam_adds_whats_new_once(self):
+        d = self.system("fillpoam")
+        out = Path(tempfile.mkdtemp())
+        atone.fill_workbooks("fillpoam", out, log=lambda *a: None)
+        rows = atone.Workbook(out / "poam.xlsx").rows("POA&M Items")
+        names = [r.get("B") for r in rows.values()]
+        self.assertEqual(names.count("TLS 1.0 enabled"), 1)                     # already there: not added again
+        self.assertIn("OpenSSL: CVE-2026-1111 buffer overread", names)
+        self.assertIn("Set Interactive Session Timeout", names)                 # a failed OpenSCAP rule
+        new = next(r for r in rows.values() if r.get("B") == "Oracle JDK out of date")
+        self.assertEqual((new["A"], new["H"], new.get("G")), ("ATONE-0003", "Open", None))    # no made-up date
+
+    def test_a_status_the_workbooks_drop_down_doesnt_have_is_refused(self):
+        d = self.system("badstatus")
+        atone.write_json(d / "workbooks" / "ssp-matrix.mapping.json",
+                         {**SSP_MAP, "status_values": {**SSP_MAP["status_values"], "met": "Compliant"}})
+        with self.assertRaises(atone.AtoneError) as e:
+            atone.fill_workbooks("badstatus", Path(tempfile.mkdtemp()), [str(d / "workbooks" / "ssp-matrix.xlsx")],
+                                 log=lambda *a: None)
+        self.assertIn("Compliant", str(e.exception))
+
+
 class CommandLine(unittest.TestCase):
     def test_init_collect_and_look_at_the_evidence(self):
         code, out = run("init", "cli")
