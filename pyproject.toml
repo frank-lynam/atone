@@ -1,0 +1,45 @@
+[build-system]
+requires = ["flit_core>=3.12,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "atone"
+description = "Keeps a system's authorization (ATO) true to the system: an expert pack for hobkin, and a deterministic toolkit that collects evidence, checks NIST 800-53 controls, verifies every cited claim, fills the customer's own workbooks and draws the architecture as it really is. Standard library only."
+dynamic = ["version"]   # from atone.__version__
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Frank Lynam" }]
+requires-python = ">=3.9"
+dependencies = ["lorewell>=0.4"]   # lores: the controls (compiled exactly), guidance, the customer's documents
+
+keywords = ["ato", "nist", "800-53", "oscal", "compliance", "security", "rmf", "agent", "hobkin", "draw.io"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+hobkin = ["hobkin>=0.6"]   # the agent atone is an expert pack for
+
+[project.urls]
+Homepage = "https://github.com/frank-lynam/atone"
+Issues = "https://github.com/frank-lynam/atone/issues"
+
+[project.scripts]
+atone = "atone:cli"
+
+[tool.flit.module]
+name = "atone"
+
+[tool.flit.sdist]
+include = ["tests/"]
+exclude = ["CLAUDE.md", "AGENTS.md"]
