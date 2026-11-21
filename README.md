@@ -9,8 +9,11 @@ cites, fills in the customer's own workbooks, and draws the architecture as it r
 between the paperwork and the system called out. People decide; atone drafts and proves. It never declares
 anything compliant. The design is in [DESIGN.md](DESIGN.md).
 
-Standard library only (plus [lorewell](https://github.com/frank-lynam/lorewell) for lores), one file, no listening
-ports. Any system, any customer: nothing about one product is in it.
+Standard library only (plus [lorewell](https://github.com/frank-lynam/lorewell) for lores), one file of code, no
+listening ports, and **no internet needed**: NIST's 800-53 catalog and baselines (OSCAL) and guidance (SP 800-37,
+800-18, 800-137 as text) ship in the package as plain text, each with its source and SHA-256 (`atone sources`).
+No sudo either: it reads what the account can, and says so where it can't. Any system, any customer: nothing about
+one product is in it.
 
 ## With a hobkin
 
@@ -30,11 +33,13 @@ due, so a quiet day costs no model calls. Its skills (atone-become-expert, -syst
 
 ```sh
 atone init tst [--store s3://bucket/prefix]     # ~/atone/systems/tst: spec, tailoring, site file, mappings...
-atone controls fetch                           # NIST's OSCAL catalog and baselines, with their hashes
-atone controls lore                            # the catalog as a lore, word for word (lorewell install it)
+atone controls lore                            # the shipped catalog as a lore, word for word (lorewell install it)
+atone controls fetch --from DIR                # a newer copy of NIST's files, brought in by hand (optional)
 atone discover tst [--ssh user@host]...        # what runs: for drafting system.json
 atone collect tst [--ssh user@host]...         # evidence, from the built-in read-only collectors
 atone import tst                               # scans in imports/: OpenSCAP natively, others through a mapping
+atone import tst --eaveswatch s3://bucket/ew   # logging evidence (AU) from an eaveswatch store
+atone evidence tst search keep_logs            # ranked full-text search over the current evidence
 atone check tst                                # every control: met, partly, not met, unknown, inherited
 atone verify tst                               # drafted narratives: each claim's citation checked
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why

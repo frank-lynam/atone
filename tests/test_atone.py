@@ -82,7 +82,7 @@ class Evidence(unittest.TestCase):
 class Controls(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        src = atone.sources_dir()
+        src = (atone.HOME / "sources")
         src.mkdir(parents=True, exist_ok=True)
         shutil.copy(FIX / "catalog.json", src / "catalog.json")
         shutil.copy(FIX / "moderate.json", src / "moderate.json")
@@ -178,9 +178,9 @@ class Imports(unittest.TestCase):
 def evidence_system(name, records):
     """A system whose current evidence is exactly `records`: [(kind, host, source, content)]."""
     d = atone.init_system(name, None)
-    atone.sources_dir().mkdir(parents=True, exist_ok=True)
-    shutil.copy(FIX / "catalog.json", atone.sources_dir() / "catalog.json")
-    shutil.copy(FIX / "moderate.json", atone.sources_dir() / "moderate.json")
+    (atone.HOME / "sources").mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIX / "catalog.json", (atone.HOME / "sources") / "catalog.json")
+    shutil.copy(FIX / "moderate.json", (atone.HOME / "sources") / "moderate.json")
     atone.save_records(d, [atone.make_record(name, k, h, src, c) for k, h, src, c in records])
     return d
 
@@ -406,6 +406,23 @@ class Architecture(unittest.TestCase):
         self.assertTrue(any("dashed=1" in (c.get("style") or "") for c in cells if c.get("source")))
         ET.parse(self.out / "network.svg")
 
+    def test_a_connection_seen_once_in_the_window_still_counts(self):
+        import time as _t
+        d = atone.init_system("overtime", None)
+        fx = json.loads((FIX / "architecture.json").read_text())
+        atone.write_json(d / "system.json", fx["spec"])
+        recs = [atone.make_record("overtime", k, h, src, c) for k, h, src, c in fx["records"] if k != "flows"]
+        recs.append(atone.make_record("overtime", "flows", "app01", "/proc/net (connected)",
+                                      [{"proto": "tcp", "state": "established", "local": "10.0.2.20:43000",
+                                        "remote": "10.0.3.30:1521", "process": "nightly batch"}]))
+        atone.save_records(d, recs)
+        _t.sleep(1.1)                                       # the next collect: the batch connection has closed
+        atone.save_records(d, [atone.make_record("overtime", "flows", "app01", "/proc/net (connected)", [])])
+        g = atone.build_graph("overtime")
+        e = next(e for e in g["edges"] if (e["from"], e["to"], e["port"]) == ("app01", "db01", "tcp/1521"))
+        self.assertIn("actual", e["layers"])                # not "unused": it was seen, once
+        self.assertEqual(e["seen"], 1)
+
     def test_what_changed_since_the_last_drawing(self):
         atone.write_json(self.d / "documented.json", json.loads((FIX / "architecture.json").read_text())["documented"]
                          + [{"from": "app", "to": "db", "port": "tcp/1521"}])
@@ -413,6 +430,92 @@ class Architecture(unittest.TestCase):
         atone.draw_system("arch", out, log=lambda *a: None)
         ch = atone.read_json(out / "graph.changes.json")
         self.assertIn("app01 -> db01 tcp/1521: undocumented -> normal", ch["changed"])
+
+
+class A_Bundled(unittest.TestCase):
+    """NIST's files ship in the package as plain text: nothing needs the internet."""
+
+    def test_the_catalog_and_baselines_are_in_the_package_and_match_their_hashes(self):
+        import hashlib
+        lock = json.loads((atone.DATA / "lock.json").read_text())
+        for rel, info in lock.items():
+            self.assertEqual(hashlib.sha256((atone.DATA / rel).read_bytes()).hexdigest(), info["sha256"], rel)
+        cat = atone.load_catalog(atone.DATA / "nist" / "catalog.json")
+        self.assertGreater(len(cat), 1000)
+        prof = json.loads((atone.DATA / "nist" / "moderate.json").read_text())["profile"]
+        ids = [i for imp in prof["imports"] for inc in imp["include-controls"] for i in inc["with-ids"]]
+        self.assertEqual(len(ids), 287)                                    # Rev 5 moderate
+        self.assertTrue(all(i in cat for i in ids))
+        for g in ("sp800-37r2", "sp800-18r1", "sp800-137"):
+            self.assertIn("NIST", (atone.DATA / "guidance" / f"{g}.txt").read_text()[:3000])
+
+    def test_a_newer_copy_from_a_folder_without_the_internet(self):
+        src = Path(tempfile.mkdtemp())
+        shutil.copy(FIX / "catalog.json", src / "NIST_SP-800-53_rev5_catalog.json")    # NIST's own file names
+        shutil.copy(FIX / "moderate.json", src / "moderate.json")                       # or atone's
+        lock = atone.fetch_sources(str(src), log=lambda *a: None)
+        self.assertEqual(set(lock), {"catalog", "moderate"})
+        self.assertTrue(lock["catalog"]["url"].endswith("NIST_SP-800-53_rev5_catalog.json"))
+        self.assertEqual(atone.sources_dir(), atone.HOME / "sources")
+
+
+class MoreEvidence(unittest.TestCase):
+    def test_a_certificate_decoded_with_the_standard_library(self):
+        import ssl
+        pem = (FIX / "cert.pem").read_text()
+        info = atone.decode_cert(ssl.PEM_cert_to_DER_cert(pem))
+        self.assertEqual(info["subject"], "commonName=app01.example.internal")
+        self.assertIn("app01.example.internal", info["names"])
+        self.assertTrue(info["self_signed"])
+
+    def test_old_tls_and_expiring_certificates_are_caught(self):
+        tls = [{"port": 443, "protocol": "TLSv1.3", "days_left": 200}, {"port": 8443, "protocol": "TLSv1.1", "days_left": 12}]
+        rec = atone.make_record("t", "certs", "h1", "TLS on listeners", tls)
+        m = {x["control"]: x for x in atone.STARTER_MAPPINGS}
+        self.assertEqual(atone.run_check(m["sc-8"]["checks"][0], [rec], "sc-8", {})["status"], "fail")
+        self.assertEqual(atone.run_check(m["sc-17"]["checks"][0], [rec], "sc-17", {})["status"], "fail")
+        ok = atone.make_record("t", "certs", "h1", "TLS on listeners", tls[:1])
+        self.assertEqual(atone.run_check(m["sc-8"]["checks"][0], [ok], "sc-8", {})["status"], "pass")
+        self.assertEqual(atone.run_check(m["sc-17"]["checks"][0], [ok], "sc-17", {})["status"], "pass")
+
+    def test_evidence_search_is_ranked_and_follows_the_current_evidence(self):
+        d = evidence_system("srch", [("file", "h1", "/etc/audit/auditd.conf", AUDITD),
+                                     ("file", "h1", "/etc/chrony.conf", "server time.example.internal iburst\n")])
+        hits = atone.search_evidence(d, "keep_logs")
+        self.assertEqual([h["source"] for h in hits], ["/etc/audit/auditd.conf"])
+        self.assertIn("[keep_logs]", hits[0]["snippet"])
+        import time as _t
+        _t.sleep(1.1)
+        atone.save_records(d, [atone.make_record("srch", "file", "h1", "/etc/audit/auditd.conf", "max_log_file_action = rotate\n")])
+        self.assertEqual(atone.search_evidence(d, "keep_logs"), [])           # superseded: out of the index
+
+    def test_eaveswatch_shows_logging_retention_and_review(self):
+        ew = Path(tempfile.mkdtemp())
+        base = ew / "systems" / "system=web"
+        (base / "interpreter").mkdir(parents=True)
+        (base / "interpreter" / "v1.json").write_text(json.dumps({"sources": [{"name": "app", "path": "/var/log/app/*.log"}]}))
+        (base / "interpreter" / "v2.json").write_text(json.dumps({"sources": [{"name": "app", "path": "/var/log/app/*.log"}],
+                                                                  "alerts": [{"name": "errors", "match": "ERROR"}]}))
+        (base / "nodes").mkdir()
+        (base / "nodes" / "app01.json").write_text(json.dumps({"host": "app01", "at": "2026-11-21T10:00:00Z", "role": "finial"}))
+        (base / "ledger").mkdir()
+        (base / "ledger" / "e1.json").write_text(json.dumps({"at": "2026-11-20", "title": "disk filling", "severity": "warn"}))
+        for day in ("2026-08-01", "2026-11-20"):
+            (ew / "env=prod" / "kind=packets" / f"dt={day}" / "hour=10" / "host=app01").mkdir(parents=True)
+        d = evidence_system("ewsys", [])
+        atone.import_results("ewsys", eaveswatch=str(ew), ew_system="web", log=lambda *a: None)
+        idx = {e["source"]: e for e in atone.current_index(d)}
+        self.assertIn("eaveswatch interpreter v2", idx)                          # the newest version
+        archive = json.loads(atone.load_record(d, idx["eaveswatch archive (prod)"])["content"])
+        self.assertEqual(archive["days_kept"], 112)
+        self.assertEqual(archive["kinds"]["packets"]["hosts_latest"], ["app01"])
+        m = {x["control"]: x for x in atone.STARTER_MAPPINGS}
+        recs = [atone.load_record(d, idx["eaveswatch archive (prod)"])]
+        chk = next(c for c in m["au-11"]["checks"] if c["id"] == "archive-reaches-back")
+        self.assertEqual(atone.run_check(chk, recs, "au-11", {"au-11_odp": "90 days"})["status"], "pass")
+        self.assertEqual(atone.run_check(chk, recs, "au-11", {"au-11_odp": "365 days"})["status"], "fail")
+        spec = [atone.load_record(d, idx["eaveswatch interpreter v2"])]
+        self.assertEqual(atone.run_check(m["au-6"]["checks"][1], spec, "au-6", {})["status"], "pass")
 
 
 class PlanAndReport(unittest.TestCase):

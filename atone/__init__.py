@@ -21,12 +21,12 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone due SYSTEM              what's due by the cadence (nothing printed when nothing is: a hobkin's watch)
     atone report SYSTEM --out DIR [--conmon]   report.html, for people
     atone sources                 public guidance worth a lore, and NIST's files
-    atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
+    atone controls fetch [--from DIR]   a newer copy of NIST's OSCAL files (the package ships them)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
     atone --version
 
-Everything lives under $ATONE_HOME (default ~/atone): sources/ (the OSCAL files), systems/NAME/ (a system's spec,
+Everything lives under $ATONE_HOME (default ~/atone): sources/ (a newer copy of NIST's files, if fetched), systems/NAME/ (a system's spec,
 tailoring, site file, mappings, imports and runs) and, unless a system names another, store/ (its evidence).
 Standard library only, plus lorewell for lores.
 """
@@ -155,6 +155,21 @@ class Store:
         tmp = dest.with_name(dest.name + ".part")
         tmp.write_bytes(data)
         os.replace(tmp, dest)
+
+    def names(self, prefix: str = "") -> list[str]:
+        """What's directly under a prefix: files, and folders as NAME/."""
+        if self.s3:
+            r = self._aws("ls", f"{self.url}/{prefix}")
+            out = []
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if parts[:1] == ["PRE"]:
+                    out.append(parts[1])
+                elif len(parts) >= 4:
+                    out.append(" ".join(parts[3:]))
+            return sorted(out)
+        p = Path(self.url) / prefix
+        return sorted(n + ("/" if (p / n).is_dir() else "") for n in os.listdir(p)) if p.is_dir() else []
 
     def get(self, key: str) -> bytes | None:
         if self.s3:
@@ -373,6 +388,57 @@ def c_aws(spec: dict) -> list[tuple[str, object]]:
     return out
 
 
+def decode_cert(der: bytes) -> dict:
+    """A certificate's subject, issuer, validity and names, with the standard library: Python's own certificate
+    decoder where it has one; else just its fingerprint (the protocol and cipher are still recorded)."""
+    out = {"sha256": hashlib.sha256(der).hexdigest()}
+    try:
+        import _ssl
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(__import__("ssl").DER_cert_to_PEM_cert(der))
+        info = _ssl._test_decode_cert(f.name)
+        os.unlink(f.name)
+    except (ImportError, AttributeError, OSError, ValueError):
+        return out
+    flat = lambda rdns: ", ".join(f"{k}={v}" for rdn in rdns for k, v in rdn)
+    out.update({"subject": flat(info.get("subject", ())), "issuer": flat(info.get("issuer", ())),
+                "not_before": info.get("notBefore"), "not_after": info.get("notAfter"),
+                "names": [v for k, v in info.get("subjectAltName", ()) if k in ("DNS", "IP Address")],
+                "self_signed": info.get("subject") == info.get("issuer")})
+    try:
+        out["days_left"] = int((__import__("ssl").cert_time_to_seconds(info["notAfter"]) - time.time()) // 86400)
+    except (KeyError, ValueError):
+        pass
+    return out
+
+
+def c_certs(spec: dict) -> list[tuple[str, object]]:
+    """TLS on this host's listeners: for each TCP port listened on, a handshake from here (trust isn't checked:
+    this only records what's offered): the protocol and cipher negotiated, and the certificate's subject, issuer,
+    expiry and names. Ports that don't speak TLS are listed as such."""
+    import ssl
+    ports = sorted({(r["local"].rpartition(":")[0], int(r["local"].rpartition(":")[2]))
+                    for r in proc_net() if r["proto"] == "tcp" and r["state"] == "listen"}, key=lambda x: x[1])
+    found, plain = [], []
+    for ip, port in ports:
+        hosts = ["127.0.0.1"] if ip in ("0.0.0.0", "") else ["::1", "127.0.0.1"] if ip == "::" else [ip]
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        for host in hosts:
+            try:
+                with socket.create_connection((host, port), timeout=3) as raw, ctx.wrap_socket(raw) as tls:
+                    der = tls.getpeercert(binary_form=True)
+                    found.append({"port": port, "address": ip, "protocol": tls.version(),
+                                  "cipher": (tls.cipher() or [""])[0],
+                                  **(decode_cert(der) if der else {"certificate": "none offered"})})
+                break
+            except (ssl.SSLError, ConnectionError, socket.timeout, OSError):
+                continue
+        else:
+            plain.append(port)
+    return [("TLS on listeners", found), ("listeners not speaking TLS (from here)", sorted(set(plain)))]
+
+
 # The menu: a spec can name these, and nothing else
 COLLECTORS = {
     "accounts": (c_accounts, "users, groups, sudo rules, last logins (never password hashes)"),
@@ -382,6 +448,7 @@ COLLECTORS = {
     "flows": (c_flows, "connections open now (over time: connections seen)"),
     "firewall": (c_firewall, "host firewall rules"),
     "file": (c_file, "the files the system spec names (never credentials)"),
+    "certs": (c_certs, "TLS on each listener: protocol, cipher, and the certificate's subject, issuer, expiry"),
     "aws": (c_aws, "security groups, network ACLs, routes, VPCs, load balancers, CloudTrail, Config, KMS (read-only)"),
 }
 LOCAL_KINDS = [k for k in COLLECTORS if k != "aws"]     # what runs on each host; aws runs once, from here
@@ -471,6 +538,67 @@ def control_ids(ref: str) -> list[str]:
                 break                                   # (a), (b): a part of the statement; the control is enough
         if cid not in out:
             out.append(cid)
+    return out
+
+
+def import_eaveswatch(url: str, system: str, env: str | None = None) -> list[dict]:
+    """Evidence for the AU family from an eaveswatch store (its folder, or s3://...): what it collects and alerts on
+    (its interpreter spec), which hosts ship logs (heartbeats), how far back the archive goes (its day partitions:
+    retention), and that logs are reviewed (findings and fired alerts). Read only."""
+    store = Store(url)
+    base = f"systems/system={system}/"
+
+    def jget(key):
+        data = store.get(key)
+        try:
+            return json.loads(data) if data else None
+        except json.JSONDecodeError:
+            return None
+    out = []
+    versions = sorted((int(m.group(1)), n) for n in store.names(base + "interpreter/")
+                      for m in [re.fullmatch(r"v(\d+)\.json", n)] if m)
+    if versions:
+        v, n = versions[-1]
+        spec = jget(base + "interpreter/" + n) or {}
+        out.append({"kind": "logs", "host": "eaveswatch", "source": f"eaveswatch interpreter v{v}",
+                    "content": {"version": v, "sources": [{k: x.get(k) for k in ("name", "path", "journald", "kind")
+                                                           if x.get(k)} for x in spec.get("sources") or []],
+                                "alerts": spec.get("alerts") or [], "services": sorted(spec.get("services") or {})}})
+    nodes = [jget(base + "nodes/" + n) for n in store.names(base + "nodes/") if n.endswith(".json")]
+    nodes = [{"host": x.get("host"), "last_seen": x.get("at"), "role": x.get("role"), "interpreter": x.get("interpreter")}
+             for x in nodes if x]
+    if nodes:
+        out.append({"kind": "logs", "host": "eaveswatch", "source": "eaveswatch nodes", "content": nodes})
+    envs = [env] if env else [n[4:].rstrip("/") for n in store.names() if n.startswith("env=")]
+    for e in envs:
+        kinds = {}
+        for kn in store.names(f"env={e}/"):
+            if not kn.startswith("kind="):
+                continue
+            k = kn[5:].rstrip("/")
+            days = sorted(n[3:].rstrip("/") for n in store.names(f"env={e}/{kn}") if n.startswith("dt="))
+            if not days:
+                continue
+            hours = [n for n in store.names(f"env={e}/{kn}dt={days[-1]}/") if n.startswith("hour=")]
+            hosts = sorted(n[5:].rstrip("/") for n in store.names(f"env={e}/{kn}dt={days[-1]}/{hours[-1]}")
+                           if n.startswith("host=")) if hours else []
+            import datetime as _dt
+            span = (_dt.date.fromisoformat(days[-1]) - _dt.date.fromisoformat(days[0])).days + 1
+            kinds[k] = {"oldest": days[0], "newest": days[-1], "days_present": len(days), "days_kept": span,
+                        "hosts_latest": hosts}
+        if kinds:
+            out.append({"kind": "logs", "host": "eaveswatch", "source": f"eaveswatch archive ({e})",
+                        "content": {"env": e, "days_kept": max(x["days_kept"] for x in kinds.values()), "kinds": kinds}})
+    events = sorted(n for n in store.names(base + "ledger/") if n.endswith(".json"))
+    alerts = [n for n in store.names(base + "alerts/") if n.endswith(".json")]
+    if events or alerts:
+        recent = [jget(base + "ledger/" + n) or {} for n in events[-20:]]
+        out.append({"kind": "logs", "host": "eaveswatch", "source": "eaveswatch findings",
+                    "content": {"findings_events": len(events), "alerts_fired": len(alerts),
+                                "recent": [{k: ev.get(k) for k in ("at", "kind", "title", "severity", "status", "by")
+                                            if ev.get(k)} for ev in recent]}})
+    if not out:
+        raise AtoneError(f"nothing for system {system!r} in {url} (an eaveswatch store has systems/system=NAME/)")
     return out
 
 
@@ -624,23 +752,47 @@ SOURCES = {
 }
 
 
+# Shipped in the package, as plain text: no internet needed. (Piped over ssh to collect, this file has no __file__,
+# and no use for the data.)
+DATA = Path(globals().get("__file__") or ".").resolve().parent / "data"
+
+
 def sources_dir() -> Path:
-    return HOME / "sources"
+    """Where NIST's files are read from: a copy fetched into ~/atone/sources (atone controls fetch), else the ones
+    shipped in the package."""
+    return HOME / "sources" if (HOME / "sources" / "catalog.json").exists() else DATA / "nist"
 
 
-def fetch_sources(log=print) -> dict:
-    """Download NIST's OSCAL files and record what was fetched (url, time, size, SHA-256) in sources/lock.json:
-    what every control's words can be traced back to."""
-    d = sources_dir()
+def source_info(name: str) -> dict:
+    """Where a NIST file came from: its url, when it was fetched, its SHA-256."""
+    if sources_dir() == DATA / "nist":
+        return (read_json(DATA / "lock.json", {}) or {}).get(f"nist/{name}.json") or {}
+    return (read_json(sources_dir() / "lock.json", {}) or {}).get(name) or {}
+
+
+def fetch_sources(from_dir: str | None = None, log=print) -> dict:
+    """A newer copy of NIST's OSCAL files, into ~/atone/sources (used instead of the shipped ones), recorded with what
+    each is (url or file, time, size, SHA-256) in its lock.json. From NIST's site, or from a folder they were
+    downloaded into elsewhere (no internet needed): NIST's own file names or atone's (catalog.json, moderate.json...)."""
+    d = HOME / "sources"
     d.mkdir(parents=True, exist_ok=True)
     lock = {}
     for name, url in SOURCES.items():
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": f"atone/{__version__}"}),
-                                    timeout=120) as r:
-            data = r.read()
+        if from_dir:
+            cands = [Path(from_dir) / f"{name}.json", Path(from_dir) / url.rsplit("/", 1)[1]]
+            src = next((c for c in cands if c.exists()), None)
+            if not src:
+                if name == "catalog":
+                    raise AtoneError(f"no catalog in {from_dir} ({cands[1].name} or catalog.json)")
+                continue
+            data, origin = src.read_bytes(), str(src.resolve())
+        else:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": f"atone/{__version__}"}),
+                                        timeout=120) as r:
+                data, origin = r.read(), url
         json.loads(data)                                    # it must at least be JSON
         (d / f"{name}.json").write_bytes(data)
-        lock[name] = {"url": url, "fetched": time.time(), "bytes": len(data),
+        lock[name] = {"url": origin, "fetched": time.strftime("%Y-%m-%d"), "bytes": len(data),
                       "sha256": hashlib.sha256(data).hexdigest()}
         log(f"{name}: {len(data) // 1024} KB, sha256 {lock[name]['sha256'][:16]}...")
     (d / "lock.json").write_text(json.dumps(lock, indent=2) + "\n")
@@ -695,7 +847,7 @@ def load_catalog(path: Path | None = None) -> dict:
     family, statement, guidance, assessment objective, parameters, related controls, and whether it's withdrawn."""
     path = path or sources_dir() / "catalog.json"
     if not path.exists():
-        raise AtoneError(f"no catalog at {path}: run `atone controls fetch` first")
+        raise AtoneError(f"no catalog at {path}: the package's data is missing (reinstall atone)")
     cat = json.loads(path.read_text())["catalog"]
     out = {}
 
@@ -735,8 +887,8 @@ def load_baseline(name: str) -> list[str]:
     """The control ids a baseline profile includes (NIST's LOW, MODERATE, HIGH or PRIVACY)."""
     path = sources_dir() / f"{name.lower()}.json"
     if not path.exists():
-        raise AtoneError(f"no {name} baseline at {path}: run `atone controls fetch` first "
-                         f"(baselines: {', '.join(k for k in SOURCES if k != 'catalog')})")
+        raise AtoneError(f"no {name} baseline in {sources_dir()} (baselines: "
+                         f"{', '.join(k for k in SOURCES if k != 'catalog')})")
     prof = json.loads(path.read_text())["profile"]
     ids = []
     for imp in prof.get("imports") or []:
@@ -771,7 +923,7 @@ def compile_controls_lore(out: Path, catalog_path: Path | None = None) -> dict:
     objective, exactly as NIST wrote them) and a symbol per control id. No model touches it."""
     import lorewell
     cat = load_catalog(catalog_path)
-    lock = read_json(sources_dir() / "lock.json", {}).get("catalog") or {}
+    lock = source_info("catalog")
     with tempfile.TemporaryDirectory() as t:
         src = Path(t)
         sections, symbols = [], []
@@ -897,15 +1049,34 @@ STARTER_MAPPINGS = [
                  "pattern": r"^\s*(server|pool)\s+\S+"}]},
     {"control": "au-9", "about": "Protection of audit information", "evidence": [], "checks": [{"id": "oscap", "type": "scan"}]},
     {"control": "au-11", "about": "Audit record retention",
-     "evidence": [{"name": "auditd", **F("/etc/audit/auditd.conf")}],
+     "evidence": [{"name": "auditd", **F("/etc/audit/auditd.conf")},
+                  {"name": "archive", "kind": "logs", "source": "eaveswatch archive*"}],
      "checks": [{"id": "keep-logs", "what": "auditd keeps rotated logs", "type": "present", "evidence": "auditd",
-                 "pattern": r"^\s*max_log_file_action\s*=\s*(keep_logs|rotate)"}, {"id": "oscap", "type": "scan"}],
+                 "pattern": r"^\s*max_log_file_action\s*=\s*(keep_logs|rotate)"}, {"id": "oscap", "type": "scan"},
+                {"id": "archive-reaches-back", "what": "the log archive goes back the retention period (in days)",
+                 "type": "value", "evidence": "archive", "pattern": r'"days_kept": (\d+)', "op": ">=",
+                 "value": "{param:au-11_odp}"}],
      "needs_person": ["the records retention policy that sets the period (AU-11), and where logs are kept for it "
                       "(eaveswatch's store, if it runs)"]},
     {"control": "au-12", "about": "Audit record generation",
      "evidence": [{"name": "unit-files", "kind": "services", "source": "systemctl list-unit-files*"}],
      "checks": [{"id": "auditd-at-boot", "what": "auditd starts at boot", "type": "present", "evidence": "unit-files",
                  "pattern": r"^auditd\.service\s+enabled"}, {"id": "oscap", "type": "scan"}]},
+    {"control": "au-6", "about": "Audit record review, analysis and reporting",
+     "evidence": [{"name": "findings", "kind": "logs", "source": "eaveswatch findings"},
+                  {"name": "spec", "kind": "logs", "source": "eaveswatch interpreter*"}],
+     "checks": [{"id": "reviewed", "what": "logs are reviewed: findings are recorded", "type": "exists",
+                 "evidence": "findings"},
+                {"id": "alert-rules", "what": "alert rules are defined", "type": "present", "evidence": "spec",
+                 "pattern": r'"alerts": \[\s*\{'}],
+     "needs_person": ["how often logs are reviewed, by whom, and who findings are reported to (AU-6a, b)"]},
+    {"control": "si-4", "about": "System monitoring",
+     "evidence": [{"name": "nodes", "kind": "logs", "source": "eaveswatch nodes"},
+                  {"name": "spec", "kind": "logs", "source": "eaveswatch interpreter*"}],
+     "checks": [{"id": "monitored", "what": "hosts ship their logs to the monitor", "type": "exists", "evidence": "nodes"},
+                {"id": "alert-rules", "what": "alert rules are defined", "type": "present", "evidence": "spec",
+                 "pattern": r'"alerts": \[\s*\{'}, {"id": "oscap", "type": "scan"}],
+     "needs_person": ["the monitoring objectives, and what's done with what's found (SI-4a, d)"]},
     {"control": "cm-2", "about": "Baseline configuration: the installed software is known",
      "evidence": [{"name": "packages", "kind": "packages"}],
      "checks": [{"id": "inventory", "what": "the installed packages were collected", "type": "exists",
@@ -934,6 +1105,16 @@ STARTER_MAPPINGS = [
      "checks": [{"id": "no-nopasswd", "what": "no sudo rule skips the password", "type": "absent", "evidence": "sudo",
                  "pattern": r"^[^#\n]*NOPASSWD"}, {"id": "oscap", "type": "scan"}]},
     {"control": "ac-12", "about": "Session termination", "evidence": [], "checks": [{"id": "oscap", "type": "scan"}]},
+    {"control": "sc-8", "about": "Transmission confidentiality: no old TLS on any listener",
+     "evidence": [{"name": "tls", "kind": "certs", "source": "TLS on listeners"}],
+     "checks": [{"id": "no-old-tls", "what": "no listener negotiates TLS 1.0 or 1.1", "type": "absent", "evidence": "tls",
+                 "pattern": r'"protocol": "TLSv1(\.1)?"'}, {"id": "oscap", "type": "scan"}],
+     "needs_person": ["which connections carry what data, and that each is encrypted (the data flow diagrams)"]},
+    {"control": "sc-17", "about": "PKI certificates: none about to expire",
+     "evidence": [{"name": "tls", "kind": "certs", "source": "TLS on listeners"}],
+     "checks": [{"id": "not-expiring", "what": "no listener's certificate expires within 30 days", "type": "count",
+                 "evidence": "tls", "field_patterns": {"days_left": r"^(-\d+|[0-2]?\d)$"}, "op": "==", "value": 0}],
+     "needs_person": ["where the certificates come from (the approved PKI), and who renews them"]},
     {"control": "sc-7", "about": "Boundary protection: nothing open to the whole internet but what's meant to be",
      "evidence": [{"name": "groups", "kind": "aws", "source": "ec2 describe-security-groups"}],
      "checks": [{"id": "no-world-ssh", "what": "no security group opens SSH (22) to 0.0.0.0/0", "type": "absent",
@@ -1011,6 +1192,55 @@ def current_index(d: Path, fresh_days: float | None = None) -> list[dict]:
     return sorted(newest.values(), key=lambda e: (e["kind"], e["host"], e["source"]))
 
 
+def window_index(d: Path, kinds: tuple, fresh_days: float | None = None) -> list[dict]:
+    """Every record of these kinds within fresh_days, not just the newest: what's been seen over time (each collect
+    snapshots the connections open at that moment; together they're the connections seen)."""
+    days = fresh_days if fresh_days is not None else float(read_json(d / "atone.json", {}).get("fresh_days") or 30)
+    cut = time.time() - days * 86400
+    runs = sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []
+    return [{**e, "run": run} for run in runs for e in run_index(d, run) if e["kind"] in kinds and e["at"] >= cut]
+
+
+def search_index(d: Path):
+    """The current evidence in a full-text index (SQLite FTS5: ranked, with snippets), kept in step: records that
+    are new are added, ones no longer current are dropped. In runs/evidence-index.db; rebuilt from the store if lost."""
+    import sqlite3
+    con = sqlite3.connect(d / "runs" / "evidence-index.db")
+    con.executescript("CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY);"
+                      "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, kind UNINDEXED, host, source, "
+                      "content, tokenize = \"unicode61 tokenchars '_.-/'\");")
+    have = {r[0] for r in con.execute("SELECT id FROM docs")}
+    current = {e["id"]: e for e in current_index(d)}
+    for gone in have - set(current):
+        con.execute("DELETE FROM docs WHERE id = ?", (gone,))
+        con.execute("DELETE FROM fts WHERE id = ?", (gone,))
+    for eid in set(current) - have:
+        rec = load_record(d, current[eid])
+        if rec:
+            con.execute("INSERT INTO docs (id) VALUES (?)", (eid,))
+            con.execute("INSERT INTO fts (id, kind, host, source, content) VALUES (?,?,?,?,?)",
+                        (eid, rec["kind"], rec["host"], rec["source"], rec["content"]))
+    con.commit()
+    return con
+
+
+def search_evidence(d: Path, query: str, n: int = 20) -> list[dict]:
+    """Ranked current evidence for some words (every word first, any if that finds nothing), each with a snippet."""
+    words = re.findall(r"[\w./-]+", query)
+    con = search_index(d)
+    hits = []
+    for op in (" AND ", " OR "):
+        q = op.join('"' + w.replace('"', "") + '"*' for w in words)
+        if not q:
+            break
+        hits = con.execute("SELECT id, kind, host, source, snippet(fts, 4, '[', ']', ' ... ', 16) FROM fts "
+                           "WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT ?", (q, n)).fetchall()
+        if hits:
+            break
+    con.close()
+    return [dict(zip(("id", "kind", "host", "source", "snippet"), h)) for h in hits]
+
+
 def load_record(d: Path, entry: dict) -> dict | None:
     data = system_store(d).get(entry["key"])
     return json.loads(gzip.decompress(data)) if data else None
@@ -1048,10 +1278,18 @@ def collect(name: str, kinds: list[str] | None = None, targets: list[str] | None
     return run
 
 
-def import_results(name: str, files: list[str] | None = None, log=print) -> str:
-    """Scanner results into evidence: the files given, or everything in the system's imports/ folder."""
+def import_results(name: str, files: list[str] | None = None, log=print, eaveswatch: str | None = None,
+                   ew_system: str | None = None, env: str | None = None) -> str:
+    """Scanner results into evidence: the files given, or everything in the system's imports/ folder; or, with
+    `eaveswatch` (its store), what eaveswatch shows about logging."""
     d = system_dir(name)
     site = read_json(d / "site.json", {})
+    if eaveswatch:
+        recs = [make_record(name, p["kind"], p["host"], p["source"], p["content"], extra_redact=site.get("redact"))
+                for p in import_eaveswatch(eaveswatch, ew_system or name, env)]
+        run = save_records(d, recs)
+        log(f"eaveswatch: {', '.join(r['source'] for r in recs)} (run {run})")
+        return run
     mappings = []
     for mp in sorted((d / "imports").glob("*.mapping.json")):
         m = read_json(mp, {})
@@ -1105,8 +1343,8 @@ def mapping_problems(m: dict) -> list[str]:
     """What's wrong with a mapping (an empty list: nothing)."""
     out, names = [], {e.get("name") for e in m.get("evidence") or []}
     for e in m.get("evidence") or []:
-        if e.get("kind") not in set(COLLECTORS) | {"scan", "site"}:
-            out.append(f"evidence {e.get('name')!r}: kind {e.get('kind')!r} isn't a collector, scan or site")
+        if e.get("kind") not in set(COLLECTORS) | {"scan", "site", "logs"}:
+            out.append(f"evidence {e.get('name')!r}: kind {e.get('kind')!r} isn't a collector, scan, logs or site")
     for c in m.get("checks") or []:
         if c.get("type") not in CHECK_TYPES:
             out.append(f"check {c.get('id')!r}: type {c.get('type')!r} isn't one of {', '.join(CHECK_TYPES)}")
@@ -1876,7 +2114,8 @@ def build_graph(name: str) -> dict:
             addr[a] = hn
             n["addresses"].append(a)
     listening = {}                                        # host -> {(proto, port)}
-    for e in index:
+    over_time = window_index(d, ("listeners", "flows"))   # every snapshot in the window, not just the newest
+    for e in over_time:
         if e["kind"] == "listeners":
             node(e["host"], inside=True, component=comp_of.get(e["host"]))
             for r in _json_content(d, e) or []:
@@ -1915,9 +2154,12 @@ def build_graph(name: str) -> dict:
     edges = {}
 
     def edge(src, dst, port, layer, **extra):
-        e = edges.setdefault((src, dst, port), {"from": src, "to": dst, "port": port, "layers": [], "evidence": []})
+        e = edges.setdefault((src, dst, port), {"from": src, "to": dst, "port": port, "layers": [], "evidence": [],
+                                                "seen": 0})
         if layer not in e["layers"]:
             e["layers"].append(layer)
+        if layer == "actual":
+            e["seen"] += 1                                # in how many snapshots
         for k, v in extra.items():
             if k == "evidence":
                 if v not in e["evidence"]:
@@ -1949,8 +2191,8 @@ def build_graph(name: str) -> dict:
                     for src in members.get(pair.get("GroupId"), []):
                         if src != hn:
                             edge(src, hn, port, "allowed", rule=f"{g} from {pair.get('GroupId')}")
-    # actual: connections seen (inbound to a listening port, else outbound)
-    for e in index:
+    # actual: connections seen, in any snapshot in the window (inbound to a listening port, else outbound)
+    for e in over_time:
         if e["kind"] != "flows":
             continue
         for r in _json_content(d, e) or []:
@@ -2224,17 +2466,12 @@ def draw_system(name: str, out: Path, log=print) -> dict:
 
 # ---- plan: the engagement plan (what's left, who does it), what's due, the report people read
 
-GUIDANCE = {      # public guidance worth a lore (lorewell build, then lorewell review): help, never cited as a control
-    "sp800-37": ("NIST SP 800-37 Rev 2: the Risk Management Framework",
-                 "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-37r2.pdf"),
-    "sp800-53a": ("NIST SP 800-53A Rev 5: assessing the controls (its objectives are already in the exact lore)",
-                  "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-53Ar5.pdf"),
-    "sp800-18": ("NIST SP 800-18 Rev 1: writing a system security plan",
-                 "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-18r1.pdf"),
-    "sp800-137": ("NIST SP 800-137: continuous monitoring",
-                  "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-137.pdf"),
-    "stigs": ("DISA STIGs, for whatever the system runs (pick the ones its components need)",
-              "https://public.cyber.mil/stigs/downloads/"),
+GUIDANCE = {      # guidance worth a lore (lorewell build, then lorewell review): help, never cited as a control
+    "sp800-37": ("NIST SP 800-37 Rev 2: the Risk Management Framework", "guidance/sp800-37r2.txt"),
+    "sp800-18": ("NIST SP 800-18 Rev 1: writing a system security plan", "guidance/sp800-18r1.txt"),
+    "sp800-137": ("NIST SP 800-137: continuous monitoring", "guidance/sp800-137.txt"),
+    "stigs": ("STIG and CIS content for what the system runs: the SCAP Security Guide on the hosts "
+              "(/usr/share/xml/scap/ssg/content), or DISA's STIG files someone brings in", None),
 }
 CADENCE = {"collect": "24h", "check": "7d", "conmon": "30d"}
 
@@ -2487,11 +2724,11 @@ Open the one for the step you're on, and follow it.
 SKILLS = {
     "atone-become-expert": ("Build the lores you need to be the expert for a system: NIST's controls exactly, public "
                             "guidance, and the customer's own documents.", """
-1. The controls, word for word: `atone controls fetch`, then `atone controls lore`, then `lorewell install` the lore it
-   writes. This is what you cite and quote for a control's text: never a model's paraphrase.
-2. Public guidance (help for you, never cited as a control): `atone sources` lists it. Build only what this system
-   needs: the STIGs for its components (from the system spec), not every one. `lorewell build NAME DOCS...`, then
-   have the ISSE look it over with `lorewell review`. (PDFs: convert to text first, e.g. with pdftotext.)
+1. The controls, word for word (NIST's files ship with atone: no internet needed): `atone controls lore`, then
+   `lorewell install` the lore it writes. This is what you cite and quote for a control's text: never a paraphrase.
+2. Guidance (help for you, never cited as a control): `atone sources` lists it, with the paths of the texts atone
+   ships. Build what this system needs: `lorewell build NAME FILE`, then have the ISSE look it over with `lorewell
+   review`. For STIGs, use the SCAP Security Guide content on the hosts, for the components the system spec names.
 3. The customer's own documents (policies, procedures, past packages, interconnection agreements), as they come up:
    ask which to use, `lorewell build` them into a private lore here, and never send them anywhere else.
 4. What you learn about the system and its people (voice, quirks, owners) goes in your field lore; the mappings
@@ -2582,22 +2819,16 @@ def cmd_evidence(args) -> str:
         return f"{rec['id']} ({rec['source']}, {time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(rec['at']))}, " \
                f"sha256 {rec['sha256'][:16]}... {ok})\n\n{rec['content']}"
     if args.what == "search":
-        words = [w.lower() for w in args.words or []]
-        hits = []
-        for e in idx:
-            rec = load_record(d, e)
-            text = (rec or {}).get("content", "").lower()
-            if words and all(w in text or w in e["source"].lower() for w in words):
-                line = next((l for l in rec["content"].splitlines() if words[0] in l.lower()), "")
-                hits.append(f"{e['id']}  {e['source']}\n    {line.strip()[:200]}")
-        return "\n".join(hits) or f"no evidence with {' '.join(args.words or [])!r}"
+        hits = search_evidence(d, " ".join(args.words or []))
+        return "\n".join(f"{h['id']}  {h['source']}\n    {' '.join(h['snippet'].split())[:240]}" for h in hits) \
+            or f"no evidence with {' '.join(args.words or [])!r}"
     raise AtoneError("evidence SYSTEM [list | show ID | search WORDS]")
 
 
 def cmd_controls(args) -> str:
     if args.what == "fetch":
-        fetch_sources()
-        return f"in {sources_dir()} (what was fetched, with hashes: lock.json)"
+        fetch_sources(args.from_dir)
+        return f"in {HOME / 'sources'}, used instead of the shipped copy (what each is, with hashes: lock.json)"
     if args.what == "lore":
         out = Path(args.out or HOME / "lores" / "nist-800-53r5.lore.db")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2637,6 +2868,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: everything in the system's imports/ folder")
     p.add_argument("--sample", metavar="FILE", help="a file's columns and first rows, for drafting its mapping")
+    p.add_argument("--eaveswatch", metavar="STORE", help="evidence about logging from an eaveswatch store (s3://... or a folder)")
+    p.add_argument("--ew-system", help="its system name there (default: this system's)")
+    p.add_argument("--env", help="only this eaveswatch env")
     p = sub.add_parser("check", help="every control against its mapping and the current evidence")
     p.add_argument("system")
     p.add_argument("control", nargs="?", help="one control's results, in full")
@@ -2669,10 +2903,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
     p.add_argument("words", nargs="*")
     p.add_argument("--run")
-    p = sub.add_parser("controls", help="fetch | lore | SYSTEM [list | show ID]")
+    p = sub.add_parser("controls", help="lore | fetch [--from DIR] | SYSTEM [list | show ID]")
     p.add_argument("what")
     p.add_argument("rest", nargs="*")
     p.add_argument("--out")
+    p.add_argument("--from", dest="from_dir", help="fetch: NIST's files from this folder (no internet needed)")
     return ap
 
 
@@ -2706,7 +2941,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.sample:
                 print(sample(Path(args.sample)))
             else:
-                import_results(args.system, args.files)
+                import_results(args.system, args.files, eaveswatch=args.eaveswatch, ew_system=args.ew_system,
+                               env=args.env)
         elif args.cmd == "check":
             if args.control:
                 res = read_json(system_dir(args.system) / "runs" / "checks-latest.json") or {}
@@ -2749,9 +2985,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "report":
             report(args.system, Path(args.out), args.conmon)
         elif args.cmd == "sources":
-            print("NIST's OSCAL (atone controls fetch, compiled exactly):\n" + "\n".join(f"  {k}: {u}" for k, u in SOURCES.items())
-                  + "\n\nGuidance (lorewell build, then lorewell review; help, never cited as a control):\n"
-                  + "\n".join(f"  {k}: {t}\n    {u}" for k, (t, u) in GUIDANCE.items()))
+            print(f"NIST's controls, compiled exactly (atone controls lore), from {sources_dir()}:\n" + "\n".join(
+                f"  {k}: sha256 {source_info(k).get('sha256', '?')[:16]}... ({source_info(k).get('url', '?')})"
+                for k in SOURCES) + "\n\nGuidance (lorewell build NAME FILE, then lorewell review; help, never cited "
+                  "as a control):\n" + "\n".join(f"  {k}: {t}" + (f"\n    {DATA / rel}" if rel else "")
+                                                for k, (t, rel) in GUIDANCE.items()))
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":

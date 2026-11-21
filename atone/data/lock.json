@@ -1,0 +1,56 @@
+{
+  "nist/catalog.json": {
+    "url": "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_catalog.json",
+    "fetched": "2026-11-21",
+    "bytes": 10448237,
+    "sha256": "64ca6b4161de51ab6af098a7d101d326f14c95e1abf721396cd8a049e8115eeb"
+  },
+  "nist/low.json": {
+    "url": "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_LOW-baseline_profile.json",
+    "fetched": "2026-11-21",
+    "bytes": 7234,
+    "sha256": "cfd4f5d9a192eb42dc04b745d82f95a85926a2a85a45418034a380a42bda9424"
+  },
+  "nist/moderate.json": {
+    "url": "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_MODERATE-baseline_profile.json",
+    "fetched": "2026-11-21",
+    "bytes": 10498,
+    "sha256": "e3a0f11237cfaac24dfcf1586e07683f17423757fd84208deb33196b12e8f590"
+  },
+  "nist/high.json": {
+    "url": "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_HIGH-baseline_profile.json",
+    "fetched": "2026-11-21",
+    "bytes": 12492,
+    "sha256": "d2ef340986b9f1ee820ad866a0f964d9a9d1088b24080c74b795ddb0148b9f83"
+  },
+  "nist/privacy.json": {
+    "url": "https://raw.githubusercontent.com/usnistgov/oscal-content/main/nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_PRIVACY-baseline_profile.json",
+    "fetched": "2026-11-21",
+    "bytes": 6064,
+    "sha256": "c0e3d54d9f474bc6c33338a8e524bc52ad070f94f9274db7ec48242242fecacc"
+  },
+  "guidance/sp800-37r2.txt": {
+    "url": "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-37r2.pdf",
+    "fetched": "2026-11-21",
+    "bytes": 598186,
+    "sha256": "375486ca42a89f0ed6a80ec7815f8608e21727ae80246cc9d7464cb7ff60ed95",
+    "from_pdf_sha256": "4f75e1136bb905a654f1bcd9eefefb4108f47597276ee5eec0688f6d96f6a01d",
+    "converted_with": "pdftotext (poppler), UTF-8"
+  },
+  "guidance/sp800-18r1.txt": {
+    "url": "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-18r1.pdf",
+    "fetched": "2026-11-21",
+    "bytes": 109141,
+    "sha256": "f3b315f8b674c90a4d6104fcaab3ae33e5badd20c98ba02d5532612e61b81100",
+    "from_pdf_sha256": "1635870f7cac9c0606cddbf42a7e4d0d8d01c5ab8709d3667821a4cdeaddd506",
+    "converted_with": "pdftotext (poppler), UTF-8"
+  },
+  "guidance/sp800-137.txt": {
+    "url": "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-137.pdf",
+    "fetched": "2026-11-21",
+    "bytes": 225517,
+    "sha256": "f2048a90c3559747a8282088b0627c457147cf8eca706b1a22a99637cfffa2fa",
+    "from_pdf_sha256": "2d1c0bf459f5e1bfd41ceb5eac83bf62e4c34bf08e2e7088b37cb73a11442b98",
+    "converted_with": "pdftotext (poppler), UTF-8"
+  }
+}
