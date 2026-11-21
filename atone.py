@@ -17,6 +17,10 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone workbook inspect FILE   a workbook's sheets, headers and drop-downs: for drafting its template mapping
     atone fill SYSTEM --out DIR   copies of the working documents, filled in, with what changed and why
     atone draw SYSTEM --out DIR   the architecture as it is: actual, allowed and documented paths (draw.io, SVG)
+    atone plan SYSTEM             the engagement plan: every piece of the effort, who can do it, what's done
+    atone due SYSTEM              what's due by the cadence (nothing printed when nothing is: a hobkin's watch)
+    atone report SYSTEM --out DIR [--conmon]   report.html, for people
+    atone sources                 public guidance worth a lore, and NIST's files
     atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -61,6 +65,8 @@ __version__ = "0.1.0"
 #   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
 #   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed
 #   architecture  one graph of actual, allowed and documented paths; draw.io and SVG, with what differs
+#   plan          the engagement plan (what's left, who does it), what's due, the report people read
+#   pack          atone as an expert pack for hobkin: a chore and its skills (the hobkin.packs entry point)
 #   command line  argument parsing, main
 
 
@@ -1800,6 +1806,7 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
         report = {"workbook": path.name, "output": str(dest), "mapping": m["_file"], "changes": changes,
                   "flags": flags, "skipped_formulas": skipped, "at": time.time()}
         write_json(out / (path.stem + ".changes.json"), report)
+        write_json(d / "runs" / f"fill-{path.stem}.changes.json", report)
         log(f"{path.name}: {len(changes)} changes, {len(flags)} flags" + (f", {len(skipped)} formula cells left alone"
                                                                         if skipped else "") + f" -> {dest}")
         reports.append(report)
@@ -2140,7 +2147,8 @@ def svg(graph: dict, title: str) -> str:
     nodes = {n["id"]: n for n in graph["nodes"]}
     w = max([p[0] for p in pos.values()] or [0]) + 260
     h = max([p[1] for p in pos.values()] or [0]) + 200 + 30 * len(EDGE_CLASSES) + 40
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="sans-serif" font-size="12">',
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
+           f'style="max-width:100%;height:auto" font-family="sans-serif" font-size="12">',
            '<defs>' + "".join(f'<marker id="a{i}" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">'
                               f'<path d="M0,0 L10,4 L0,8 z" fill="{EDGE_STYLE[c][0]}"/></marker>'
                               for i, c in enumerate(EDGE_CLASSES)) + '</defs>',
@@ -2212,6 +2220,349 @@ def draw_system(name: str, out: Path, log=print) -> dict:
     log(f"{len(g['nodes'])} nodes, {len(g['edges'])} paths: " + ", ".join(f"{v} {k}" for k, v in g["counts"].items() if v)
         + f" -> {out / 'network.drawio'}")
     return g
+
+
+# ---- plan: the engagement plan (what's left, who does it), what's due, the report people read
+
+GUIDANCE = {      # public guidance worth a lore (lorewell build, then lorewell review): help, never cited as a control
+    "sp800-37": ("NIST SP 800-37 Rev 2: the Risk Management Framework",
+                 "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-37r2.pdf"),
+    "sp800-53a": ("NIST SP 800-53A Rev 5: assessing the controls (its objectives are already in the exact lore)",
+                  "https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-53Ar5.pdf"),
+    "sp800-18": ("NIST SP 800-18 Rev 1: writing a system security plan",
+                 "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-18r1.pdf"),
+    "sp800-137": ("NIST SP 800-137: continuous monitoring",
+                  "https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-137.pdf"),
+    "stigs": ("DISA STIGs, for whatever the system runs (pick the ones its components need)",
+              "https://public.cyber.mil/stigs/downloads/"),
+}
+CADENCE = {"collect": "24h", "check": "7d", "conmon": "30d"}
+
+
+def duration(text: str) -> float:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*", str(text))
+    if not m:
+        raise AtoneError(f"not a duration: {text!r} (e.g. 24h, 7d)")
+    return float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def plan(name: str) -> dict:
+    """The engagement plan: every piece of the effort, each with who can do it (the hobkin, access it needs, or a
+    person), what it's waiting on and whether it's done. Worked out from the system's folder every time, so it's
+    never out of date: doing a thing (or recording a person's answer in a file) ticks it."""
+    d = system_dir(name)
+    spec = read_json(d / "system.json", {})
+    tail = read_json(d / "tailoring.json", {})
+    index = current_index(d)
+    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    items = []
+
+    def item(iid, who, what, done, unblocks="", control=None):
+        items.append({"id": iid, "who": who, "what": what, "done": bool(done), "unblocks": unblocks,
+                      "control": control})
+
+    wbs = sorted((d / "workbooks").glob("*.xlsx"))
+    item("documents", "person", "the working documents (SSP matrix, POA&M, inventories...), blank or partly done, "
+         f"in {d / 'workbooks'}", wbs, "filling them in")
+    for wb in wbs:
+        item(f"mapping:{wb.name}", "hobkin", f"a template mapping for {wb.name} (atone workbook inspect), confirmed "
+             "by the ISSE", any(fnmatch.fnmatch(wb.name, (read_json(m, {}) or {}).get("match") or "")
+                                for m in (d / "workbooks").glob("*.mapping.json")), f"filling {wb.name}")
+    item("baseline", "person", f"confirm the baseline ({tail.get('baseline', 'moderate')}) and tailoring: controls "
+         "added or removed, parameter values (tailoring.json: set \"confirmed\" to who and when)",
+         tail.get("confirmed"), "checks against the right controls")
+    item("inherited", "person", "the inherited and shared controls, from the provider's responsibility matrix "
+         "(there almost always are some)", tail.get("inherited") or tail.get("shared") or tail.get("no_inherited"),
+         "drafting inherited controls as inherited")
+    item("examples", "person", f"examples of implementation statements the ISSO accepted, and any sent back, in "
+         f"{d / 'drafts' / 'examples'}", any((d / "drafts" / "examples").glob("*")) if (d / "drafts" / "examples").is_dir()
+         else False, "narratives that sound like theirs")
+    item("spec", "hobkin", "the system spec (system.json) from `atone discover`: hosts, components, the config files "
+         "that define their connections; reviewed by the ISSE", spec.get("hosts") and spec.get("reviewed"),
+         "collecting the right evidence")
+    item("documented", "hobkin", "the documented flows (documented.json), from the SSP's boundary and data flow "
+         "sections; reviewed by the ISSE", (d / "documented.json").exists(), "the architecture's documented layer")
+    seen_hosts = {e["host"] for e in index if e["kind"] in LOCAL_KINDS}
+    for h in spec.get("hosts") or []:
+        hn = h if isinstance(h, str) else h.get("name")
+        item(f"access:{hn}", "access", f"read access to {hn}: an account that can ssh in (keys, no password) and read "
+             f"config and logs; root only for /etc/sudoers and audit config (atone collect --ssh USER@{hn})",
+             hn in seen_hosts, f"evidence from {hn}")
+    if "aws" in (spec.get("collect") or []):
+        item("access:aws", "access", "read-only AWS access where atone runs (the SecurityAudit managed policy is the "
+             "least that covers it)", any(e["kind"] == "aws" and not e["source"].startswith("aws") for e in index),
+             "the security groups, routes and instances")
+    item("scans", "person", f"the latest scan results (OpenSCAP, the vulnerability scanner, the endpoint tool) in "
+         f"{d / 'imports'}", any(e["kind"] == "scan" for e in index), "CM-6, RA-5, SI-2, SI-3 and the POA&M")
+    for cid, r in checks.items():
+        if r["status"] == "unknown" and not r.get("mapping"):
+            item(f"map:{cid}", "hobkin", f"a control mapping for {r['label']} {r['title']}", False,
+                 f"checking {r['label']}", cid)
+        elif r["status"] == "unknown":
+            item(f"evidence:{cid}", "hobkin", f"evidence for {r['label']}: its checks found none ("
+                 + "; ".join(f"{c['check']}: {c['detail']}" for c in r.get("checks") or [])[:200] + ")", False,
+                 f"checking {r['label']}", cid)
+        elif r["status"] in ("not met", "partly"):
+            failing = [c for c in r.get("checks") or [] if c["status"] == "fail"]
+            if failing:
+                item(f"fix:{cid}", "hobkin", f"{r['label']}: investigate what failed ("
+                     + "; ".join(f"{c['check']}: {c['detail']}" for c in failing)[:200] + ") and propose the fix, to "
+                     "the system or the paperwork, for a person to choose", False, f"{r['label']}", cid)
+        for need in r.get("needs_person") or []:
+            item(f"person:{cid}:{hashlib.sha1(need.encode()).hexdigest()[:6]}", "person", f"{r['label']}: {need}",
+                 False, f"{r['label']}'s narrative", cid)
+        if r["status"] != "inherited" and r["status"] != "unknown":
+            item(f"narrative:{cid}", "hobkin", f"{r['label']}: a narrative, every claim cited (atone verify)",
+                 (d / "drafts" / "verified" / f"{cid}.json").exists(), f"{r['label']} in the SSP", cid)
+    if any(r["status"] in ("not met", "partly") for r in checks.values()) or any(e["kind"] == "scan" for e in index):
+        item("schedule", "hobkin", "a POA&M schedule (drafts/poam-schedule.json): realistic dates, with margin for the "
+             "ISSE and DevOps to review and do the work; approved by a person", (d / "drafts" / "poam-schedule.json").exists(),
+             "dates on the POA&M")
+    out = {"system": name, "at": time.time(), "items": items,
+           "open": {w: sum(1 for i in items if i["who"] == w and not i["done"]) for w in ("hobkin", "access", "person")},
+           "done": sum(1 for i in items if i["done"])}
+    write_json(d / "plan.json", out)
+    md = [f"# The plan for {name}\n", f"Worked out by `atone plan {name}`: {out['done']} done, "
+          + ", ".join(f"{v} open for {k}" for k, v in out["open"].items()) + ".\n"]
+    for who, title in (("person", "Needs a person"), ("access", "Needs access"), ("hobkin", "The hobkin's")):
+        md.append(f"\n## {title}\n")
+        md += [f"- [{'x' if i['done'] else ' '}] {i['what']}" + (f" (for {i['unblocks']})" if i["unblocks"] else "")
+               for i in items if i["who"] == who]
+    (d / "PLAN.md").write_text("\n".join(md) + "\n")
+    return out
+
+
+def due(name: str) -> list[str]:
+    """What's due, by the system's cadence (atone.json "cadence": collect 24h, check 7d, conmon 30d): one line each,
+    nothing when nothing is. The chore's watch: a quiet day costs no model calls."""
+    d = system_dir(name)
+    cad = {**CADENCE, **(read_json(d / "atone.json", {}).get("cadence") or {})}
+    now = time.time()
+    newest = max([e["at"] for e in current_index(d)] or [0])
+    checks = d / "runs" / "checks-latest.json"
+    checked = checks.stat().st_mtime if checks.exists() else 0
+    conmon = d / "runs" / "conmon-latest"
+    out = []
+    if now - newest > duration(cad["collect"]):
+        out.append(f"collect: the newest evidence is {'never' if not newest else f'{(now - newest) / 3600:.0f}h old'} "
+                   f"(every {cad['collect']}): atone collect {name}, and import new scans")
+    if now - checked > duration(cad["check"]) or (checked and newest > checked):
+        out.append(f"check: {'new evidence since the last check' if checked and newest > checked else 'due'}: "
+                   f"atone check {name}, then atone plan {name}")
+    if now - (conmon.stat().st_mtime if conmon.exists() else 0) > duration(cad["conmon"]):
+        out.append(f"conmon: the monthly continuous monitoring package (every {cad['conmon']}): your atone-conmon skill")
+    return out
+
+
+def _h(s) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def report(name: str, out: Path, conmon: bool = False, log=print) -> Path:
+    """report.html: what changed and what's open, for people. Coverage first (what's verified, what's from a person's
+    word, what's unknown), then what needs a person, drift, the architecture, and every control with its checks and
+    evidence a click away. Everything in it is escaped: it shows evidence. --conmon marks the monthly package done."""
+    d = system_dir(name)
+    out.mkdir(parents=True, exist_ok=True)
+    p = plan(name)
+    checks = read_json(d / "runs" / "checks-latest.json", {}) or {}
+    ctl = checks.get("controls") or {}
+    index = current_index(d)
+    by_id = {e["id"]: e for e in index}
+    verified = {v.stem: read_json(v, {}) for v in (d / "drafts" / "verified").glob("*.json")} \
+        if (d / "drafts" / "verified").is_dir() else {}
+    graph = read_json(d / "runs" / "graph-latest.json", None)
+    fills = [read_json(f, {}) for f in sorted((d / "runs").glob("fill-*.changes.json"))]
+    cov = {k: sum(v.get("coverage", {}).get(k, 0) for v in verified.values()) for k in ("evidence", "person", "dropped")}
+    css = ("body{font:14px/1.5 system-ui,sans-serif;margin:0;color:#1d1d1f;background:#fff}main{max-width:1100px;"
+           "margin:auto;padding:24px 16px}h1{font-size:24px}h2{margin-top:32px;border-bottom:1px solid #ddd}"
+           "table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #eee;padding:6px;text-align:left;"
+           "vertical-align:top}.met{color:#1a7f37}.partly{color:#9a6700}.not.met,.not-met{color:#cf222e}.unknown{color:#6e7781}"
+           ".inherited{color:#0969da}.pill{display:inline-block;padding:0 8px;border-radius:10px;background:#f2f2f2}"
+           "pre{white-space:pre-wrap;background:#f6f8fa;padding:8px;max-height:320px;overflow:auto}"
+           ".svg{overflow-x:auto;border:1px solid #eee}@media(prefers-color-scheme:dark){body{background:#0d1117;"
+           "color:#e6edf3}pre,.pill{background:#161b22}td,th{border-color:#30363d}.svg{background:#fff}}")
+    h = [f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+         f"<title>atone: {_h(name)}</title><style>{css}</style><main>",
+         f"<h1>{_h(name)}: where the authorization stands</h1>",
+         f"<p>atone {__version__}, {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}. {len(index)} pieces of current "
+         "evidence. Drafts: nothing here declares the system compliant; people decide.</p>",
+         "<h2>Coverage</h2><p>" + " ".join(f"<span class='pill {k.replace(' ', '-')}'>{v} {k}</span>"
+                                          for k, v in (checks.get("counts") or {}).items()) + "</p>",
+         f"<p>Narratives: {cov['evidence']} claims on evidence, {cov['person']} on a person's word, {cov['dropped']} "
+         f"dropped by verify. Evidence from a person's site commands: "
+         f"{sum(1 for e in index if e.get('site'))}.</p>",
+         "<h2>Needs a person</h2><ul>" + "".join(f"<li>{_h(i['what'])}</li>" for i in p["items"]
+                                                 if i["who"] in ("person", "access") and not i["done"]) + "</ul>"]
+    flags = [f for r in fills for f in r.get("flags") or []]
+    if flags:
+        h.append("<h2>Drift: the paperwork and the evidence disagree</h2><table><tr><th>Cell</th><th>Says</th>"
+                 "<th>Evidence says</th><th>Why</th></tr>" + "".join(
+                     f"<tr><td>{_h(f['cell'])}</td><td>{_h(f['has'])}</td><td>{_h(f['atone'])}</td><td>{_h(f['why'])}</td></tr>"
+                     for f in flags) + "</table>")
+    if graph:
+        svg_file = out / "network.svg"
+        svg_file.write_text(svg(graph, f"{name}: network"))
+        h.append("<h2>Architecture</h2><p>" + ", ".join(f"{v} {k}" for k, v in graph["counts"].items() if v)
+                 + "</p><div class=svg>" + svg_file.read_text().split("?>")[-1] + "</div><ul>" + "".join(
+                     f"<li><b>{_h(e['class'])}</b>: {_h(e['from'])} &rarr; {_h(e['to'])} {_h(e['port'])}</li>"
+                     for e in graph["edges"] if e["class"] != "normal") + "</ul>")
+    h.append("<h2>Controls</h2><table><tr><th>Control</th><th>Status</th><th>Checks</th><th>Narrative</th></tr>")
+    for c in ctl.values():
+        checks_html = "".join(f"<div>{_h(x['check'])}: <b>{_h(x['status'])}</b> {_h(x['detail'])}" + "".join(
+            f"<details><summary>{_h(q['evidence'])}</summary><pre>{_h(q['quote'])}</pre>"
+            f"<small>{_h((by_id.get(q['evidence']) or {}).get('source', ''))}, sha256 "
+            f"{_h((by_id.get(q['evidence']) or {}).get('sha256', '')[:16])}</small></details>"
+            for q in x.get("quotes") or []) + "</div>" for x in c.get("checks") or []) or _h(c.get("why", ""))
+        v = verified.get(c["control"])
+        narr = (_h(v["statement"]) + (f"<br><small>{v['coverage']['dropped']} claims dropped</small>"
+                                      if v["coverage"]["dropped"] else "")) if v else ""
+        h.append(f"<tr><td><b>{_h(c['label'])}</b><br>{_h(c['title'])}</td><td class='{c['status'].replace(' ', '-')}'>"
+                 f"{_h(c['status'])}</td><td>{checks_html}</td><td>{narr}</td></tr>")
+    h.append("</table></main>")
+    dest = out / "report.html"
+    dest.write_text("\n".join(h))
+    if conmon:
+        (d / "runs" / "conmon-latest").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+    log(f"{dest}")
+    return dest
+
+
+# ---- pack: atone as an expert pack for hobkin (a chore and its skills), served through the hobkin.packs entry point
+
+CHORE_JSON = {
+    "name": "atone",
+    "description": "Keep a system's authorization (ATO) true to the system: evidence, checks, cited narratives, the "
+                   "customer's workbooks, the architecture, continuous monitoring.",
+    "settings": {
+        "system": {"about": "the system's name: atone's folder for it", "env": "ATONE_SYSTEM"},
+        "store": {"default": "", "about": "where its evidence goes: s3://bucket/prefix or a folder (empty: ~/atone/store)",
+                  "env": "ATONE_STORE"},
+        "baseline": {"default": "moderate", "about": "its 800-53 baseline: low, moderate, high or privacy",
+                     "env": "ATONE_BASELINE"}},
+    "config": {"idle_prompt": None, "wake": {"command": "atone due {{system}}", "every": "1h"}},
+    "given": ("You've been given the atone chore for the system {{system}}: keeping its authorization true to the "
+              "system. Read CHORE-atone.md, then start: atone init {{system}} (if it isn't set up), atone plan "
+              "{{system}}, and tell your people what you need from them first."),
+}
+CHORE_MD = """# Your chore: atone, for {{system}}
+
+You keep the authorization of the system **{{system}}** true to the system. Assessors mostly take what the package
+says on trust, so being right matters more than being complete: when in doubt, say less, and say why.
+
+## How it works
+
+- **atone is your toolkit; you are its apprentice.** `atone` (run it like any command; `atone --help`) collects
+  evidence, imports scans, checks controls, verifies citations, fills the workbooks and draws the architecture. It
+  never calls a model. You do the judgement work: drafting the system spec, the mappings and the narratives,
+  investigating drift, and explaining to people what you need.
+- **Evidence is never yours to write.** Only atone collects or imports evidence. You read it (`atone evidence
+  {{system}} search WORDS`, `show ID`).
+- **No citation, no claim.** Every claim in a narrative cites evidence and quotes it (your atone-narratives skill);
+  `atone verify` drops what doesn't hold. A claim from a person cites who and when.
+- **The customer's words, never yours.** Status values come from their workbook; what's filled in is kept, and where
+  the evidence disagrees, atone flags it for a person.
+- **People decide.** The ISSE owns the system spec and the mappings; the ISSO owns the package. You draft, prove,
+  and propose.
+
+## The plan comes first
+
+`atone plan {{system}}` works out every piece of the effort, and who can do it: you, access you need, or a person.
+Make it your checklist (copy PLAN.md into your goal's CHECKLIST.md, and re-run it as things change). Start on yours,
+in the order that unblocks the most. For the rest, tell the people exactly what you need and why: the account or
+permission (the least that works), the file, the decision. The first things to ask for are always the working
+documents, the inherited-controls matrix, example narratives, and access.
+
+## The cadence
+
+Your watch runs `atone due {{system}}` every hour and wakes you only when something's due: collecting (daily),
+checking (weekly, and after new evidence), and the monthly continuous monitoring package (your atone-conmon skill).
+After each: `atone plan {{system}}`, and tell your people what changed and what you need.
+
+## Your skills
+
+atone-become-expert (the lores), atone-system-spec, atone-mappings, atone-narratives, atone-drift, atone-conmon.
+Open the one for the step you're on, and follow it.
+"""
+SKILLS = {
+    "atone-become-expert": ("Build the lores you need to be the expert for a system: NIST's controls exactly, public "
+                            "guidance, and the customer's own documents.", """
+1. The controls, word for word: `atone controls fetch`, then `atone controls lore`, then `lorewell install` the lore it
+   writes. This is what you cite and quote for a control's text: never a model's paraphrase.
+2. Public guidance (help for you, never cited as a control): `atone sources` lists it. Build only what this system
+   needs: the STIGs for its components (from the system spec), not every one. `lorewell build NAME DOCS...`, then
+   have the ISSE look it over with `lorewell review`. (PDFs: convert to text first, e.g. with pdftotext.)
+3. The customer's own documents (policies, procedures, past packages, interconnection agreements), as they come up:
+   ask which to use, `lorewell build` them into a private lore here, and never send them anywhere else.
+4. What you learn about the system and its people (voice, quirks, owners) goes in your field lore; the mappings
+   don't: they're files the ISSE reviews."""),
+    "atone-system-spec": ("Draft the system spec (system.json) and the documented flows (documented.json) for the "
+                          "ISSE to review.", """
+1. `atone discover {{system}}` (with `--ssh USER@HOST` for each host you have access to). Read discovery.json.
+2. In system.json: the hosts (name, addresses), the components (which hosts run them; the config files that define
+   their connections and audit settings, from discovery's config list: `{"path": ...}`; never credential files),
+   what to collect (`collect`: kinds from atone's menu), and `aws.region` if it runs in AWS. Keep the generic linux
+   component's files.
+3. In documented.json: the flows the SSP describes: `{"from", "to", "port": "tcp/443", "data", "about"}`, by
+   component name (or "internet"). Quote the SSP's section for each in "about".
+4. Ask the ISSE to review both; when they have, set `"reviewed": "who, when"` in system.json."""),
+    "atone-mappings": ("Draft control mappings, scanner mappings and workbook template mappings: data the ISSE "
+                       "owns, run by atone's code.", """
+- **Control mappings** (mappings/*.json): for each control, the evidence that bears on it (`kind` from atone's menu,
+  `source` as a glob, `component`), checks (`present`, `absent`, `value` with `op` against a value or `{param:ID}`,
+  `count` with `field_patterns`, `scan`, `findings`, `exists`), and `needs_person` (what only a person can supply).
+  Start from mappings/starter.json; look the control up in the controls lore (its objective says what to check).
+  `atone mappings {{system}}` shows what's wrong with any.
+- **Scanner mappings** (imports/TOOL.mapping.json): `atone import {{system}} --sample FILE` shows the columns; map
+  host, finding, id, severity (in the customer's words), cve, first_seen, solution.
+- **Template mappings** (workbooks/NAME.mapping.json): `atone workbook inspect FILE`; map the sheet, the header row,
+  the columns, and `status_values` (atone's met, partly, not met, inherited, open, closed) to the workbook's own
+  drop-down values, exactly as written there.
+- Ask the ISSE to confirm each; mappings are drafts until they do."""),
+    "atone-narratives": ("Write implementation statements as cited claims, and verify them.", """
+1. `atone check {{system}} CONTROL` for its results and the quotes its checks found; `atone evidence {{system}}
+   search ...` for more. The controls lore for what the control asks; the customer's examples for their voice.
+2. Write drafts/CONTROL.json: `{"control": "au-11", "claims": [{"text": "...", "cites": [{"evidence": ID, "quote":
+   "the exact words"}]}]}`. One fact per claim; quote words that are really in the evidence. A fact from a person:
+   `{"text": "...", "person": "who, when"}`.
+3. `atone verify {{system}} drafts/CONTROL.json`. Dropped claims say why: fix the claim or drop it; never re-word a
+   claim so it says more than its evidence.
+4. For many controls, hand families to brownies (each: these controls, these steps), then read what they wrote.
+5. Never write that a control is met, implemented or compliant: say what the system does, and let the status come
+   from the checks."""),
+    "atone-drift": ("Investigate where the paperwork and the system disagree, and propose the fix.", """
+- Sources: flags in the fill's NAME.changes.json, failing checks (`atone plan` lists them), and the architecture
+  (`atone draw`): unused paths (a rule to tighten), undocumented ones (the SSP or the system is wrong), not allowed
+  ones, documented-only ones.
+- For each: what the paperwork says, what the evidence shows (cite it), the likely cause, and two fixes: to the
+  system (the exact change) and to the paperwork (the exact words). People choose.
+- Never change the system or the workbooks yourself to make them agree."""),
+    "atone-conmon": ("The monthly continuous monitoring package.", """
+1. Ask for this month's scan exports if they aren't in imports/; `atone import {{system}}`; `atone collect
+   {{system}}`; `atone check {{system}}`.
+2. The POA&M: propose a schedule in drafts/poam-schedule.json (`{item key: "YYYY-MM-DD"}`; keys from the fill's
+   changes): realistic dates with margin for the ISSE and DevOps to review and do the work, by severity; ask a person
+   to approve it. Where there's a hard deadline, say plainly what can't fit.
+3. `atone fill {{system}} --out PACKAGE`, `atone draw {{system}} --out PACKAGE`, `atone report {{system}} --out
+   PACKAGE --conmon`.
+4. Tell your people what changed this month, what's open, and what you need, with the report's path."""),
+}
+
+
+def hobkin_pack() -> str:
+    """The hobkin.packs entry point: atone's chore and skills as a folder (written once per version), for hobkin to
+    find with --chore atone."""
+    root = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "atone" / f"pack-{__version__}"
+    chore = root / "chores" / "atone"
+    if not (chore / "chore.json").exists():
+        (chore / "skills").mkdir(parents=True, exist_ok=True)
+        (chore / "CHORE.md").write_text(CHORE_MD)
+        for name, (desc, body) in SKILLS.items():
+            (chore / "skills" / name).mkdir(parents=True, exist_ok=True)
+            (chore / "skills" / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: \"{desc}\"\n---\n\n# {name}\n{body.strip()}\n")
+        write_json(chore / "chore.json", CHORE_JSON)
+    return str(root)
 
 
 # ---- command line: argument parsing, main
@@ -2304,6 +2655,15 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("draw", help="the architecture: actual, allowed and documented paths, as draw.io and SVG")
     p.add_argument("system")
     p.add_argument("--out", required=True)
+    p = sub.add_parser("plan", help="the engagement plan: every piece of the effort, and who can do it")
+    p.add_argument("system")
+    p = sub.add_parser("due", help="what's due by the cadence (prints nothing when nothing is)")
+    p.add_argument("system")
+    p = sub.add_parser("report", help="report.html: coverage, what needs a person, drift, the architecture, controls")
+    p.add_argument("system")
+    p.add_argument("--out", required=True)
+    p.add_argument("--conmon", action="store_true", help="this is the monthly package: mark it done")
+    sub.add_parser("sources", help="public guidance worth a lore (lorewell build), and NIST's OSCAL files")
     p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
@@ -2379,6 +2739,19 @@ def main(argv: list[str] | None = None) -> int:
             fill_workbooks(args.system, Path(args.out), args.files)
         elif args.cmd == "draw":
             draw_system(args.system, Path(args.out))
+        elif args.cmd == "plan":
+            p = plan(args.system)
+            print(f"{p['done']} done; open: " + ", ".join(f"{v} for {k}" for k, v in p["open"].items())
+                  + f"\n  {system_dir(args.system) / 'PLAN.md'}")
+        elif args.cmd == "due":
+            for line in due(args.system):
+                print(line)
+        elif args.cmd == "report":
+            report(args.system, Path(args.out), args.conmon)
+        elif args.cmd == "sources":
+            print("NIST's OSCAL (atone controls fetch, compiled exactly):\n" + "\n".join(f"  {k}: {u}" for k, u in SOURCES.items())
+                  + "\n\nGuidance (lorewell build, then lorewell review; help, never cited as a control):\n"
+                  + "\n".join(f"  {k}: {t}\n    {u}" for k, (t, u) in GUIDANCE.items()))
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":

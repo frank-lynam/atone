@@ -415,6 +415,61 @@ class Architecture(unittest.TestCase):
         self.assertIn("app01 -> db01 tcp/1521: undocumented -> normal", ch["changed"])
 
 
+class PlanAndReport(unittest.TestCase):
+    def test_the_plan_says_who_does_what_and_ticks_what_is_done(self):
+        d = evidence_system("plan", [("file", "app01", "/etc/audit/auditd.conf", AUDITD)])
+        spec = atone.read_json(d / "system.json")
+        spec["hosts"] = [{"name": "app01"}, {"name": "db01"}]
+        atone.write_json(d / "system.json", spec)
+        atone.check_system("plan", log=lambda *a: None)
+        p = {i["id"]: i for i in atone.plan("plan")["items"]}
+        self.assertEqual((p["documents"]["who"], p["documents"]["done"]), ("person", False))
+        self.assertEqual((p["inherited"]["who"], p["inherited"]["done"]), ("person", False))     # always asked
+        self.assertEqual((p["access:db01"]["who"], p["access:db01"]["done"]), ("access", False))
+        self.assertIn("map:ac-11", p)                                                             # no mapping yet
+        self.assertTrue(any(i.startswith("person:au-11") for i in p))                             # needs_person
+        t = atone.read_json(d / "tailoring.json")
+        t["inherited"] = {"pe-3": {"from": "AWS GovCloud"}}
+        atone.write_json(d / "tailoring.json", t)
+        self.assertTrue({i["id"]: i for i in atone.plan("plan")["items"]}["inherited"]["done"])
+        self.assertIn("## Needs a person", (d / "PLAN.md").read_text())
+
+    def test_due_is_quiet_until_something_is(self):
+        d = evidence_system("due", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        lines = atone.due("due")
+        self.assertTrue(any(l.startswith("check:") for l in lines))
+        atone.check_system("due", log=lambda *a: None)
+        atone.report("due", Path(tempfile.mkdtemp()), conmon=True, log=lambda *a: None)
+        self.assertEqual(atone.due("due"), [])                    # collected, checked, the month's package done
+
+    def test_the_report_escapes_what_it_shows(self):
+        d = evidence_system("rep", [("file", "h1", "/etc/audit/auditd.conf", AUDITD + "<script>alert(1)</script>\n")])
+        m = atone.read_json(d / "mappings" / "starter.json")
+        m.append({"control": "ac-11", "evidence": [{"name": "f", "kind": "file"}],
+                  "checks": [{"id": "x", "type": "present", "evidence": "f", "pattern": "script"}]})
+        atone.write_json(d / "mappings" / "starter.json", m)
+        atone.check_system("rep", log=lambda *a: None)
+        html = atone.report("rep", Path(tempfile.mkdtemp()), log=lambda *a: None).read_text()
+        self.assertNotIn("<script>alert", html)
+        self.assertIn("&lt;script&gt;alert", html)
+
+
+class Pack(unittest.TestCase):
+    def test_the_hobkin_pack_is_a_chore_with_its_skills(self):
+        os.environ["XDG_CACHE_HOME"] = tempfile.mkdtemp()
+        root = Path(atone.hobkin_pack())
+        chore = root / "chores" / "atone"
+        spec = json.loads((chore / "chore.json").read_text())
+        self.assertEqual(spec["name"], "atone")
+        self.assertEqual(spec["config"]["wake"]["command"], "atone due {{system}}")
+        self.assertIn("No citation, no claim", (chore / "CHORE.md").read_text())
+        skills = sorted(p.name for p in (chore / "skills").iterdir())
+        self.assertEqual(skills, sorted(atone.SKILLS))
+        head = (chore / "skills" / "atone-narratives" / "SKILL.md").read_text().split("---")[1]
+        self.assertIn("name: atone-narratives", head)
+        self.assertRegex(head, r'description: ".+"')               # quoted: descriptions have colons
+
+
 class CommandLine(unittest.TestCase):
     def test_init_collect_and_look_at_the_evidence(self):
         code, out = run("init", "cli")

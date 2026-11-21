@@ -37,6 +37,9 @@ Issues = "https://github.com/frank-lynam/atone/issues"
 [project.scripts]
 atone = "atone:cli"
 
+[project.entry-points."hobkin.packs"]
+atone = "atone:hobkin_pack"   # hobkin --chore atone: the chore and its skills
+
 [tool.flit.module]
 name = "atone"
 
