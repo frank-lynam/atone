@@ -11,6 +11,9 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone collect SYSTEM [--kind K]... [--ssh user@host]...   evidence, from the built-in collectors
     atone import SYSTEM [FILE]... [--sample FILE]   scanner results (OpenSCAP natively; others through a mapping)
     atone evidence SYSTEM [list | show ID | search WORDS]   the current evidence
+    atone mappings SYSTEM         the control mappings (the ISSE's), and anything wrong with them
+    atone check SYSTEM [CONTROL]  every control against its mapping and the evidence: met, partly, not met, unknown
+    atone verify SYSTEM [DRAFT]...   a drafted narrative's citations, each checked against the evidence it quotes
     atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -51,7 +54,8 @@ __version__ = "0.1.0"
 #   collectors    the built-in, read-only menu (COLLECTORS), run here or over ssh; discovery
 #   imports       scanner results: OpenSCAP natively, anything else through a mapping file
 #   controls      NIST's OSCAL catalog and baselines, the system's tailoring, the exact lore
-#   system        a system's folder: spec, tailoring, site file
+#   system        a system's folder: spec, tailoring, site file; collecting and importing into it
+#   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
 #   command line  argument parsing, main
 
 
@@ -839,8 +843,93 @@ TAILORING_STARTER = {
 SPEC_STARTER = {
     "_about": "What the system is: its hosts, its components (which hosts run them, the config files that define "
               "their connections), and the evidence to collect. Drafted from `atone discover`; reviewed by a person.",
-    "hosts": [], "components": [], "collect": LOCAL_KINDS + ["aws"], "aws": {},
+    "hosts": [],
+    "components": [
+        {"name": "linux", "about": "the operating system on every host (generic: edit to fit)", "hosts": [],
+         "files": [{"path": "/etc/audit/auditd.conf"}, {"path": "/etc/audit/rules.d/*.rules"},
+                   {"path": "/etc/chrony.conf"}, {"path": "/etc/chrony/chrony.conf"}, {"path": "/etc/ssh/sshd_config"},
+                   {"path": "/etc/login.defs"}, {"path": "/etc/security/pwquality.conf"}]},
+    ],
+    "collect": LOCAL_KINDS + ["aws"], "aws": {},
 }
+
+# The starter library: generic Linux and AWS control mappings for a first slice (AU, CM, and the access controls
+# OpenSCAP covers). Copied into each new system's mappings/starter/, where they're the ISSE's to edit: drafts, not
+# rulings. Each says which evidence bears on the control, the checks (data: see CHECK_TYPES), and what a person
+# must supply.
+F = lambda path: {"kind": "file", "source": path}
+STARTER_MAPPINGS = [
+    {"control": "au-2", "about": "Event logging: the audit daemon runs and has rules",
+     "evidence": [{"name": "services", "kind": "services"}, {"name": "rules", **F("/etc/audit/rules.d/*.rules")}],
+     "checks": [{"id": "auditd-running", "what": "auditd is running", "type": "present", "evidence": "services",
+                 "pattern": r"^auditd\.service\s+loaded\s+active\s+running"},
+                {"id": "audit-rules", "what": "audit rules are defined", "type": "present", "evidence": "rules",
+                 "pattern": r"^-[aw]\s"},
+                {"id": "oscap", "type": "scan"}],
+     "needs_person": ["the event types the organization decided to log, and who agreed them (AU-2a, AU-2c)"]},
+    {"control": "au-3", "about": "Content of audit records", "evidence": [], "checks": [{"id": "oscap", "type": "scan"}]},
+    {"control": "au-4", "about": "Audit log storage capacity",
+     "evidence": [{"name": "auditd", **F("/etc/audit/auditd.conf")}],
+     "checks": [{"id": "space-left", "what": "auditd acts before the disk fills", "type": "present",
+                 "evidence": "auditd", "pattern": r"^\s*space_left\s*=\s*\S+"}, {"id": "oscap", "type": "scan"}]},
+    {"control": "au-5", "about": "Response to audit logging process failures",
+     "evidence": [{"name": "auditd", **F("/etc/audit/auditd.conf")}],
+     "checks": [{"id": "disk-full", "what": "auditd has an action when its disk is full", "type": "present",
+                 "evidence": "auditd", "pattern": r"^\s*disk_full_action\s*=\s*(halt|single|suspend|syslog|email)"},
+                {"id": "oscap", "type": "scan"}],
+     "needs_person": ["who is alerted on an audit failure, and how fast (AU-5a)"]},
+    {"control": "au-8", "about": "Time stamps: clocks synchronized",
+     "evidence": [{"name": "services", "kind": "services"}, {"name": "chrony", "kind": "file", "source": "*chrony.conf"}],
+     "checks": [{"id": "chronyd", "what": "a time service runs", "type": "present", "evidence": "services",
+                 "pattern": r"^(chronyd|systemd-timesyncd|ntpd)\.service\s+loaded\s+active\s+running"},
+                {"id": "time-source", "what": "it has a time source", "type": "present", "evidence": "chrony",
+                 "pattern": r"^\s*(server|pool)\s+\S+"}]},
+    {"control": "au-9", "about": "Protection of audit information", "evidence": [], "checks": [{"id": "oscap", "type": "scan"}]},
+    {"control": "au-11", "about": "Audit record retention",
+     "evidence": [{"name": "auditd", **F("/etc/audit/auditd.conf")}],
+     "checks": [{"id": "keep-logs", "what": "auditd keeps rotated logs", "type": "present", "evidence": "auditd",
+                 "pattern": r"^\s*max_log_file_action\s*=\s*(keep_logs|rotate)"}, {"id": "oscap", "type": "scan"}],
+     "needs_person": ["the records retention policy that sets the period (AU-11), and where logs are kept for it "
+                      "(eaveswatch's store, if it runs)"]},
+    {"control": "au-12", "about": "Audit record generation",
+     "evidence": [{"name": "unit-files", "kind": "services", "source": "systemctl list-unit-files*"}],
+     "checks": [{"id": "auditd-at-boot", "what": "auditd starts at boot", "type": "present", "evidence": "unit-files",
+                 "pattern": r"^auditd\.service\s+enabled"}, {"id": "oscap", "type": "scan"}]},
+    {"control": "cm-2", "about": "Baseline configuration: the installed software is known",
+     "evidence": [{"name": "packages", "kind": "packages"}],
+     "checks": [{"id": "inventory", "what": "the installed packages were collected", "type": "exists",
+                 "evidence": "packages"}],
+     "needs_person": ["the documented baseline configuration, and when it was last reviewed (CM-2a, CM-2b)"]},
+    {"control": "cm-6", "about": "Configuration settings: the hardening profile",
+     "evidence": [], "checks": [{"id": "oscap", "type": "scan"}],
+     "needs_person": ["which configuration standard (STIG, CIS) and profile is the system's, and its deviations"]},
+    {"control": "cm-7", "about": "Least functionality: no needless services",
+     "evidence": [{"name": "packages", "kind": "packages"}],
+     "checks": [{"id": "no-cleartext", "what": "no telnet, rsh, tftp or ftp servers installed", "type": "absent",
+                 "evidence": "packages", "pattern": r"^(telnet-server|rsh-server|tftp-server|vsftpd|xinetd)\s"},
+                {"id": "oscap", "type": "scan"}],
+     "needs_person": ["the ports, protocols and services the system needs (CM-7b): the listeners are compared with "
+                      "them in the architecture"]},
+    {"control": "cm-8", "about": "System component inventory",
+     "evidence": [{"name": "packages", "kind": "packages"}, {"name": "aws", "kind": "aws", "source": "ec2 describe-instances"}],
+     "checks": [{"id": "hosts", "what": "each host's software was collected", "type": "exists", "evidence": "packages"},
+                {"id": "instances", "what": "the AWS instances were listed", "type": "exists", "evidence": "aws"}]},
+    {"control": "ac-2", "about": "Account management", "evidence": [{"name": "passwd", "kind": "accounts",
+                                                                     "source": "passwd entries"}],
+     "checks": [{"id": "one-root", "what": "only root has uid 0", "type": "count", "evidence": "passwd",
+                 "field_patterns": {"uid": "^0$"}, "op": "==", "value": 1}, {"id": "oscap", "type": "scan"}],
+     "needs_person": ["the account types allowed, account managers, and the approval process (AC-2a-c)"]},
+    {"control": "ac-6", "about": "Least privilege", "evidence": [{"name": "sudo", "kind": "accounts", "source": "/etc/sudoers*"}],
+     "checks": [{"id": "no-nopasswd", "what": "no sudo rule skips the password", "type": "absent", "evidence": "sudo",
+                 "pattern": r"^[^#\n]*NOPASSWD"}, {"id": "oscap", "type": "scan"}]},
+    {"control": "ac-12", "about": "Session termination", "evidence": [], "checks": [{"id": "oscap", "type": "scan"}]},
+    {"control": "sc-7", "about": "Boundary protection: nothing open to the whole internet but what's meant to be",
+     "evidence": [{"name": "groups", "kind": "aws", "source": "ec2 describe-security-groups"}],
+     "checks": [{"id": "no-world-ssh", "what": "no security group opens SSH (22) to 0.0.0.0/0", "type": "absent",
+                 "evidence": "groups",
+                 "pattern": r'"FromPort": 22,\s*"IpProtocol": "tcp",\s*"IpRanges": \[\s*\{[^]]*"CidrIp": "0\.0\.0\.0/0"'}],
+     "needs_person": ["the boundary's managed interfaces, and what's meant to be reachable from outside (SC-7a, b)"]},
+]
 SITE_STARTER = {
     "_about": "Written by a person, never by an agent: commands atone doesn't have, and patterns to redact on top "
               "of the built-in floor. Evidence from a site command is marked as such in every report.",
@@ -850,8 +939,11 @@ SITE_STARTER = {
 
 def init_system(name: str, store: str | None) -> Path:
     d = system_dir(name, must_exist=False)
-    for sub in ("mappings", "imports", "runs", "workbooks"):
+    for sub in ("mappings", "imports", "runs", "workbooks", "drafts"):
         (d / sub).mkdir(parents=True, exist_ok=True)
+    starter = d / "mappings" / "starter.json"
+    if not starter.exists():
+        write_json(starter, STARTER_MAPPINGS)
     for fname, starter in (("tailoring.json", TAILORING_STARTER), ("system.json", SPEC_STARTER),
                            ("site.json", SITE_STARTER)):
         if not (d / fname).exists():
@@ -971,6 +1063,293 @@ def import_results(name: str, files: list[str] | None = None, log=print) -> str:
     return run
 
 
+# ---- checks: control mappings (data the ISSE owns), the check engine, verifying a narrative's citations
+
+# What a mapping's check can be: each is run by plain code, never by evaluating anything from the file
+CHECK_TYPES = {
+    "present": "a pattern is found in the evidence",
+    "absent": "a pattern is NOT found in the evidence (e.g. NOPASSWD in sudo rules)",
+    "value": "a value a pattern captures, compared (op: == != >= <= > < in) with a value or a tailored {param:ID}",
+    "count": "how many items of a JSON list (filtered by field patterns) there are, compared with a value",
+    "scan": "the OpenSCAP rules that reference this control: all must pass",
+    "findings": "imported findings at the given severities: their count compared with a value",
+    "exists": "the evidence was collected at all (and readable)",
+}
+STATUSES = ("met", "partly", "not met", "unknown", "inherited")
+NOT_READ = re.compile(r"^(not collected|not readable here|.*: not installed here|.*collector failed)", re.I)
+
+
+def load_mappings(d: Path) -> dict[str, dict]:
+    """{control id: mapping} from the system's mappings/ folder (a file may hold one mapping or a list)."""
+    out = {}
+    for p in sorted((d / "mappings").rglob("*.json")):
+        data = read_json(p, [])
+        for m in data if isinstance(data, list) else [data]:
+            if isinstance(m, dict) and m.get("control"):
+                out[m["control"]] = {**m, "_file": str(p.relative_to(d))}
+    return out
+
+
+def mapping_problems(m: dict) -> list[str]:
+    """What's wrong with a mapping (an empty list: nothing)."""
+    out, names = [], {e.get("name") for e in m.get("evidence") or []}
+    for e in m.get("evidence") or []:
+        if e.get("kind") not in set(COLLECTORS) | {"scan", "site"}:
+            out.append(f"evidence {e.get('name')!r}: kind {e.get('kind')!r} isn't a collector, scan or site")
+    for c in m.get("checks") or []:
+        if c.get("type") not in CHECK_TYPES:
+            out.append(f"check {c.get('id')!r}: type {c.get('type')!r} isn't one of {', '.join(CHECK_TYPES)}")
+        if c.get("type") != "scan" and c.get("evidence") not in names:
+            out.append(f"check {c.get('id')!r}: no evidence named {c.get('evidence')!r}")
+        for key in ("pattern", "field_patterns"):
+            pats = [c.get(key)] if key == "pattern" else list((c.get(key) or {}).values())
+            for pat in pats:
+                if pat:
+                    try:
+                        re.compile(pat)
+                    except re.error as e:
+                        out.append(f"check {c.get('id')!r}: pattern {pat!r} doesn't compile ({e})")
+    return out
+
+
+def select(index: list[dict], sel: dict, spec: dict) -> list[dict]:
+    """The current evidence an evidence selector picks: kind, source (a glob), host (a glob) or component (the hosts
+    the system spec says run it), tool (for scans)."""
+    hosts = None
+    if sel.get("component"):
+        comp = next((c for c in spec.get("components") or [] if c.get("name") == sel["component"]), None)
+        hosts = set((comp or {}).get("hosts") or [])
+    out = []
+    for e in index:
+        if e["kind"] != sel.get("kind"):
+            continue
+        if sel.get("source") and not fnmatch.fnmatch(e["source"], sel["source"]):
+            continue
+        if sel.get("tool") and not e["source"].startswith(sel["tool"]):
+            continue
+        if sel.get("host") and not fnmatch.fnmatch(e["host"], sel["host"]):
+            continue
+        if hosts is not None and e["host"] not in hosts:
+            continue
+        out.append(e)
+    return out
+
+
+def _compare(got, op: str, want) -> bool:
+    try:
+        g, w = float(got), float(want)
+    except (TypeError, ValueError):
+        g, w = str(got).strip().lower(), str(want).strip().lower()
+    if op == "in":
+        return str(got).strip().lower() in [str(x).strip().lower() for x in (want if isinstance(want, list) else [want])]
+    return {"==": g == w, "!=": g != w, ">=": g >= w, "<=": g <= w, ">": g > w, "<": g < w}.get(op, False)
+
+
+def _want(value, values: dict):
+    """A check's value, or a tailored parameter's ({param:ID}); None if that parameter isn't set."""
+    if isinstance(value, str):
+        m = re.fullmatch(r"\{param:([\w.-]+)\}", value.strip())
+        if m:
+            v = values.get(m.group(1))
+            if v is None:
+                return None
+            num = re.match(r"\s*(\d+(?:\.\d+)?)", str(v))
+            return num.group(1) if num else v
+    return value
+
+
+def _quote(content: str, start: int, end: int) -> str:
+    """The line (or lines) around a match: what a narrative can cite word for word."""
+    a = content.rfind("\n", 0, start) + 1
+    b = content.find("\n", end)
+    return content[a:b if b != -1 else len(content)].strip()[:300]
+
+
+def run_check(c: dict, recs: list[dict], ctl_id: str, values: dict) -> dict:
+    """One check over the evidence it names: {status: pass|fail|unknown, evidence: [ids], quotes: [...], detail}."""
+    t = c.get("type")
+    out = {"check": c.get("id") or t, "what": c.get("what", ""), "type": t, "evidence": [r["id"] for r in recs],
+           "quotes": [], "detail": ""}
+    usable = [r for r in recs if not NOT_READ.match(r["content"].strip())]
+    if not recs or (t != "exists" and not usable):
+        out.update(status="unknown", detail="no evidence" if not recs else
+                   "the evidence couldn't be read here: " + "; ".join(r["content"].strip()[:120] for r in recs[:3]))
+        return out
+    flags = re.I | re.M
+    if t == "exists":
+        out.update(status="pass" if usable else "fail", detail=f"{len(usable)} of {len(recs)} readable")
+    elif t in ("present", "absent"):
+        hits = [(r, m) for r in usable for m in [re.search(c["pattern"], r["content"], flags)] if m]
+        out["quotes"] = [{"evidence": r["id"], "quote": _quote(r["content"], m.start(), m.end())} for r, m in hits]
+        ok = bool(hits) if t == "present" else not hits
+        out.update(status="pass" if ok else "fail",
+                   detail=(f"found in {len(hits)} of {len(usable)}" if hits else f"not found in {len(usable)}"))
+    elif t == "value":
+        want = _want(c.get("value"), values)
+        if want is None:
+            out.update(status="unknown", detail=f"{c.get('value')} isn't set in the tailoring")
+            return out
+        results = []
+        for r in usable:
+            m = re.search(c["pattern"], r["content"], flags)
+            if not m:
+                results.append((r, None, False))
+                continue
+            got = m.group(1) if m.groups() else m.group(0)
+            results.append((r, got, _compare(got, c.get("op", "=="), want)))
+            out["quotes"].append({"evidence": r["id"], "quote": _quote(r["content"], m.start(), m.end())})
+        bad = [r["host"] for r, got, ok in results if not ok]
+        out.update(status="fail" if bad else "pass",
+                   detail=f"{c.get('op', '==')} {want}: " + ", ".join(f"{r['host']}={got}" for r, got, _ in results))
+    elif t == "count":
+        n, items = 0, []
+        for r in usable:
+            try:
+                data = json.loads(r["content"])
+            except json.JSONDecodeError:
+                continue
+            for it in data if isinstance(data, list) else []:
+                if all(re.search(p, str(it.get(f, "")), re.I) for f, p in (c.get("field_patterns") or {}).items()):
+                    n += 1
+                    items.append(it)
+        ok = _compare(n, c.get("op", "=="), _want(c.get("value", 0), values))
+        out["quotes"] = [{"evidence": usable[0]["id"], "quote": json.dumps(it, sort_keys=True)[:300]} for it in items[:5]]
+        out.update(status="pass" if ok else "fail", detail=f"{n} {c.get('op', '==')} {c.get('value', 0)}")
+    elif t == "scan":
+        rules = []
+        for r in usable:
+            try:
+                data = json.loads(r["content"])
+            except json.JSONDecodeError:
+                continue
+            for res in data.get("results") or []:
+                ctls = res.get("controls") or []
+                if ctl_id in ctls or any(x in ctls for x in c.get("controls") or []):
+                    rules.append((r, res))
+        failed = [(r, res) for r, res in rules if res["result"] not in ("pass", "fixed")]
+        out["quotes"] = [{"evidence": r["id"], "quote": f"{res['title']}: {res['result']}"} for r, res in (failed or rules)[:8]]
+        out["evidence"] = sorted({r["id"] for r, _ in rules}) or out["evidence"]
+        if not rules:
+            out.update(status="unknown", detail="no OpenSCAP rule in the evidence references this control")
+        else:
+            out.update(status="fail" if failed else "pass",
+                       detail=f"{len(rules) - len(failed)} of {len(rules)} rules pass" + (
+                           ": failing " + "; ".join(f"{res['title']} ({r['host']})" for r, res in failed[:5]) if failed else ""))
+    elif t == "findings":
+        sev = [s.lower() for s in c.get("severity") or []]
+        found = []
+        for r in usable:
+            try:
+                data = json.loads(r["content"])
+            except json.JSONDecodeError:
+                continue
+            found += [(r, f) for f in data.get("findings") or [] if not sev or str(f.get("severity", "")).lower() in sev]
+        ok = _compare(len(found), c.get("op", "=="), c.get("value", 0))
+        out["quotes"] = [{"evidence": r["id"], "quote": f"{f.get('host')}: {f.get('finding')} ({f.get('severity')})"}
+                         for r, f in found[:8]]
+        out.update(status="pass" if ok else "fail", detail=f"{len(found)} findings ({', '.join(sev) or 'any severity'})")
+    return out
+
+
+def check_system(name: str, log=print) -> dict:
+    """Every control in the system's baseline, against its mapping and the current evidence: per control, its checks'
+    results, a status (met, partly, not met, unknown, inherited), and what a person must supply. Written to
+    runs/checks-STAMP.json (and runs/checks-latest.json)."""
+    d = system_dir(name)
+    spec = read_json(d / "system.json", {})
+    ctls = system_controls(d)
+    maps = load_mappings(d)
+    index = current_index(d)
+    cache: dict[str, dict] = {}
+
+    def recs_for(sel):
+        out = []
+        for e in select(index, sel, spec):
+            if e["id"] not in cache:
+                cache[e["id"]] = load_record(d, e) or {}
+            if cache[e["id"]]:
+                out.append(cache[e["id"]])
+        return out
+
+    results = {}
+    for c in ctls:
+        m = maps.get(c["id"])
+        entry = {"control": c["id"], "label": c["label"], "title": c["title"], "responsibility": c["responsibility"],
+                 "mapping": (m or {}).get("_file"), "checks": [], "needs_person": list((m or {}).get("needs_person") or [])}
+        if c["responsibility"] == "inherited":
+            entry.update(status="inherited", provider=c["provider"])
+        elif not m:
+            entry.update(status="unknown", why="no mapping for this control yet")
+        elif mapping_problems(m):
+            entry.update(status="unknown", why="its mapping has problems: " + "; ".join(mapping_problems(m)))
+        else:
+            sels = {e["name"]: e for e in m.get("evidence") or []}
+            for chk in m.get("checks") or []:
+                sel = sels.get(chk.get("evidence")) or {"kind": "scan", "tool": "openscap"}
+                entry["checks"].append(run_check(chk, recs_for(sel), c["id"], c["values"]))
+            states = [r["status"] for r in entry["checks"]]
+            entry["status"] = ("unknown" if not states or all(s == "unknown" for s in states) else
+                               "not met" if all(s == "fail" for s in states if s != "unknown") else
+                               "met" if all(s == "pass" for s in states) and not entry["needs_person"] else "partly")
+        results[c["id"]] = entry
+    counts = {s: sum(1 for r in results.values() if r["status"] == s) for s in STATUSES}
+    out = {"system": name, "at": time.time(), "controls": results, "counts": counts,
+           "evidence": len(index), "atone": __version__}
+    write_json(d / "runs" / f"checks-{stamp()}.json", out)
+    write_json(d / "runs" / "checks-latest.json", out)
+    log(", ".join(f"{v} {k}" for k, v in counts.items()) + f" ({len(results)} controls, {len(index)} pieces of evidence)")
+    return out
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def verify_narrative(d: Path, draft: dict) -> dict:
+    """Check every citation in a drafted narrative: each claim must cite current evidence whose (hash-checked)
+    content contains the words it quotes. A claim from a person cites who and when instead ({"person": ...}). Claims
+    that don't hold are dropped, with why; the statement is rebuilt from what's left."""
+    index = {e["id"]: e for e in current_index(d)}
+    superseded = {}
+    for run in sorted(p.name for p in (d / "runs").iterdir() if p.is_dir()) if (d / "runs").is_dir() else []:
+        for e in run_index(d, run):
+            if e["id"] not in index:
+                superseded[e["id"]] = e
+    kept, dropped = [], []
+    for claim in draft.get("claims") or []:
+        text, cites = (claim.get("text") or "").strip(), claim.get("cites") or []
+        if claim.get("person"):
+            kept.append({**claim, "basis": "person"})
+            continue
+        why = None if cites else "it cites nothing"
+        for cite in cites:
+            e = index.get(cite.get("evidence"))
+            if not e:
+                why = (f"{cite.get('evidence')} has been superseded by newer evidence" if cite.get("evidence") in superseded
+                       else f"no evidence {cite.get('evidence')!r}")
+                break
+            rec = load_record(d, e)
+            if not rec or not check_record(rec):
+                why = f"{e['id']} doesn't match its hash"
+                break
+            if not cite.get("quote") or _norm(cite["quote"]) not in _norm(rec["content"]):
+                why = f"{e['id']} doesn't say {clip_text(cite.get('quote') or '(no quote)', 80)!r}"
+                break
+        if why:
+            dropped.append({"text": text, "why": why})
+        else:
+            kept.append({**claim, "basis": "evidence"})
+    return {"control": draft.get("control"), "statement": " ".join(c["text"].strip() for c in kept),
+            "claims": kept, "dropped": dropped, "verified_at": time.time(),
+            "coverage": {"evidence": sum(1 for c in kept if c["basis"] == "evidence"),
+                         "person": sum(1 for c in kept if c["basis"] == "person"), "dropped": len(dropped)}}
+
+
+def clip_text(text: str, n: int) -> str:
+    one = " ".join(text.split())
+    return one if len(one) <= n else one[:n - 3] + "..."
+
+
 # ---- command line: argument parsing, main
 
 def cmd_evidence(args) -> str:
@@ -1043,6 +1422,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: everything in the system's imports/ folder")
     p.add_argument("--sample", metavar="FILE", help="a file's columns and first rows, for drafting its mapping")
+    p = sub.add_parser("check", help="every control against its mapping and the current evidence")
+    p.add_argument("system")
+    p.add_argument("control", nargs="?", help="one control's results, in full")
+    p = sub.add_parser("verify", help="check the citations in drafted narratives (drafts/*.json)")
+    p.add_argument("system")
+    p.add_argument("drafts", nargs="*", help="default: every draft in drafts/")
+    p = sub.add_parser("mappings", help="the system's control mappings, and anything wrong with them")
+    p.add_argument("system")
     p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
@@ -1086,6 +1473,32 @@ def main(argv: list[str] | None = None) -> int:
                 print(sample(Path(args.sample)))
             else:
                 import_results(args.system, args.files)
+        elif args.cmd == "check":
+            if args.control:
+                res = read_json(system_dir(args.system) / "runs" / "checks-latest.json") or {}
+                want = args.control.lower()
+                hit = next((r for r in (res.get("controls") or {}).values() if want in (r["control"], r["label"].lower())), None)
+                if not hit:
+                    raise AtoneError(f"no results for {args.control}: atone check {args.system}")
+                print(json.dumps(hit, indent=1))
+            else:
+                check_system(args.system)
+        elif args.cmd == "verify":
+            d = system_dir(args.system)
+            paths = [Path(p) for p in args.drafts] or sorted((d / "drafts").glob("*.json"))
+            for p in paths:
+                v = verify_narrative(d, read_json(p))
+                write_json(d / "drafts" / "verified" / p.name, v)
+                cov = v["coverage"]
+                print(f"{p.name}: {cov['evidence']} claims on evidence, {cov['person']} on a person's word, "
+                      f"{cov['dropped']} dropped" + "".join(f"\n  dropped: {x['text'][:80]} ({x['why']})"
+                                                          for x in v["dropped"]))
+        elif args.cmd == "mappings":
+            maps = load_mappings(system_dir(args.system))
+            for cid, m in maps.items():
+                probs = mapping_problems(m)
+                print(f"{cid:<10} {m.get('about', '')[:60]:<60} {m['_file']}" + "".join(f"\n  ! {x}" for x in probs))
+            print(f"{len(maps)} mappings")
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":

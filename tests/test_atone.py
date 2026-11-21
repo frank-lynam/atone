@@ -175,6 +175,104 @@ class Imports(unittest.TestCase):
         self.assertEqual(len([e for e in atone.current_index(d) if e["source"] == "passwd entries"]), 1)
 
 
+def evidence_system(name, records):
+    """A system whose current evidence is exactly `records`: [(kind, host, source, content)]."""
+    d = atone.init_system(name, None)
+    atone.sources_dir().mkdir(parents=True, exist_ok=True)
+    shutil.copy(FIX / "catalog.json", atone.sources_dir() / "catalog.json")
+    shutil.copy(FIX / "moderate.json", atone.sources_dir() / "moderate.json")
+    atone.save_records(d, [atone.make_record(name, k, h, src, c) for k, h, src, c in records])
+    return d
+
+
+AUDITD = "log_file = /var/log/audit/audit.log\nnum_logs = 10\nmax_log_file_action = keep_logs\nspace_left = 25%\n"
+
+
+class Checks(unittest.TestCase):
+    def rec(self, content, kind="file", host="h1", source="/etc/audit/auditd.conf"):
+        return atone.make_record("t", kind, host, source, content)
+
+    def test_present_absent_and_their_quotes(self):
+        r = atone.run_check({"type": "present", "pattern": r"^max_log_file_action\s*=\s*keep_logs"}, [self.rec(AUDITD)], "au-11", {})
+        self.assertEqual(r["status"], "pass")
+        self.assertEqual(r["quotes"][0]["quote"], "max_log_file_action = keep_logs")
+        r = atone.run_check({"type": "absent", "pattern": "NOPASSWD"}, [self.rec("%wheel ALL=(ALL) NOPASSWD: ALL")], "ac-6", {})
+        self.assertEqual(r["status"], "fail")
+
+    def test_a_value_against_the_tailoring(self):
+        chk = {"type": "value", "pattern": r"^num_logs\s*=\s*(\d+)", "op": ">=", "value": "{param:au-11_odp}"}
+        self.assertEqual(atone.run_check(chk, [self.rec(AUDITD)], "au-11", {"au-11_odp": "5 rotations"})["status"], "pass")
+        self.assertEqual(atone.run_check(chk, [self.rec(AUDITD)], "au-11", {"au-11_odp": "30"})["status"], "fail")
+        self.assertEqual(atone.run_check(chk, [self.rec(AUDITD)], "au-11", {})["status"], "unknown")   # not tailored yet
+
+    def test_counts_scans_and_findings(self):
+        users = self.rec(json.dumps([{"user": "root", "uid": 0}, {"user": "toor", "uid": 0}]), kind="accounts")
+        self.assertEqual(atone.run_check({"type": "count", "field_patterns": {"uid": "^0$"}, "op": "==", "value": 1},
+                                         [users], "ac-2", {})["status"], "fail")
+        [scan] = atone.import_oscap(FIX / "oscap-results.xml")
+        srec = self.rec(scan["content"], kind="scan", source=scan["source"])
+        self.assertEqual(atone.run_check({"type": "scan"}, [srec], "ac-12", {})["status"], "fail")   # the timeout rule
+        self.assertEqual(atone.run_check({"type": "scan"}, [srec], "au-11", {})["status"], "pass")
+        self.assertEqual(atone.run_check({"type": "scan"}, [srec], "ac-17", {})["status"], "unknown")
+        mapping = json.loads((FIX / "vulns.mapping.json").read_text())
+        vrecs = [self.rec(r["content"], kind="scan", host=r["host"], source=r["source"])
+                 for r in atone.import_file(FIX / "vulns-export.csv", [mapping])]
+        r = atone.run_check({"type": "findings", "severity": ["critical", "high"], "op": "==", "value": 0}, vrecs, "ra-5", {})
+        self.assertEqual((r["status"], r["detail"]), ("fail", "2 findings (critical, high)"))
+
+    def test_evidence_that_couldnt_be_read_is_unknown_not_a_pass_or_a_fail(self):
+        r = atone.run_check({"type": "absent", "pattern": "NOPASSWD"},
+                            [self.rec("not readable here: /etc/sudoers: Permission denied")], "ac-6", {})
+        self.assertEqual(r["status"], "unknown")
+
+    def test_a_mapping_with_mistakes_says_what_they_are(self):
+        probs = atone.mapping_problems({"control": "x", "evidence": [{"name": "e", "kind": "rm"}],
+                                        "checks": [{"id": "a", "type": "eval", "evidence": "e"},
+                                                   {"id": "b", "type": "present", "evidence": "nope", "pattern": "("}]})
+        self.assertEqual(len(probs), 4, probs)
+
+    def test_a_system_checked_end_to_end(self):
+        d = evidence_system("chk", [("file", "h1", "/etc/audit/auditd.conf", AUDITD),
+                                    ("services", "h1", "systemctl list-units --type=service --all",
+                                     "auditd.service loaded active running Security Auditing Service\n")])
+        t = atone.read_json(d / "tailoring.json")
+        t["inherited"] = {"pe-3": {"from": "AWS GovCloud"}}
+        atone.write_json(d / "tailoring.json", t)
+        res = atone.check_system("chk", log=lambda *a: None)["controls"]
+        self.assertEqual(res["au-11"]["status"], "partly")       # checks pass, but a person must supply the policy
+        self.assertEqual(res["au-11"]["checks"][0]["status"], "pass")
+        self.assertEqual(res["pe-3"]["status"], "inherited")
+        self.assertEqual(res["ac-11"]["status"], "unknown")       # no mapping yet: said so
+        self.assertIn("no mapping", res["ac-11"]["why"])
+
+
+class Verify(unittest.TestCase):
+    def test_only_claims_the_evidence_bears_out_are_kept(self):
+        d = evidence_system("ver", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        eid = atone.current_index(d)[0]["id"]
+        draft = {"control": "au-11", "claims": [
+            {"text": "The audit daemon keeps rotated logs rather than overwriting them.",
+             "cites": [{"evidence": eid, "quote": "max_log_file_action = keep_logs"}]},
+            {"text": "Audit logs are kept for one year.", "cites": [{"evidence": eid, "quote": "num_logs = 365"}]},
+            {"text": "Logs are reviewed weekly.", "cites": []},
+            {"text": "The ISSO reviews retention annually.", "person": "the ISSE, 2026-11-21"}]}
+        v = atone.verify_narrative(d, draft)
+        self.assertEqual([c["text"][:20] for c in v["claims"]], ["The audit daemon kee", "The ISSO reviews ret"])
+        self.assertEqual(v["coverage"], {"evidence": 1, "person": 1, "dropped": 2})
+        self.assertIn("doesn't say", v["dropped"][0]["why"])
+        self.assertIn("cites nothing", v["dropped"][1]["why"])
+
+    def test_a_claim_on_superseded_evidence_is_dropped(self):
+        d = evidence_system("sup", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        old = atone.current_index(d)[0]["id"]
+        import time
+        time.sleep(1.1)
+        atone.save_records(d, [atone.make_record("sup", "file", "h1", "/etc/audit/auditd.conf",
+                                                 AUDITD.replace("keep_logs", "rotate"))])
+        v = atone.verify_narrative(d, {"claims": [{"text": "x", "cites": [{"evidence": old, "quote": "keep_logs"}]}]})
+        self.assertIn("superseded", v["dropped"][0]["why"])
+
+
 class CommandLine(unittest.TestCase):
     def test_init_collect_and_look_at_the_evidence(self):
         code, out = run("init", "cli")
