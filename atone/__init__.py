@@ -21,6 +21,7 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone due SYSTEM              what's due by the cadence (nothing printed when nothing is: a hobkin's watch)
     atone report SYSTEM --out DIR [--conmon]   report.html, for people
     atone sources                 public guidance worth a lore, and NIST's files
+    atone oscal SYSTEM --out DIR  the SSP, assessment results and POA&M as OSCAL 1.1.2
     atone controls fetch [--from DIR]   a newer copy of NIST's OSCAL files (the package ships them)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -66,6 +67,7 @@ __version__ = "0.1.0"
 #   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed
 #   architecture  one graph of actual, allowed and documented paths; draw.io and SVG, with what differs
 #   plan          the engagement plan (what's left, who does it), what's due, the report people read
+#   oscal         the SSP, assessment results and POA&M as OSCAL 1.1.2
 #   pack          atone as an expert pack for hobkin: a chore and its skills (the hobkin.packs entry point)
 #   command line  argument parsing, main
 
@@ -2665,6 +2667,173 @@ def report(name: str, out: Path, conmon: bool = False, log=print) -> Path:
     return dest
 
 
+# ---- oscal: the SSP, assessment results and POA&M as OSCAL (1.1.2), for whoever takes machine-readable packages
+
+OSCAL_VERSION = "1.1.2"
+ATONE_NS = "https://github.com/frank-lynam/atone"
+IMPL_STATE = {"met": "implemented", "partly": "partial", "not met": "planned"}   # unknown, inherited: no claim
+
+
+def _uuid(*parts) -> str:
+    """The same thing gets the same uuid every time, so two runs diff cleanly."""
+    import uuid
+    return str(uuid.uuid5(uuid.UUID("6f1a3c2e-8b1d-4e7a-9c55-0a7d2f1e9b40"), "/".join(map(str, parts))))
+
+
+def _iso(t: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t or time.time()))
+
+
+def _meta(title: str) -> dict:
+    return {"title": title, "last-modified": _iso(), "version": __version__, "oscal-version": OSCAL_VERSION,
+            "remarks": "Drafted by atone from the system's evidence; people review and decide. Nothing here declares "
+                       "the system compliant."}
+
+
+def _tbd(what: str) -> str:
+    return f"(to be described by a person: {what})"
+
+
+def oscal_ssp(name: str) -> dict:
+    """The system security plan: the system's characteristics and boundary (from the spec and the architecture),
+    its components and inventory, and each control's implementation (verified narratives; status only where the
+    checks give one; inherited controls said so)."""
+    d = system_dir(name)
+    spec = read_json(d / "system.json", {})
+    tail = read_json(d / "tailoring.json", {})
+    checks = (read_json(d / "runs" / "checks-latest.json", {}) or {}).get("controls") or {}
+    graph = read_json(d / "runs" / "graph-latest.json", None)
+    this = _uuid(name, "this-system")
+    comps = [{"uuid": this, "type": "this-system", "title": name, "description": spec.get("description") or
+              _tbd("what the system is for"), "status": {"state": "operational"}}]
+    comp_ids = {}
+    for c in spec.get("components") or []:
+        comp_ids[c.get("name")] = _uuid(name, "component", c.get("name"))
+        comps.append({"uuid": comp_ids[c.get("name")], "type": "software", "title": c.get("name"),
+                      "description": c.get("about") or f"the {c.get('name')} component", "status": {"state": "operational"}})
+    inventory = []
+    for h in spec.get("hosts") or []:
+        hn = h if isinstance(h, str) else h.get("name")
+        props = [{"name": "fqdn", "value": hn}] + [{"name": "ipv4-address", "value": a}
+                                                   for a in ([] if isinstance(h, str) else h.get("addresses") or [])
+                                                   if re.fullmatch(r"[\d.]+", a)]
+        impl = [{"component-uuid": comp_ids[c.get("name")]} for c in spec.get("components") or []
+                if hn in (c.get("hosts") or [])]
+        inventory.append({"uuid": _uuid(name, "host", hn), "description": f"host {hn}", "props": props,
+                          **({"implemented-components": impl} if impl else {})})
+    reqs = []
+    for cid, r in checks.items():
+        v = read_json(d / "drafts" / "verified" / f"{cid}.json", None)
+        req = {"uuid": _uuid(name, "req", cid), "control-id": cid}
+        props = [{"name": "atone-status", "ns": ATONE_NS, "value": r["status"].replace(" ", "-")}]
+        if r["status"] == "inherited":
+            props.append({"name": "inherited-from", "ns": ATONE_NS, "value": (r.get("provider") or {}).get("from") or "?"})
+        req["props"] = props
+        bc = {"component-uuid": this, "uuid": _uuid(name, "by", cid),
+              "description": (v or {}).get("statement") or (f"Inherited from {(r.get('provider') or {}).get('from')}."
+                                                            if r["status"] == "inherited" else _tbd("how it's implemented"))}
+        if r["status"] in IMPL_STATE:
+            bc["implementation-status"] = {"state": IMPL_STATE[r["status"]]}
+        req["by-components"] = [bc]
+        reqs.append(req)
+    boundary = "Inside the boundary: " + (", ".join(n["id"] for n in (graph or {}).get("nodes") or [] if n["inside"])
+                                          or _tbd("the hosts")) + "."
+    if graph and graph.get("crossing"):
+        boundary += " Paths that cross it: " + "; ".join(graph["crossing"]) + "."
+    return {"system-security-plan": {
+        "uuid": _uuid(name, "ssp"), "metadata": _meta(f"{name}: system security plan"),
+        "import-profile": {"href": source_info(tail.get("baseline", "moderate")).get("url")
+                           or f"#{tail.get('baseline', 'moderate')}"},
+        "system-characteristics": {
+            "system-ids": [{"identifier-type": ATONE_NS, "id": name}], "system-name": name,
+            "description": spec.get("description") or _tbd("the system's purpose"),
+            "system-information": {"information-types": [{
+                "uuid": _uuid(name, "info-type"), "title": _tbd("the information types (FIPS 199 categorization)"),
+                "description": "The system owner categorizes the information the system handles; atone can't."}]},
+            "status": {"state": "operational"},
+            "authorization-boundary": {"description": boundary, **({"diagrams": [{
+                "uuid": _uuid(name, "boundary-diagram"), "description": "computed from the evidence (atone draw)",
+                "links": [{"href": "network.svg", "rel": "diagram"}]}]} if graph else {})}},
+        "system-implementation": {
+            "users": [{"uuid": _uuid(name, "users"), "title": _tbd("the system's user types and roles")}],
+            "components": comps, **({"inventory-items": inventory} if inventory else {})},
+        "control-implementation": {"description": f"The {tail.get('baseline', 'moderate')} baseline, tailored "
+                                                  "(tailoring.json).", "implemented-requirements": reqs}}}
+
+
+def oscal_results(name: str) -> dict:
+    """Assessment results: one result for the latest checks, an observation per check (with the evidence it read:
+    ids and hashes) and a finding per control that has checks."""
+    d = system_dir(name)
+    res = read_json(d / "runs" / "checks-latest.json", {}) or {}
+    by_id = {e["id"]: e for e in current_index(d)}
+    obs, finds = [], []
+    for cid, r in (res.get("controls") or {}).items():
+        related = []
+        for c in r.get("checks") or []:
+            ou = _uuid(name, "obs", cid, c["check"])
+            related.append({"observation-uuid": ou})
+            obs.append({"uuid": ou, "title": f"{r['label']}: {c['check']}", "description": f"{c.get('what') or c['check']}: "
+                        f"{c['status']} ({c['detail']})", "methods": ["TEST"], "collected": _iso(res.get("at")),
+                        **({"relevant-evidence": [{"href": f"#{e}", "description": f"{(by_id.get(e) or {}).get('source', e)} "
+                                                  f"(sha256 {(by_id.get(e) or {}).get('sha256', '?')})"}
+                                                 for e in c.get("evidence") or []]} if c.get("evidence") else {})})
+        if not related:
+            continue
+        state = {"met": "satisfied", "not met": "not-satisfied"}.get(r["status"])
+        finds.append({"uuid": _uuid(name, "finding", cid), "title": f"{r['label']} {r['title']}",
+                      "description": f"atone's checks: {r['status']}",
+                      "target": {"type": "objective-id", "target-id": f"{cid}_obj",
+                                 "status": {"state": state or "not-satisfied",
+                                            **({} if state else {"reason": r["status"].replace(" ", "-")})}},
+                      "related-observations": related})
+    return {"assessment-results": {
+        "uuid": _uuid(name, "ar"), "metadata": _meta(f"{name}: assessment results (atone's checks)"),
+        "import-ap": {"href": "#" + _uuid(name, "ap")},
+        "results": [{"uuid": _uuid(name, "result", res.get("at")), "title": "atone's checks",
+                     "description": "Each control's checks against the current evidence.", "start": _iso(res.get("at")),
+                     "reviewed-controls": {"control-selections": [{"include-all": {}}]},
+                     **({"observations": obs} if obs else {}), **({"findings": finds} if finds else {})}]}}
+
+
+def oscal_poam(name: str) -> dict:
+    """The POA&M: an item per open finding (imported findings, failed OpenSCAP rules), each with its observation and
+    the evidence it came from."""
+    d = system_dir(name)
+    schedule = read_json(d / "drafts" / "poam-schedule.json", {}) or {}
+    by_id = {e["id"]: e for e in current_index(d)}
+    items, obs = [], []
+    for it in poam_items(d):
+        ou = _uuid(name, "poam-obs", it["key"])
+        ev = by_id.get(it["evidence"]) or {}
+        obs.append({"uuid": ou, "description": f"{it['weakness']} on {it['asset']} ({it['source']}, {it['severity']})",
+                    "methods": ["TEST"], "collected": _iso(), "relevant-evidence": [{
+                        "href": f"#{it['evidence']}",
+                        "description": f"{ev.get('source', it['evidence'])} (sha256 {ev.get('sha256', '?')})"}]})
+        items.append({"uuid": _uuid(name, "poam", it["key"]), "title": it["weakness"],
+                      "description": f"{it['description'] or it['weakness']} (control {it['control']}; detected "
+                                     f"{it['detected'] or '?'})",
+                      "props": [{"name": "severity", "ns": ATONE_NS, "value": str(it["severity"] or "unknown")}]
+                      + ([{"name": "scheduled-completion", "ns": ATONE_NS, "value": schedule[it["key"]]}]
+                         if it["key"] in schedule else []),
+                      "related-observations": [{"observation-uuid": ou}]})
+    return {"plan-of-action-and-milestones": {
+        "uuid": _uuid(name, "poam"), "metadata": _meta(f"{name}: plan of action and milestones"),
+        "system-id": {"identifier-type": ATONE_NS, "id": name},
+        **({"observations": obs} if obs else {}), "poam-items": items}}
+
+
+def write_oscal(name: str, out: Path, log=print) -> list[Path]:
+    out.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for fname, doc in (("ssp.json", oscal_ssp(name)), ("assessment-results.json", oscal_results(name)),
+                       ("poam.json", oscal_poam(name))):
+        write_json(out / fname, doc)
+        paths.append(out / fname)
+    log(f"OSCAL {OSCAL_VERSION}: " + ", ".join(str(p) for p in paths))
+    return paths
+
+
 # ---- pack: atone as an expert pack for hobkin (a chore and its skills), served through the hobkin.packs entry point
 
 CHORE_JSON = {
@@ -2898,6 +3067,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.add_argument("--conmon", action="store_true", help="this is the monthly package: mark it done")
     sub.add_parser("sources", help="public guidance worth a lore (lorewell build), and NIST's OSCAL files")
+    p = sub.add_parser("oscal", help="the SSP, assessment results and POA&M as OSCAL 1.1.2")
+    p.add_argument("system")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
@@ -2984,6 +3156,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(line)
         elif args.cmd == "report":
             report(args.system, Path(args.out), args.conmon)
+        elif args.cmd == "oscal":
+            write_oscal(args.system, Path(args.out))
         elif args.cmd == "sources":
             print(f"NIST's controls, compiled exactly (atone controls lore), from {sources_dir()}:\n" + "\n".join(
                 f"  {k}: sha256 {source_info(k).get('sha256', '?')[:16]}... ({source_info(k).get('url', '?')})"

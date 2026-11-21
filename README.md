@@ -44,9 +44,12 @@ atone check tst                                # every control: met, partly, not
 atone verify tst                               # drafted narratives: each claim's citation checked
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why
 atone draw tst --out package/                  # the architecture: actual, allowed, documented (draw.io, SVG)
+atone oscal tst --out package/oscal/           # the SSP, assessment results and POA&M as OSCAL 1.1.2
 atone plan tst                                 # the plan (PLAN.md)
 atone report tst --out package/ [--conmon]     # report.html
 ```
+
+The first run on a real system, step by step (offline, no sudo): [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## A system's folder
 

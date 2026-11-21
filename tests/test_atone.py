@@ -518,6 +518,31 @@ class MoreEvidence(unittest.TestCase):
         self.assertEqual(atone.run_check(m["au-6"]["checks"][1], spec, "au-6", {})["status"], "pass")
 
 
+class Oscal(unittest.TestCase):
+    """OSCAL 1.1.2 (checked against NIST's schemas by hand: they need modules beyond the standard library)."""
+
+    def test_the_ssp_claims_only_what_the_checks_say(self):
+        d = Workbooks().system("osc")                     # evidence, scans, tailoring (PE-3 inherited), checks
+        out = Path(tempfile.mkdtemp())
+        atone.write_oscal("osc", out, log=lambda *a: None)
+        ssp = json.loads((out / "ssp.json").read_text())["system-security-plan"]
+        for key in ("uuid", "metadata", "import-profile", "system-characteristics", "system-implementation",
+                    "control-implementation"):
+            self.assertIn(key, ssp)
+        reqs = {r["control-id"]: r for r in ssp["control-implementation"]["implemented-requirements"]}
+        self.assertEqual(reqs["au-11"]["by-components"][0]["implementation-status"], {"state": "partial"})
+        self.assertNotIn("implementation-status", reqs["ac-11"]["by-components"][0])        # unknown: no claim
+        self.assertIn("to be described by a person", reqs["ac-11"]["by-components"][0]["description"])
+        self.assertEqual(reqs["pe-3"]["by-components"][0]["description"], "Inherited from AWS GovCloud.")
+        poam = json.loads((out / "poam.json").read_text())["plan-of-action-and-milestones"]
+        self.assertTrue(any(i["title"] == "Oracle JDK out of date" for i in poam["poam-items"]))
+        ar = json.loads((out / "assessment-results.json").read_text())["assessment-results"]
+        self.assertTrue(ar["results"][0]["observations"])
+        again = Path(tempfile.mkdtemp())
+        atone.write_oscal("osc", again, log=lambda *a: None)                      # the same uuids: diffs are real
+        self.assertEqual(json.loads((again / "ssp.json").read_text())["system-security-plan"]["uuid"], ssp["uuid"])
+
+
 class PlanAndReport(unittest.TestCase):
     def test_the_plan_says_who_does_what_and_ticks_what_is_done(self):
         d = evidence_system("plan", [("file", "app01", "/etc/audit/auditd.conf", AUDITD)])
