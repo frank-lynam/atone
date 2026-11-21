@@ -39,7 +39,7 @@ jobs:
           python-version: "3.12"
       - name: Check the release tag matches __version__
         run: |
-          version=$(python -c 'import eaveswatch; print(atone.__version__)')
+          version=$(python -c 'import atone; print(atone.__version__)')
           if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
             echo "Tag ${GITHUB_REF_NAME} doesn't match atone.__version__ $version"; exit 1
           fi
