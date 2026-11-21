@@ -402,9 +402,49 @@ class Architecture(unittest.TestCase):
         self.assertEqual(self.edges[("db01", "backup.example.internal", "tcp/443")], "documented only")
         self.assertEqual(self.edges[("34.200.1.7", "web01", "tcp/443")], "normal")         # covered by 0.0.0.0/0
 
+    def test_aws_load_balancers_databases_and_reachability(self):
+        e = {(x["from"], x["to"], x["port"]): x for x in self.g["edges"]}
+        self.assertEqual(self.edges[("internet", "public-alb", "tcp/443")], "idle")          # its listener: the way in
+        self.assertIn("configured", e[("public-alb", "web01", "tcp/8443")]["layers"])           # its target group
+        self.assertEqual(self.edges[("public-alb", "web01", "tcp/8443")], "idle")
+        self.assertEqual(e[("app01", "reports-db", "tcp/5432")]["config"]["file"], "/opt/app/application.properties")
+        self.assertTrue(e[("app01", "reports-db", "tcp/5432")]["allowed_by_rule"])           # by name: its endpoint
+        self.assertFalse(e[("internet", "db01", "tcp/22")]["reachable"])                     # private: rule, no route
+        self.assertTrue(e[("internet", "web01", "tcp/22")]["reachable"])
+        self.assertEqual(self.edges[("app01", "52.94.0.10", "tcp/443")], "unexpected")       # egress doesn't name it
+
+    def test_the_security_group_review(self):
+        f = {(x["group"], x["what"].split(" ")[0] + " " + x["what"].split(" ")[1]): x for x in self.g["security_groups"]}
+        found = sorted((x["group"], x["severity"]) for x in self.g["security_groups"])
+        self.assertIn(("sg-web", "high"), found)                                              # SSH to the world
+        self.assertTrue(next(x for x in self.g["security_groups"] if x["group"] == "sg-web")["reachable"])
+        ssh_db = next(x for x in self.g["security_groups"] if x["group"] == "sg-db")
+        self.assertEqual((ssh_db["severity"], ssh_db["reachable"]), ("high", False))          # open, but not routed
+        whats = {x["group"]: [y["what"] for y in self.g["security_groups"] if y["group"] == x["group"]]
+                 for x in self.g["security_groups"]}
+        self.assertTrue(any("attached to nothing" in w for w in whats["sg-old"]))
+        self.assertTrue(any("RDP" in w for w in whats["sg-old"]))
+        self.assertTrue(any("default group allows traffic" in w for w in whats["sg-default"]))
+        self.assertTrue(any("sg-gone" in w for w in whats["sg-app"]))
+        self.assertNotIn("sg-alb", whats)                                                     # 443 to the world: meant
+        self.assertTrue(f)
+
+    def test_sc7_and_cm7_check_the_security_groups(self):
+        recs = [atone.load_record(self.d, e) for e in atone.current_index(self.d) if e["kind"] == "aws"]
+        m = {x["control"]: x for x in atone.STARTER_MAPPINGS}
+        sc7 = atone.run_check(m["sc-7"]["checks"][0], recs, "sc-7", {})
+        self.assertEqual(sc7["status"], "fail")
+        self.assertIn("1 reachable from the internet", sc7["detail"])                # web01's SSH; db01's isn't
+        self.assertTrue(any("sg-web" in q["quote"] and "reachable from the internet" in q["quote"] for q in sc7["quotes"]))
+        cm7 = atone.run_check(next(c for c in m["cm-7"]["checks"] if c["type"] == "security_groups"), recs, "cm-7", {})
+        self.assertEqual(cm7["status"], "fail")                                      # sg-old: attached to nothing
+        html = atone.report("arch", Path(tempfile.mkdtemp()), log=lambda *a: None).read_text()
+        self.assertIn("<h2>Security groups</h2>", html)
+        self.assertIn("opens SSH to the whole internet", html)
+
     def test_the_boundary_and_what_crosses_it(self):
         inside = {n["id"] for n in self.g["nodes"] if n["inside"]}
-        self.assertEqual(inside, {"web01", "app01", "db01"})
+        self.assertEqual(inside, {"web01", "app01", "db01", "public-alb", "reports-db"})
         self.assertIn("app01 -> 52.94.0.10 tcp/443", self.g["crossing"])
 
     def test_drawio_and_svg_are_well_formed_and_say_what_they_show(self):

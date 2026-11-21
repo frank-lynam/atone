@@ -165,6 +165,18 @@
    ]
   ],
   [
+   "file",
+   "web01",
+   "/etc/nginx/nginx.conf",
+   "server {\n    listen 443 ssl;\n    location / { proxy_pass http://app01.example.internal:9000; }\n}\n"
+  ],
+  [
+   "file",
+   "app01",
+   "/opt/app/application.properties",
+   "server.port=9000\nspring.datasource.url=jdbc:oracle:thin:@//db01.example.internal:1521/PROD\nbackup.target=https://backup.example.internal/upload\nmail.host=smtp.example.internal\nmail.port=25\nreports.url=postgresql://db01.example.internal:5432/reports\naudit.url=postgresql://reports-db.abc.us-gov-west-1.rds.amazonaws.com:5432/audit\n"
+  ],
+  [
    "aws",
    "aws",
    "ec2 describe-instances",
@@ -185,7 +197,10 @@
          {
           "GroupId": "sg-web"
          }
-        ]
+        ],
+        "SubnetId": "subnet-pub",
+        "VpcId": "vpc-1",
+        "PublicIpAddress": "3.30.1.10"
        },
        {
         "InstanceId": "i-app",
@@ -200,7 +215,9 @@
          {
           "GroupId": "sg-app"
          }
-        ]
+        ],
+        "SubnetId": "subnet-app",
+        "VpcId": "vpc-1"
        },
        {
         "InstanceId": "i-db",
@@ -215,7 +232,9 @@
          {
           "GroupId": "sg-db"
          }
-        ]
+        ],
+        "SubnetId": "subnet-db",
+        "VpcId": "vpc-1"
        }
       ]
      }
@@ -253,6 +272,28 @@
          }
         ],
         "UserIdGroupPairs": []
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 8443,
+        "ToPort": 8443,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-alb"
+         }
+        ]
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
        }
       ]
      },
@@ -270,6 +311,63 @@
           "GroupId": "sg-web"
          }
         ]
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 9000,
+        "ToPort": 9000,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-gone"
+         }
+        ]
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 1521,
+        "ToPort": 1521,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-db"
+         }
+        ]
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-reports"
+         }
+        ]
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 25,
+        "ToPort": 25,
+        "IpRanges": [
+         {
+          "CidrIp": "10.0.0.0/8"
+         }
+        ],
+        "UserIdGroupPairs": []
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 443,
+        "ToPort": 443,
+        "IpRanges": [
+         {
+          "CidrIp": "10.0.0.0/8"
+         }
+        ],
+        "UserIdGroupPairs": []
        }
       ]
      },
@@ -287,6 +385,138 @@
           "GroupId": "sg-app"
          }
         ]
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 22,
+        "ToPort": 22,
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-alb",
+      "GroupName": "alb",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 443,
+        "ToPort": 443,
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-reports",
+      "GroupName": "reports",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 5432,
+        "ToPort": 5432,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-app"
+         }
+        ]
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-old",
+      "GroupName": "old-bastion",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 3389,
+        "ToPort": 3389,
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-default",
+      "GroupName": "default",
+      "IpPermissions": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-default"
+         }
+        ]
+       }
+      ],
+      "IpPermissionsEgress": [
+       {
+        "IpProtocol": "-1",
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
        }
       ]
      }
@@ -294,16 +524,189 @@
    }
   ],
   [
-   "file",
-   "web01",
-   "/etc/nginx/nginx.conf",
-   "server {\n    listen 443 ssl;\n    location / { proxy_pass http://app01.example.internal:9000; }\n}\n"
+   "aws",
+   "aws",
+   "ec2 describe-network-interfaces",
+   {
+    "NetworkInterfaces": [
+     {
+      "PrivateIpAddress": "10.0.1.10",
+      "Groups": [
+       {
+        "GroupId": "sg-web"
+       }
+      ],
+      "Description": ""
+     },
+     {
+      "PrivateIpAddress": "10.0.2.20",
+      "Groups": [
+       {
+        "GroupId": "sg-app"
+       }
+      ],
+      "Description": ""
+     },
+     {
+      "PrivateIpAddress": "10.0.3.30",
+      "Groups": [
+       {
+        "GroupId": "sg-db"
+       }
+      ],
+      "Description": ""
+     },
+     {
+      "PrivateIpAddress": "10.0.1.5",
+      "Groups": [
+       {
+        "GroupId": "sg-alb"
+       }
+      ],
+      "Description": "ELB app/public-alb/50dc6c495c0c9188"
+     },
+     {
+      "PrivateIpAddress": "10.0.3.40",
+      "Groups": [
+       {
+        "GroupId": "sg-reports"
+       }
+      ],
+      "Description": "RDSNetworkInterface"
+     }
+    ]
+   }
   ],
   [
-   "file",
-   "app01",
-   "/opt/app/application.properties",
-   "server.port=9000\nspring.datasource.url=jdbc:oracle:thin:@//db01.example.internal:1521/PROD\nbackup.target=https://backup.example.internal/upload\nmail.host=smtp.example.internal\nmail.port=25\nreports.url=postgresql://db01.example.internal:5432/reports\n"
+   "aws",
+   "aws",
+   "ec2 describe-route-tables",
+   {
+    "RouteTables": [
+     {
+      "VpcId": "vpc-1",
+      "Associations": [
+       {
+        "SubnetId": "subnet-pub"
+       }
+      ],
+      "Routes": [
+       {
+        "DestinationCidrBlock": "10.0.0.0/16",
+        "GatewayId": "local"
+       },
+       {
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": "igw-1"
+       }
+      ]
+     },
+     {
+      "VpcId": "vpc-1",
+      "Associations": [
+       {
+        "Main": true
+       }
+      ],
+      "Routes": [
+       {
+        "DestinationCidrBlock": "10.0.0.0/16",
+        "GatewayId": "local"
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "elbv2 describe-load-balancers",
+   {
+    "LoadBalancers": [
+     {
+      "LoadBalancerArn": "arn:aws:elasticloadbalancing:x:1:loadbalancer/app/public-alb/50dc",
+      "LoadBalancerName": "public-alb",
+      "Scheme": "internet-facing",
+      "Type": "application",
+      "DNSName": "public-alb-1.elb.amazonaws.com",
+      "SecurityGroups": [
+       "sg-alb"
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "elbv2 describe-listeners (public-alb)",
+   {
+    "Listeners": [
+     {
+      "Port": 443,
+      "Protocol": "HTTPS"
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "elbv2 describe-target-groups",
+   {
+    "TargetGroups": [
+     {
+      "TargetGroupName": "tg-web",
+      "TargetGroupArn": "arn:tg-web",
+      "Port": 8443,
+      "Protocol": "HTTPS",
+      "LoadBalancerArns": [
+       "arn:aws:elasticloadbalancing:x:1:loadbalancer/app/public-alb/50dc"
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "elbv2 describe-target-health (tg-web)",
+   {
+    "TargetHealthDescriptions": [
+     {
+      "Target": {
+       "Id": "i-web",
+       "Port": 8443
+      },
+      "TargetHealth": {
+       "State": "healthy"
+      }
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "rds describe-db-instances",
+   {
+    "DBInstances": [
+     {
+      "DBInstanceIdentifier": "reports-db",
+      "Endpoint": {
+       "Address": "reports-db.abc.us-gov-west-1.rds.amazonaws.com",
+       "Port": 5432
+      },
+      "PubliclyAccessible": false,
+      "VpcSecurityGroups": [
+       {
+        "VpcSecurityGroupId": "sg-reports"
+       }
+      ]
+     }
+    ]
+   }
   ]
  ],
  "documented": [
@@ -331,6 +734,18 @@
    "to": "smtp.example.internal",
    "port": "tcp/25",
    "data": "notifications"
+  },
+  {
+   "from": "internet",
+   "to": "public-alb",
+   "port": "tcp/443",
+   "data": "public"
+  },
+  {
+   "from": "public-alb",
+   "to": "web",
+   "port": "tcp/8443",
+   "data": "requests"
   }
  ]
 }

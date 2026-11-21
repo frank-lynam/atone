@@ -46,6 +46,7 @@ atone verify tst                               # drafted narratives: each claim'
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why
 atone connections tst                          # the intentional connections each config file defines
 atone draw tst --out package/                  # the architecture: configured, seen, allowed, documented (draw.io)
+                                               #   with the account's security groups reviewed (and in the report)
 atone oscal tst --out package/oscal/           # the SSP, assessment results and POA&M as OSCAL 1.1.2
 atone plan tst                                 # the plan (PLAN.md)
 atone report tst --out package/ [--conmon]     # report.html

@@ -369,25 +369,44 @@ def c_file(spec: dict) -> list[tuple[str, object]]:
     return out
 
 
+AWS_CALLS = [["ec2", "describe-security-groups"], ["ec2", "describe-network-interfaces"], ["ec2", "describe-instances"],
+             ["ec2", "describe-subnets"], ["ec2", "describe-route-tables"], ["ec2", "describe-network-acls"],
+             ["ec2", "describe-vpcs"], ["ec2", "describe-vpc-endpoints"], ["ec2", "describe-flow-logs"],
+             ["elbv2", "describe-load-balancers"], ["elbv2", "describe-target-groups"], ["rds", "describe-db-instances"],
+             ["cloudtrail", "describe-trails"], ["configservice", "describe-configuration-recorder-status"],
+             ["kms", "list-keys"], ["iam", "get-account-summary"]]
+
+
 def c_aws(spec: dict) -> list[tuple[str, object]]:
-    """Read-only AWS calls (describe/get/list), through the AWS CLI and whatever credentials it has here."""
+    """Read-only AWS calls (describe/get/list), through the AWS CLI and whatever credentials it has here, in each of
+    the spec's regions (aws.regions, or aws.region): security groups and what uses them, instances, subnets and
+    routes, network ACLs, load balancers (their listeners, target groups and targets), RDS, CloudTrail, Config, KMS."""
     if not shutil.which("aws"):
         return [("aws", "no AWS CLI here")]
-    region = (spec.get("aws") or {}).get("region")
-    calls = [["ec2", "describe-security-groups"], ["ec2", "describe-network-acls"], ["ec2", "describe-route-tables"],
-             ["ec2", "describe-vpcs"], ["ec2", "describe-subnets"], ["ec2", "describe-instances"],
-             ["ec2", "describe-vpc-endpoints"], ["ec2", "describe-flow-logs"], ["elbv2", "describe-load-balancers"],
-             ["cloudtrail", "describe-trails"],
-             ["configservice", "describe-configuration-recorder-status"], ["kms", "list-keys"],
-             ["iam", "get-account-summary"]]
+    conf = spec.get("aws") or {}
+    regions = conf.get("regions") or ([conf["region"]] if conf.get("region") else [None])
     out = []
-    for call in calls:
-        argv = ["aws", *call, "--output", "json"] + (["--region", region] if region else [])
+
+    def call(args, label, region):
+        argv = ["aws", *args, "--output", "json"] + (["--region", region] if region else [])
         code, text = run_cmd(argv, timeout=180)
+        name = label + (f" [{region}]" if region and len(regions) > 1 else "")
         try:
-            out.append((" ".join(argv[1:3]), json.loads(text) if code == 0 else text))
+            data = json.loads(text) if code == 0 else text
         except json.JSONDecodeError:
-            out.append((" ".join(argv[1:3]), text))
+            data = text
+        out.append((name, data))
+        return data if isinstance(data, dict) else {}
+    for region in regions:
+        got = {}
+        for c in AWS_CALLS:
+            got[" ".join(c)] = call(c, " ".join(c), region)
+        for lb in got.get("elbv2 describe-load-balancers", {}).get("LoadBalancers") or []:
+            call(["elbv2", "describe-listeners", "--load-balancer-arn", lb["LoadBalancerArn"]],
+                 f"elbv2 describe-listeners ({lb.get('LoadBalancerName')})", region)
+        for tg in got.get("elbv2 describe-target-groups", {}).get("TargetGroups") or []:
+            call(["elbv2", "describe-target-health", "--target-group-arn", tg["TargetGroupArn"]],
+                 f"elbv2 describe-target-health ({tg.get('TargetGroupName')})", region)
     return out
 
 
@@ -1089,10 +1108,12 @@ STARTER_MAPPINGS = [
      "evidence": [], "checks": [{"id": "oscap", "type": "scan"}],
      "needs_person": ["which configuration standard (STIG, CIS) and profile is the system's, and its deviations"]},
     {"control": "cm-7", "about": "Least functionality: no needless services",
-     "evidence": [{"name": "packages", "kind": "packages"}],
+     "evidence": [{"name": "packages", "kind": "packages"}, {"name": "aws", "kind": "aws"}],
      "checks": [{"id": "no-cleartext", "what": "no telnet, rsh, tftp or ftp servers installed", "type": "absent",
                  "evidence": "packages", "pattern": r"^(telnet-server|rsh-server|tftp-server|vsftpd|xinetd)\s"},
-                {"id": "oscap", "type": "scan"}],
+                {"id": "oscap", "type": "scan"},
+                {"id": "no-stray-groups", "what": "no security group is attached to nothing, or names a missing group",
+                 "type": "security_groups", "evidence": "aws", "fail_on": ["low"]}],
      "needs_person": ["the ports, protocols and services the system needs (CM-7b): the listeners are compared with "
                       "them in the architecture"]},
     {"control": "cm-8", "about": "System component inventory",
@@ -1119,10 +1140,10 @@ STARTER_MAPPINGS = [
                  "evidence": "tls", "field_patterns": {"days_left": r"^(-\d+|[0-2]?\d)$"}, "op": "==", "value": 0}],
      "needs_person": ["where the certificates come from (the approved PKI), and who renews them"]},
     {"control": "sc-7", "about": "Boundary protection: nothing open to the whole internet but what's meant to be",
-     "evidence": [{"name": "groups", "kind": "aws", "source": "ec2 describe-security-groups"}],
-     "checks": [{"id": "no-world-ssh", "what": "no security group opens SSH (22) to 0.0.0.0/0", "type": "absent",
-                 "evidence": "groups",
-                 "pattern": r'"FromPort": 22,\s*"IpProtocol": "tcp",\s*"IpRanges": \[\s*\{[^]]*"CidrIp": "0\.0\.0\.0/0"'}],
+     "evidence": [{"name": "aws", "kind": "aws"}],
+     "checks": [{"id": "security-groups", "what": "no security group opens admin or other ports to the world, allows "
+                 "all traffic, or is a default group that allows anything", "type": "security_groups", "evidence": "aws",
+                 "public_ports": [80, 443], "fail_on": ["high", "moderate"]}],
      "needs_person": ["the boundary's managed interfaces, and what's meant to be reachable from outside (SC-7a, b)"]},
 ]
 SITE_STARTER = {
@@ -1326,6 +1347,8 @@ CHECK_TYPES = {
     "scan": "the OpenSCAP rules that reference this control: all must pass",
     "findings": "imported findings at the given severities: their count compared with a value",
     "exists": "the evidence was collected at all (and readable)",
+    "security_groups": "the account's security groups reviewed (AWS evidence): fails on findings at the severities in "
+                       "fail_on (default high, moderate); public_ports are the ports meant to be open to the world",
 }
 STATUSES = ("met", "partly", "not met", "unknown", "inherited")
 NOT_READ = re.compile(r"^(not collected|not readable here|.*: not installed here|.*collector failed)", re.I)
@@ -1351,7 +1374,7 @@ def mapping_problems(m: dict) -> list[str]:
     for c in m.get("checks") or []:
         if c.get("type") not in CHECK_TYPES:
             out.append(f"check {c.get('id')!r}: type {c.get('type')!r} isn't one of {', '.join(CHECK_TYPES)}")
-        if c.get("type") != "scan" and c.get("evidence") not in names:
+        if c.get("type") not in ("scan",) and c.get("evidence") not in names:
             out.append(f"check {c.get('id')!r}: no evidence named {c.get('evidence')!r}")
         for key in ("pattern", "field_patterns"):
             pats = [c.get(key)] if key == "pattern" else list((c.get(key) or {}).values())
@@ -1487,6 +1510,27 @@ def run_check(c: dict, recs: list[dict], ctl_id: str, values: dict) -> dict:
             out.update(status="fail" if failed else "pass",
                        detail=f"{len(rules) - len(failed)} of {len(rules)} rules pass" + (
                            ": failing " + "; ".join(f"{res['title']} ({r['host']})" for r, res in failed[:5]) if failed else ""))
+    elif t == "security_groups":
+        items = []
+        for r in usable:
+            try:
+                items.append((r["id"], r["source"], json.loads(r["content"])))
+            except json.JSONDecodeError:
+                continue
+        model = aws_model(items)
+        if not model["groups"]:
+            out.update(status="unknown", detail="no security groups in the evidence")
+            return out
+        found = review_security_groups(model, tuple(c.get("public_ports") or (80, 443)))
+        bad = [f for f in found if f["severity"] in (c.get("fail_on") or ["high", "moderate"])]
+        out["quotes"] = [{"evidence": f["evidence"], "quote": f"{f['group']} ({f['name']}): {f['what']}"
+                          + (f" [{f['rule']}]" if f["rule"] else "") + ("; reachable from the internet" if f["reachable"]
+                                                                       else "; not reachable from the internet now")}
+                         for f in (bad or found)[:10]]
+        out.update(status="fail" if bad else "pass",
+                   detail=f"{len(model['groups'])} groups: {len(bad)} findings at {', '.join(c.get('fail_on') or ['high', 'moderate'])}"
+                          + (f" ({sum(1 for f in bad if f['reachable'])} reachable from the internet)" if bad else "")
+                          + (f", {len(found) - len(bad)} lesser" if len(found) > len(bad) else ""))
     elif t == "findings":
         sev = [s.lower() for s in c.get("severity") or []]
         found = []
@@ -2171,6 +2215,143 @@ def configured_endpoints(d: Path, spec: dict) -> list[dict]:
     return out
 
 
+def aws_model(items: list[tuple[str, str, object]]) -> dict:  # noqa: C901 (a pass over each kind of AWS evidence)
+    """What the AWS evidence says, put together: security groups; the resources that use them (instances, RDS
+    databases, load balancers), each with its addresses and whether the internet can reach it (a public address in a
+    subnet routed to an internet gateway, an internet-facing load balancer, a publicly accessible database); which
+    groups anything is attached to (network interfaces); and what each load balancer sends where. `items`: (evidence
+    id, source, its JSON) for each piece of AWS evidence."""
+    groups, resources, attached, targets = {}, [], set(), []
+    subnets_public, main_public, explicit = set(), {}, set()
+    lbs, tgs, enis, health, listeners = [], [], [], {}, {}
+    for eid, src, data in items:
+        if not isinstance(data, dict):
+            continue
+        e = {"id": eid}
+        for sg in data.get("SecurityGroups") or []:
+            if "IpPermissions" in sg:
+                groups[sg["GroupId"]] = {**sg, "_evidence": e["id"]}
+        enis += data.get("NetworkInterfaces") or []
+        for rt in data.get("RouteTables") or []:
+            public = any((r.get("GatewayId") or "").startswith("igw-") and r.get("DestinationCidrBlock") == "0.0.0.0/0"
+                         for r in rt.get("Routes") or [])
+            for a in rt.get("Associations") or []:
+                if a.get("SubnetId"):
+                    explicit.add(a["SubnetId"])
+                    if public:
+                        subnets_public.add(a["SubnetId"])
+                if a.get("Main"):
+                    main_public[rt.get("VpcId")] = public
+        for res in data.get("Reservations") or []:
+            for inst in res.get("Instances") or []:
+                tags = {t.get("Key"): t.get("Value") for t in inst.get("Tags") or []}
+                resources.append({"kind": "instance", "aws_id": inst.get("InstanceId"), "name": tags.get("Name"),
+                                  "addresses": [x for x in (inst.get("PrivateIpAddress"),) if x],
+                                  "public_ip": inst.get("PublicIpAddress"), "subnet": inst.get("SubnetId"),
+                                  "vpc": inst.get("VpcId"), "names": [x for x in (inst.get("PrivateDnsName"),) if x],
+                                  "sgs": [g.get("GroupId") for g in inst.get("SecurityGroups") or []], "evidence": e["id"]})
+        for db in data.get("DBInstances") or []:
+            ep = db.get("Endpoint") or {}
+            resources.append({"kind": "database", "aws_id": db.get("DBInstanceIdentifier"),
+                              "name": db.get("DBInstanceIdentifier"), "addresses": [], "names": [x for x in (ep.get("Address"),) if x],
+                              "port": ep.get("Port"), "public": bool(db.get("PubliclyAccessible")),
+                              "sgs": [g.get("VpcSecurityGroupId") for g in db.get("VpcSecurityGroups") or []],
+                              "evidence": e["id"]})
+        lbs += [{**lb, "_evidence": e["id"]} for lb in data.get("LoadBalancers") or []]
+        tgs += data.get("TargetGroups") or []
+        if src.startswith("elbv2 describe-target-health"):
+            health[src.split("(", 1)[-1].split(")")[0]] = data.get("TargetHealthDescriptions") or []
+        if src.startswith("elbv2 describe-listeners"):
+            listeners[src.split("(", 1)[-1].split(")")[0]] = data.get("Listeners") or []
+    for lb in lbs:
+        resources.append({"kind": "load balancer", "aws_id": lb.get("LoadBalancerArn"), "name": lb.get("LoadBalancerName"),
+                          "addresses": [], "names": [x for x in (lb.get("DNSName"),) if x],
+                          "public": lb.get("Scheme") == "internet-facing", "sgs": lb.get("SecurityGroups") or [],
+                          "listens": [{"port": l.get("Port"), "protocol": l.get("Protocol")}
+                                      for l in listeners.get(lb.get("LoadBalancerName"), [])], "evidence": lb["_evidence"]})
+    for eni in enis:                                     # who uses which groups; and the addresses of RDS and LBs
+        gids = [g.get("GroupId") for g in eni.get("Groups") or []]
+        attached.update(gids)
+        ip, desc = eni.get("PrivateIpAddress"), eni.get("Description") or ""
+        if not ip:
+            continue
+        m = re.match(r"ELB (?:app|net)/([^/]+)/", desc)
+        for r in resources:
+            if (m and r["kind"] == "load balancer" and r["name"] == m.group(1)) or \
+                    (r["kind"] == "database" and "RDS" in desc and set(gids) == set(r["sgs"])):
+                if ip not in r["addresses"]:
+                    r["addresses"].append(ip)
+    for r in resources:
+        attached.update(r["sgs"])
+        if r["kind"] == "instance":                    # a subnet with no route table of its own uses the VPC's main one
+            routed = r.get("subnet") in subnets_public or (r.get("subnet") not in explicit and main_public.get(r.get("vpc")))
+            r["public"] = bool(r.get("public_ip")) and bool(routed)
+    by_aws_id = {r["aws_id"]: r for r in resources}
+    for tg in tgs:
+        hs = health.get(tg.get("TargetGroupName"), [])
+        for lb_arn in tg.get("LoadBalancerArns") or []:
+            lb = by_aws_id.get(lb_arn)
+            for h in hs:
+                t = h.get("Target") or {}
+                target = by_aws_id.get(t.get("Id")) or next((r for r in resources if t.get("Id") in r["addresses"]), None)
+                targets.append({"lb": lb, "target": target, "target_id": t.get("Id"), "port": t.get("Port") or tg.get("Port"),
+                                "protocol": (tg.get("Protocol") or "TCP").lower(), "group": tg.get("TargetGroupName"),
+                                "health": (h.get("TargetHealth") or {}).get("State")})
+    return {"groups": groups, "resources": resources, "attached": attached, "targets": targets,
+            "public_subnets": sorted(subnets_public)}
+
+
+ADMIN_PORTS = {22: "SSH", 3389: "RDP", 23: "telnet", 21: "FTP", 1521: "Oracle", 1433: "SQL Server", 3306: "MySQL",
+               5432: "PostgreSQL", 27017: "MongoDB", 6379: "Redis", 9200: "Elasticsearch", 5601: "Kibana",
+               445: "SMB", 135: "RPC", 5985: "WinRM", 5986: "WinRM"}
+
+
+def review_security_groups(model: dict, open_ports=(80, 443)) -> list[dict]:
+    """What's wrong with the account's security groups, as findings: rules open to the whole internet (all traffic,
+    or a port beyond `open_ports`; admin and database ports named), groups attached to nothing, rules that name a
+    group that doesn't exist, and a default group that still allows anything. Each says whether what it opens can
+    actually be reached from the internet now (a public address, an internet-facing load balancer)."""
+    out = []
+    users = {}
+    for r in model["resources"]:
+        for g in r["sgs"]:
+            users.setdefault(g, []).append(r)
+    for gid, sg in sorted(model["groups"].items()):
+        name = sg.get("GroupName") or gid
+        who = users.get(gid, [])
+        reach = any(r.get("public") for r in who)
+
+        def finding(sev, what, rule=""):
+            out.append({"group": gid, "name": name, "severity": sev, "what": what, "rule": rule,
+                        "used_by": [r.get("name") or r["aws_id"] for r in who], "reachable": reach,
+                        "evidence": sg.get("_evidence")})
+        for perm in sg.get("IpPermissions") or []:
+            proto, lo, hi = perm.get("IpProtocol"), perm.get("FromPort"), perm.get("ToPort")
+            world = [x.get("CidrIp") for x in perm.get("IpRanges") or [] if x.get("CidrIp") == "0.0.0.0/0"] + \
+                [x.get("CidrIpv6") for x in perm.get("Ipv6Ranges") or [] if x.get("CidrIpv6") == "::/0"]
+            rule = f"{_port_text(proto, lo, hi)} from {', '.join(world)}" if world else ""
+            if world:
+                if proto == "-1":
+                    finding("high", "allows all traffic from anywhere", rule)
+                else:
+                    named = sorted({ADMIN_PORTS[p] for p in ADMIN_PORTS if lo is not None and lo <= p <= (hi or lo)})
+                    if named:
+                        finding("high", f"opens {', '.join(named)} to the whole internet", rule)
+                    elif not (lo == hi and lo in open_ports):
+                        finding("moderate", "opens a port to the whole internet that isn't one meant to be public "
+                                            f"({', '.join(map(str, open_ports))})", rule)
+            for pair in perm.get("UserIdGroupPairs") or []:
+                if pair.get("GroupId") and pair["GroupId"] not in model["groups"] and not pair.get("UserId", "").startswith("amazon"):
+                    finding("low", f"a rule names {pair['GroupId']}, which isn't in this account's groups (deleted, or "
+                                   "another account's)", f"{_port_text(proto, lo, hi)} from {pair['GroupId']}")
+        if name == "default" and (sg.get("IpPermissions") or [p for p in sg.get("IpPermissionsEgress") or []]):
+            finding("moderate", "the VPC's default group allows traffic: it should allow none (anything launched without "
+                                "a group gets it)")
+        if gid not in model["attached"] and name != "default":
+            finding("low", "attached to nothing: remove it, or say what it's for")
+    return out
+
+
 def _json_content(d: Path, e: dict):
     rec = load_record(d, e) or {}
     try:
@@ -2234,28 +2415,26 @@ def build_graph(name: str) -> dict:
                     addr.setdefault(ip, e["host"])
                     if ip not in nodes[e["host"]]["addresses"]:
                         nodes[e["host"]]["addresses"].append(ip)
-    groups = {}
-    instances = []                                        # (host node, [sg ids])
-    for e in index:
-        if e["kind"] != "aws":
-            continue
-        data = _json_content(d, e) or {}
-        if not isinstance(data, dict):
-            continue
-        for sg in data.get("SecurityGroups") or []:
-            if "IpPermissions" in sg:
-                groups[sg["GroupId"]] = sg
-        for res in data.get("Reservations") or []:
-            for inst in res.get("Instances") or []:
-                tags = {t.get("Key"): t.get("Value") for t in inst.get("Tags") or []}
-                ip = inst.get("PrivateIpAddress")
-                hn = addr.get(ip) or tags.get("Name") or inst.get("InstanceId")
-                n = node(hn, inside=True, component=comp_of.get(hn))
-                if ip:
-                    addr.setdefault(ip, hn)
-                    if ip not in n["addresses"]:
-                        n["addresses"].append(ip)
-                instances.append((hn, [g.get("GroupId") for g in inst.get("SecurityGroups") or []]))
+    model = aws_model([(e["id"], e["source"], _json_content(d, e)) for e in index if e["kind"] == "aws"])
+    groups = model["groups"]
+    instances = []                                        # (node, [sg ids]) for everything with security groups
+    for r in model["resources"]:
+        ip = next(iter(r["addresses"]), None)
+        hn = addr.get(ip) if ip else None
+        hn = hn or (r["name"] if r["kind"] == "instance" and r["name"] else None) or r["name"] or r["aws_id"]
+        n = node(hn, label=hn + ("" if r["kind"] == "instance" else f" ({r['kind']})"), inside=True,
+                 component=comp_of.get(hn))
+        n["aws"] = {"kind": r["kind"], "id": r["aws_id"], "public": bool(r.get("public"))}
+        for a_ in r["addresses"]:
+            addr.setdefault(a_, hn)
+            if a_ not in n["addresses"]:
+                n["addresses"].append(a_)
+        for nm in r.get("names") or []:
+            n.setdefault("names", []).append(nm)
+        if r.get("listens"):
+            n["configured_listens"] = sorted({l["port"] for l in r["listens"] if l.get("port")})
+        r["node"] = hn
+        instances.append((hn, r["sgs"]))
     members = {}
     for hn, sgs in instances:
         for g in sgs:
@@ -2285,21 +2464,65 @@ def build_graph(name: str) -> dict:
             private = False
         return node(ip, label=ip, kind="peer" if private else "internet-peer", inside=False)["id"]
 
-    # allowed: each instance's security groups' ingress rules
+    # allowed: the security groups' rules, in (ingress) and out (egress), for everything that has them
+    egress_all = set()                                   # nodes whose groups let anything out (or don't say)
+    egress = []                                          # (node, destination cidr or group, port text)
+
+    def cidr_node(cidr):
+        src = "internet" if cidr in ("0.0.0.0/0", "::/0") else cidr
+        node(src, label="the internet" if src == "internet" else cidr,
+             kind="internet" if src == "internet" else "range", inside=False)
+        return src
     for hn, sgs in instances:
+        public = (nodes[hn].get("aws") or {}).get("public")
+        if not any("IpPermissionsEgress" in (groups.get(g) or {}) for g in sgs):
+            egress_all.add(hn)                           # no egress rules in the evidence: not known to block anything
         for g in sgs:
-            for perm in (groups.get(g) or {}).get("IpPermissions") or []:
+            sg = groups.get(g) or {}
+            why = f"{g} ({sg.get('GroupName', '')})"
+            for perm in sg.get("IpPermissions") or []:
                 port = _port_text(perm.get("IpProtocol"), perm.get("FromPort"), perm.get("ToPort"))
-                for r in perm.get("IpRanges") or []:
-                    cidr = r.get("CidrIp")
-                    src = "internet" if cidr == "0.0.0.0/0" else cidr
-                    node(src, label="the internet" if src == "internet" else cidr, kind="internet" if src == "internet"
-                         else "range", inside=False)
-                    edge(src, hn, port, "allowed", rule=f"{g} ({(groups.get(g) or {}).get('GroupName', '')})")
+                for cidr in [r.get("CidrIp") for r in perm.get("IpRanges") or []] + \
+                        [r.get("CidrIpv6") for r in perm.get("Ipv6Ranges") or []]:
+                    if not cidr:
+                        continue
+                    src = cidr_node(cidr)
+                    edge(src, hn, port, "allowed", rule=why,
+                         **({"reachable": bool(public)} if src == "internet" else {}))
+                for pl in perm.get("PrefixListIds") or []:
+                    src = node(pl.get("PrefixListId"), label=f"prefix list {pl.get('PrefixListId')}", kind="range")["id"]
+                    edge(src, hn, port, "allowed", rule=why)
                 for pair in perm.get("UserIdGroupPairs") or []:
                     for src in members.get(pair.get("GroupId"), []):
                         if src != hn:
                             edge(src, hn, port, "allowed", rule=f"{g} from {pair.get('GroupId')}")
+            for perm in sg.get("IpPermissionsEgress") or []:
+                port = _port_text(perm.get("IpProtocol"), perm.get("FromPort"), perm.get("ToPort"))
+                dests = [r.get("CidrIp") for r in perm.get("IpRanges") or []] + \
+                    [r.get("CidrIpv6") for r in perm.get("Ipv6Ranges") or []]
+                if port == "all" and any(x in ("0.0.0.0/0", "::/0") for x in dests):
+                    egress_all.add(hn)
+                    continue
+                egress += [(hn, x, port) for x in dests if x] + \
+                    [(hn, pair.get("GroupId"), port) for pair in perm.get("UserIdGroupPairs") or []]
+    for hn in egress_all:
+        nodes[hn]["egress"] = "anything"
+    # load balancers: their listeners (an internet-facing one's are the intended way in) and their targets
+    for r in model["resources"]:
+        if r["kind"] == "load balancer":
+            for l in r.get("listens") or []:
+                if r.get("public") and l.get("port"):
+                    cidr_node("0.0.0.0/0")
+                    edge("internet", r["node"], f"tcp/{l['port']}", "configured", evidence=r["evidence"],
+                         config={"file": f"load balancer {r['name']}", "line": 0, "quote": f"listener {l.get('protocol')} "
+                                 f"{l['port']} (internet-facing)", "how": "an internet-facing load balancer's listener"})
+    for t in model["targets"]:
+        if t["lb"] and (t["target"] or t["target_id"]):
+            dst = t["target"]["node"] if t["target"] else peer(t["target_id"])
+            edge(t["lb"]["node"], dst, f"{'tcp' if t['protocol'] in ('http', 'https', 'tcp', 'tls') else t['protocol']}/{t['port']}",
+                 "configured", evidence=t["lb"]["evidence"],
+                 config={"file": f"target group {t['group']}", "line": 0, "quote": f"target {t['target_id']} port "
+                         f"{t['port']} ({t['health'] or '?'})", "how": "a load balancer's target group"})
     # actual: connections seen, in any snapshot in the window (inbound to a listening port, else outbound)
     for e in over_time:
         if e["kind"] != "flows":
@@ -2324,6 +2547,9 @@ def build_graph(name: str) -> dict:
         if isinstance(h, dict):
             for alias in h.get("names") or []:
                 by_name[alias.lower()] = h.get("name")
+    for nid, n in nodes.items():                         # AWS names: an RDS endpoint, a load balancer's DNS name
+        for alias in n.get("names") or []:
+            by_name[alias.lower()] = nid
 
     def resolve(target: str) -> str:
         t = target.lower()
@@ -2378,6 +2604,33 @@ def build_graph(name: str) -> dict:
                 pass
         return False
 
+    def egress_allows(e, specific=False) -> bool:
+        """Whether the source's security groups let this connection out (`specific`: by a rule that names it, not a
+        blanket allow-all, which says nothing about intent)."""
+        if e["from"] in egress_all:
+            return not specific
+        proto, _, p = e["port"].partition("/")
+        if not p.isdigit():
+            return False
+        dst_ips = [e["to"]] if nodes[e["to"]]["kind"] != "host" else nodes[e["to"]]["addresses"]
+        try:
+            [ipaddress.ip_address(x) for x in dst_ips]
+        except ValueError:
+            dst_ips = []
+        if not dst_ips and not nodes[e["to"]].get("aws"):
+            return not specific                          # a destination known only by name: can't tell, so not blocked
+        for src, dest, port in egress:
+            if src != e["from"] or not (port == "all" or _port_in(port, proto, int(p))):
+                continue
+            if dest in members and e["to"] in members[dest]:
+                return True
+            try:
+                if any(ipaddress.ip_address(x) in ipaddress.ip_network(dest, strict=False) for x in dst_ips):
+                    return True
+            except ValueError:
+                pass
+        return False
+
     docs = [e for e in edges.values() if "documented" in e["layers"]]
     confs = [e for e in edges.values() if "configured" in e["layers"]]
     seen_edges = [e for e in edges.values() if "actual" in e["layers"]]
@@ -2386,16 +2639,22 @@ def build_graph(name: str) -> dict:
         seen = "actual" in L
         conf = "configured" in L or (seen and covered(e, confs))
         doc = "documented" in L or covered(e, docs)
-        allowed_rule = "allowed" in L or covered(e, allowed)
-        e.update(configured=conf, documented=doc, allowed_by_rule=allowed_rule)
+        # allowed: in through the destination's groups (if it has any) and out through the source's (if it has any)
+        inbound_ok = "allowed" in L or covered(e, allowed) or not nodes[e["to"]].get("aws")
+        outbound_ok = egress_allows(e) or not nodes[e["from"]].get("aws")
+        has_aws_end = bool(nodes[e["to"]].get("aws") or nodes[e["from"]].get("aws"))
+        allowed_rule = bool(groups) and has_aws_end and inbound_ok and outbound_ok
+        # explained by a rule: a rule that names this path (into an AWS destination; or out by a specific egress rule)
+        by_rule = ("allowed" in L or covered(e, allowed)) if nodes[e["to"]].get("aws") else egress_allows(e, True)
+        e.update(configured=conf, documented=doc, allowed_by_rule=allowed_rule, explained_by_rule=by_rule)
         if seen or "configured" in L:                # the most urgent first
             to_inside, from_outside = nodes[e["to"]]["inside"], not nodes[e["from"]]["inside"]
-            if seen and not (conf or allowed_rule or doc):
+            if seen and not (conf or by_rule or doc):
                 e["class"] = "unexpected"                # nothing explains it
-            elif "configured" in L and instances and to_inside and nodes[e["to"]]["kind"] == "host" \
-                    and not allowed_rule and not seen:
+            elif "configured" in L and groups and not allowed_rule and not seen and \
+                    (nodes[e["to"]].get("aws") or nodes[e["from"]].get("aws")):
                 e["class"] = "blocked"                   # it would fail
-            elif seen and instances and to_inside and from_outside and not allowed_rule:
+            elif seen and groups and not allowed_rule and (to_inside and from_outside or nodes[e["from"]].get("aws")):
                 e["class"] = "unexpected"
             elif documented and not doc:
                 e["class"] = "undocumented"
@@ -2408,6 +2667,8 @@ def build_graph(name: str) -> dict:
         else:
             e["class"] = "documented only"
     out = {"system": name, "at": time.time(), "nodes": list(nodes.values()),
+           "security_groups": review_security_groups(model, tuple(((spec.get("aws") or {}).get("public_ports")
+                                                                   or [80, 443]))),
            "edges": sorted(edges.values(), key=lambda e: (e["from"], e["to"], e["port"])),
            "counts": {k: sum(1 for e in edges.values() if e["class"] == k) for k in EDGE_CLASSES},
            "crossing": [f"{e['from']} -> {e['to']} {e['port']}" for e in edges.values()
@@ -2418,14 +2679,18 @@ def build_graph(name: str) -> dict:
 def layout(graph: dict) -> dict[str, tuple[int, int]]:
     """Positions by tier: outside first, then each component in order of its distance from outside, hosts stacked."""
     nodes = {n["id"]: n for n in graph["nodes"]}
+    # tiers follow the paths that are intended or used (never an allowed-only rule), by the longest way in from
+    # outside, so a load balancer stands before what it sends to
+    flow = [e for e in graph["edges"] if e.get("class") != "unused" and nodes[e["to"]]["inside"]]
     depth = {nid: 0 for nid, n in nodes.items() if not n["inside"]}
-    changed = True
-    while changed:
+    for _ in range(len(nodes)):
         changed = False
-        for e in graph["edges"]:
-            if e["from"] in depth and e["to"] not in depth and nodes[e["to"]]["inside"]:
+        for e in flow:
+            if e["from"] in depth and depth[e["from"]] + 1 > depth.get(e["to"], 0) and depth[e["from"]] < len(nodes):
                 depth[e["to"]] = depth[e["from"]] + 1
                 changed = True
+        if not changed:
+            break
     for nid, n in nodes.items():
         depth.setdefault(nid, 1)
     comp_depth = {}
@@ -2463,18 +2728,28 @@ def edge_ends(pos: dict, e: dict, k: int, n: int) -> tuple[float, float, float, 
     return x1 + 90 + off, (y1 + 70 if y2 > y1 else y1), x2 + 90 + off, (y2 if y2 > y1 else y2 + 70)
 
 
-def detour(pos: dict, e: dict, k: int) -> list[tuple[float, float]]:
-    """Waypoints for an edge that would pass through boxes on its way (it skips a column, or runs along one): below
-    the boxes it passes, so it never crosses one. [] when the straight line is clear."""
-    (x1, y1), (x2, y2) = pos[e["from"]], pos[e["to"]]
-    lo, hi = sorted((x1, x2))
-    between = [(x, y) for nid, (x, y) in pos.items() if lo < x < hi and nid not in (e["from"], e["to"])]
-    if abs(x2 - x1) <= 260 or not between:
-        return []
-    below = max([y for _, y in between] + [y1, y2]) + 90 + k * 12
-    ax = x1 + 180 + 20 if x2 > x1 else x1 - 20
-    bx = x2 - 20 if x2 > x1 else x2 + 180 + 20
-    return [(ax, below), (bx, below)]
+def detours(graph: dict, pos: dict) -> dict[int, list[tuple[float, float]]]:
+    """Waypoints for each edge whose straight line would cross a box: out of its source's side into the gap beside
+    it, down to a lane of its own below every box, along to the gap beside its target, and in from the side. Lanes
+    never shared, so no two detours run along each other."""
+    out, bottom = {}, max([y for _, y in pos.values()] or [0]) + 70
+    lane = 0
+    for i, e in enumerate(graph["edges"]):
+        (x1, y1), (x2, y2) = pos[e["from"]], pos[e["to"]]
+        lo, hi = sorted((x1, x2))
+        crossed = [nid for nid, (x, y) in pos.items() if nid not in (e["from"], e["to"])
+                   and ((lo < x < hi) or (x == x2 and min(y1, y2) < y < max(y1, y2)))]
+        if (abs(x2 - x1) <= 260 and not crossed) or (x1 == x2 and not crossed) or not crossed:
+            continue
+        lane += 1
+        ly, g = bottom + 30 + lane * 16, 8 + 7 * (lane % 7)       # its own lane, and its own run up each gap
+        if x2 >= x1:
+            out[i] = [(x1 + 180, y1 + 35), (x1 + 180 + g, y1 + 35), (x1 + 180 + g, ly), (x2 - g, ly), (x2 - g, y2 + 35),
+                      (x2, y2 + 35)]
+        else:
+            out[i] = [(x1, y1 + 35), (x1 - g, y1 + 35), (x1 - g, ly), (x2 + 180 + g, ly), (x2 + 180 + g, y2 + 35),
+                      (x2 + 180, y2 + 35)]
+    return out
 
 
 def parallel(edges: list[dict]) -> list[tuple[int, int]]:
@@ -2518,20 +2793,22 @@ def drawio(graph: dict, title: str) -> str:
                  "rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;")
         cells.append(f'<mxCell id="{ids[nid]}" value="{_x(label)}" style="{style}whiteSpace=wrap;html=1;" vertex="1" '
                      f'parent="1"><mxGeometry x="{x}" y="{y}" width="180" height="70" as="geometry"/></mxCell>')
+    routes = detours(graph, pos)
     for i, (e, (k, n)) in enumerate(zip(graph["edges"], parallel(graph["edges"]))):
         color, extra = EDGE_STYLE[e["class"]]
         y = round(0.5 + (k - (n - 1) / 2) * 0.25, 2)            # parallel edges leave and arrive apart
         sides = (f"exitX=1;exitY={y};entryX=0;entryY={y};" if pos[e["to"]][0] > pos[e["from"]][0] else
                  f"exitX=0;exitY={y};entryX=1;entryY={y};" if pos[e["to"]][0] < pos[e["from"]][0] else "")
-        way = detour(pos, e, k)
+        way = routes.get(i, [])[1:-1]
         points = ('<Array as="points">' + "".join(f'<mxPoint x="{x}" y="{y}"/>' for x, y in way) + "</Array>") if way else ""
         if way:
-            sides = "exitX=0.5;exitY=1;entryX=0.5;entryY=1;"
-        cells.append(f'<mxCell id="e{i}" value="{_x(e["port"])}" style="endArrow=block;html=1;strokeColor={color};'
+            right = pos[e["to"]][0] >= pos[e["from"]][0]
+            sides = f"exitX={1 if right else 0};exitY=0.5;entryX={0 if right else 1};entryY=0.5;"
+        cells.append(f'<mxCell id="e{i}" value="{_x(e["port"] + (" (not reachable)" if e.get("reachable") is False else ""))}" style="endArrow=block;html=1;strokeColor={color};'
                      f'fontColor={color};labelBackgroundColor=#ffffff;{sides}{extra}" edge="1" parent="1" '
                      f'source="{ids[e["from"]]}" target="{ids[e["to"]]}"><mxGeometry relative="1" as="geometry">'
                      f'{points}</mxGeometry></mxCell>')
-    ly = 80 + max([p[1] for p in pos.values()] or [0]) + 200
+    ly = 80 + max([p[1] for p in pos.values()] or [0]) + 200 + 16 * len(routes)
     for i, (cls, about) in enumerate(EDGE_CLASSES.items()):
         color, extra = EDGE_STYLE[cls]
         y = ly + i * 30
@@ -2550,7 +2827,8 @@ def svg(graph: dict, title: str) -> str:
     pos = layout(graph)
     nodes = {n["id"]: n for n in graph["nodes"]}
     w = max([p[0] for p in pos.values()] or [0]) + 260
-    h = max([p[1] for p in pos.values()] or [0]) + 200 + 30 * len(EDGE_CLASSES) + 40
+    lanes = len(detours(graph, pos))
+    h = max([p[1] for p in pos.values()] or [0]) + 200 + 16 * lanes + 30 * len(EDGE_CLASSES) + 40
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
            f'style="max-width:100%;height:auto" font-family="sans-serif" font-size="12">',
            '<defs>' + "".join(f'<marker id="a{i}" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">'
@@ -2564,11 +2842,10 @@ def svg(graph: dict, title: str) -> str:
         out.append(f'<rect x="{bx}" y="{by}" width="{max(p[0] for p in inside) - bx + 210}" height="'
                    f'{max(p[1] for p in inside) - by + 100}" rx="12" fill="none" stroke="#2ca02c" stroke-width="2" '
                    f'stroke-dasharray="8 4"/>')
-    for e, (k, n) in zip(graph["edges"], parallel(graph["edges"])):
-        way = detour(pos, e, k)
-        if way:                                   # down out of the box, along below the others, up into the target
-            (fx, fy), (tx, ty) = pos[e["from"]], pos[e["to"]]
-            pts = [(fx + 90, fy + 70), (fx + 90, way[0][1]), (tx + 90, way[1][1]), (tx + 90, ty + 70)]
+    routes = detours(graph, pos)
+    for i, (e, (k, n)) in enumerate(zip(graph["edges"], parallel(graph["edges"]))):
+        if i in routes:                           # out of the side, along its own lane below, in from the side
+            pts = routes[i]
         else:
             x1, y1, x2, y2 = edge_ends(pos, e, k, n)
             pts = [(x1, y1), (x2, y2)]
@@ -2576,7 +2853,7 @@ def svg(graph: dict, title: str) -> str:
         dash = ' stroke-dasharray="6 4"' if "dashed" in extra else ""
         out.append(f'<polyline points="{" ".join(f"{x},{y}" for x, y in pts)}" fill="none" stroke="{color}" '
                    f'stroke-width="1.5"{dash} marker-end="url(#a{cls_i[e["class"]]})"/>')
-        mx, my = ((pts[1][0] + pts[2][0]) / 2, pts[1][1]) if len(pts) > 2 else ((pts[0][0] + pts[1][0]) / 2,
+        mx, my = ((pts[2][0] + pts[3][0]) / 2, pts[2][1]) if len(pts) > 2 else ((pts[0][0] + pts[1][0]) / 2,
                                                                                (pts[0][1] + pts[1][1]) / 2)
         out.append(f'<text x="{mx}" y="{my - 4}" fill="{color}" text-anchor="middle" '
                    f'paint-order="stroke" stroke="#ffffff" stroke-width="3">{_x(e["port"])}</text>')
@@ -2591,7 +2868,7 @@ def svg(graph: dict, title: str) -> str:
             out.append(f'<text x="{x + 90}" y="{y + 22 + j * 16}" text-anchor="middle"'
                        f'{" font-style=" + chr(34) + "italic" + chr(34) if j == 1 and n["component"] else ""}>'
                        f'{_x(clip_text(line, 28))}</text>')
-    ly = max([p[1] for p in pos.values()] or [0]) + 200
+    ly = max([p[1] for p in pos.values()] or [0]) + 200 + 16 * lanes
     for i, (c, about) in enumerate(EDGE_CLASSES.items()):
         color, extra = EDGE_STYLE[c]
         dash = ' stroke-dasharray="6 4"' if "dashed" in extra else ""
@@ -2806,6 +3083,14 @@ def report(name: str, out: Path, conmon: bool = False, log=print) -> Path:
                  + "</p><div class=svg>" + svg_file.read_text().split("?>")[-1] + "</div><ul>" + "".join(
                      f"<li><b>{_h(e['class'])}</b>: {_h(e['from'])} &rarr; {_h(e['to'])} {_h(e['port'])}</li>"
                      for e in graph["edges"] if e["class"] != "normal") + "</ul>")
+    if graph and graph.get("security_groups"):
+        h.append("<h2>Security groups</h2><table><tr><th>Group</th><th>Finding</th><th>Rule</th><th>Used by</th>"
+                 "<th>Reachable from the internet</th></tr>" + "".join(
+                     f"<tr><td>{_h(f['group'])} ({_h(f['name'])})</td><td><b>{_h(f['severity'])}</b>: {_h(f['what'])}</td>"
+                     f"<td>{_h(f['rule'])}</td><td>{_h(', '.join(f['used_by']) or 'nothing')}</td>"
+                     f"<td>{'yes' if f['reachable'] else 'no'}</td></tr>"
+                     for f in sorted(graph["security_groups"], key=lambda f: ("high", "moderate", "low").index(f["severity"])))
+                 + "</table>")
     h.append("<h2>Controls</h2><table><tr><th>Control</th><th>Status</th><th>Checks</th><th>Narrative</th></tr>")
     for c in ctl.values():
         checks_html = "".join(f"<div>{_h(x['check'])}: <b>{_h(x['status'])}</b> {_h(x['detail'])}" + "".join(
@@ -3067,8 +3352,10 @@ SKILLS = {
 1. `atone discover {{system}}` (with `--ssh USER@HOST` for each host you have access to). Read discovery.json.
 2. In system.json: the hosts (name, addresses, other `names` it's known by), the components (which hosts run them;
    every config file that defines what they connect to or listen on, and their audit settings, from discovery's
-   config list: `{"path": ...}`; never credential files), what to collect (`collect`: kinds from atone's menu), and
-   `aws.region` if it runs in AWS. Keep the generic linux component's files.
+   config list: `{"path": ...}`; never credential files), what to collect (`collect`: kinds from atone's menu), and,
+   if it runs in AWS, `aws.regions` (or `aws.region`) and `aws.public_ports`: the ports meant to be open to the whole
+   internet (default 80 and 443; anything else open to the world is a finding). Keep the generic linux component's
+   files.
 3. The intentional connections come from those files: after `atone collect`, `atone connections {{system}}` shows
    what atone's generic readers found in each (URLs, JDBC and TNS strings, host and port settings, listen
    directives), with the line. Where a product's format hides a connection from them, add a pattern to that file's

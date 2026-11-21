@@ -133,7 +133,7 @@ The ISSE reviews the spec. Every system gets its own; PeopleSoft's will just be 
 | `services` | services, their state, and the account each runs as |
 | `listeners`, `flows` | ports listened on, and connections seen over time |
 | `firewall` | host firewall rules |
-| `aws` | security groups, network ACLs, route tables, load balancers, IAM summaries, CloudTrail and Config status, KMS (`describe`/`get`/`list` calls only) |
+| `aws` | security groups and the network interfaces that use them, instances, subnets, route tables, network ACLs, load balancers (listeners, target groups, targets), RDS, CloudTrail and Config status, KMS, IAM summary, in each of the spec's regions (`describe`/`get`/`list` calls only) |
 | `certs` | certificates on listeners: issuer, expiry, protocols |
 
 A spec can only *name* collectors from this menu; it can't add a command. A customer who needs a command atone
@@ -211,7 +211,12 @@ matrix. `atone fill` fills them in without wrecking them:
    `atone connections` lists what was found.
 2. **Seen:** connections observed (the `flows` collector, every snapshot in the freshness window; eaveswatch;
    VPC Flow Logs where they're on).
-3. **Allowed:** security groups (ranges and other groups), and host firewalls.
+3. **Allowed:** the AWS security groups, in (ranges, IPv6 ranges, prefix lists, other groups) and out (egress;
+   a blanket allow-all lets traffic out but explains nothing), for instances, load balancers and RDS databases.
+   Whether a rule open to the world is actually reachable comes from the routes (a subnet routed to an internet
+   gateway) and public addresses. An internet-facing load balancer's listeners and its target groups are
+   configuration: they're the intended way in. (Network ACLs are collected, not yet evaluated; host firewall rules
+   likewise.)
 4. **Documented:** the boundary and data flows the SSP describes (documented.json, reviewed).
 
 | Class | Means |
@@ -223,6 +228,11 @@ matrix. `atone fill` fills them in without wrecking them:
 | idle | configured but not seen in the window: intended, just quiet |
 | documented only | in the SSP, but neither configured nor seen |
 | normal | configured (or documented, or allowed), and seen |
+
+**The security groups themselves are reviewed,** account-wide: rules open to the world (all traffic, admin and
+database ports named, any port beyond the system's `public_ports`), each with whether it's reachable from the
+internet now; groups attached to nothing; rules naming a group that doesn't exist; a default group that allows
+anything. The review is a check type (`security_groups`) the mappings use (SC-7, CM-7), and a table in the report.
 
 The authorization boundary is computed, not drawn by hand, so interconnections can't hide outside it. The diagrams
 are first for the engineering team: accurate and useful for understanding the system, not just for the package.
