@@ -282,7 +282,7 @@ class Verify(unittest.TestCase):
             {"text": "The ISSO reviews retention annually.", "person": "the ISSE, 2026-11-21"}]}
         v = atone.verify_narrative(d, draft)
         self.assertEqual([c["text"][:20] for c in v["claims"]], ["The audit daemon kee", "The ISSO reviews ret"])
-        self.assertEqual(v["coverage"], {"evidence": 1, "person": 1, "dropped": 2})
+        self.assertEqual(v["coverage"], {"evidence": 1, "document": 0, "person": 1, "dropped": 2})
         self.assertIn("doesn't say", v["dropped"][0]["why"])
         self.assertIn("cites nothing", v["dropped"][1]["why"])
 
@@ -780,6 +780,24 @@ class CommandLine(unittest.TestCase):
         self.assertIn("verified", out.splitlines()[0])
         code, out = run("evidence", "cli", "search", "root")
         self.assertIn("passwd entries", out)
+
+    def test_a_claim_can_cite_the_customers_document_and_verify_checks_it_says_so(self):
+        d = evidence_system("docs", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        shutil.copy(FIX / "ssp.docx", d / "workbooks" / "ssp.docx")
+        v = atone.verify_narrative(d, {"control": "ca-3", "claims": [
+            {"text": "The SSP states the web tier accepts HTTPS from the agency network.",
+             "cites": [{"document": "workbooks/ssp.docx", "quote": "accepts HTTPS from the agency network"}]},
+            {"text": "The SSP says it's quantum.", "cites": [{"document": "workbooks/ssp.docx", "quote": "quantum"}]},
+            {"text": "Outside.", "cites": [{"document": "../../etc/passwd", "quote": "root"}]}]})
+        self.assertEqual(v["coverage"], {"evidence": 0, "document": 1, "person": 0, "dropped": 2})
+        self.assertEqual(len(v["claims"][0]["cites"][0]["sha256"]), 64)
+        self.assertIn("no document", v["dropped"][1]["why"])
+
+    def test_evidence_from_a_host_the_system_doesnt_name_isnt_counted(self):
+        f = atone.in_boundary({"hosts": [{"name": "app01", "addresses": ["10.0.0.5"]}]})
+        self.assertEqual([f(h) for h in ("app01.example.internal", "10.0.0.5", "db01", "10.0.0.6", "aws")],
+                         [True, True, False, False, True])
+        self.assertTrue(atone.in_boundary({})("anything"))                     # until the spec names hosts
 
     def test_a_word_document_reads_as_text_headings_lists_and_tables(self):
         t = atone.doc_text(FIX / "ssp.docx")                                    # made by LibreOffice, as Word saves

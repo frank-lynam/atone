@@ -1584,7 +1584,9 @@ def import_results(name: str, files: list[str] | None = None, log=print, eaveswa
             rec.update(file_sha256=sha, from_file=path.name)           # the export it came from, as it was
             recs.append(rec)
             n += 1
-        log(f"{path.name}: {n} hosts")
+        hosts = sorted({r["host"] for r in recs if r.get("from_file") == path.name})
+        strange = [h for h in hosts if not in_boundary(read_json(d / "system.json", {}))(h)]
+        log(f"{path.name}: {n} hosts" + (f" (not this system's, so not counted: {', '.join(strange)})" if strange else ""))
     changed = save_records(d, recs, f"evidence: imported {', '.join(p.name for p in paths)}")
     log(f"{len(recs)} pieces of evidence, {len(changed)} changed" + (" (committed)" if changed else ""))
     return changed
@@ -1639,6 +1641,24 @@ def mapping_problems(m: dict) -> list[str]:
                     except re.error as e:
                         out.append(f"check {c.get('id')!r}: pattern {pat!r} doesn't compile ({e})")
     return out
+
+
+ABOUT_SYSTEM = {"aws", "eaveswatch"}        # evidence about the system that isn't from one of its hosts
+
+
+def in_boundary(spec: dict):
+    """A test for a record's host: is it one of the system's (by name, another name it's known by, an address, or the
+    same short name: a scanner's app01.example.internal is the spec's app01)? Everything is, until the spec names
+    hosts. Evidence from elsewhere (a scan of another system's host) never counts toward this system's controls."""
+    known = set()
+    for h in spec.get("hosts") or []:
+        for n in ([h] if isinstance(h, str) else [h.get("name"), *(h.get("names") or []), *(h.get("addresses") or [])]):
+            if n:
+                known |= {str(n).lower(), str(n).lower().split(".")[0]} if not re.match(r"[\d.:]+$", str(n)) else {str(n)}
+    if not known:
+        return lambda host: True
+    return lambda host: (host in ABOUT_SYSTEM or str(host).lower() in known
+                         or (not re.match(r"[\d.:]+$", str(host)) and str(host).lower().split(".")[0] in known))
 
 
 def select(index: list[dict], sel: dict, spec: dict) -> list[dict]:
@@ -1871,6 +1891,13 @@ def check_system(name: str, log=print) -> dict:
     ctls = system_controls(d)
     maps = load_mappings(d)
     index = current_index(d)
+    inside = in_boundary(spec)
+    inside = (lambda e, test=inside: e["kind"] == "site" or test(e["host"]))   # a person's commands: from here
+    outside = sorted({e["host"] for e in index if not inside(e)})
+    if outside:
+        log(f"not counted: evidence from {', '.join(outside)}, which system.json doesn't name as this system's "
+            "(add it there if it is)")
+    index = [e for e in index if inside(e)]
     cache: dict[str, dict] = {}
 
     def recs_for(sel):
@@ -1946,11 +1973,11 @@ def save_statement(d: Path, verified: dict) -> str | None:
                         "drafted_at": time.strftime("%Y-%m-%d", time.gmtime()), "reviewed_by": None, "reviewed_at": None}
     if not save_control(d, cid, ctl):
         return None
-    cites = sorted({c["evidence"] for cl in verified["claims"] for c in cl.get("cites") or []})
+    cites = sorted({c["evidence"] for cl in verified["claims"] for c in cl.get("cites") or [] if c.get("evidence")})
     cov = verified["coverage"]
     return codex_commit(d, f"{ctl.get('label', cid.upper())}: implementation statement drafted",
-                        f"{cov['evidence']} claims on evidence, {cov['person']} on a person's word, {cov['dropped']} "
-                        "dropped by verify.", [("Control", cid)] + [("Evidence", e) for e in cites],
+                        f"{cov['evidence']} claims on evidence, {cov.get('document', 0)} on the customer's documents, "
+                        f"{cov['person']} on a person's word, {cov['dropped']} dropped by verify.", [("Control", cid)] + [("Evidence", e) for e in cites],
                         paths=[str(control_path(d, cid).relative_to(d))])
 
 
@@ -2055,10 +2082,26 @@ def _norm(text: str) -> str:
 
 def verify_narrative(d: Path, draft: dict) -> dict:
     """Check every citation in a drafted narrative: each claim must cite current evidence whose (hash-checked)
-    content contains the words it quotes. A claim from a person cites who and when instead ({"person": ...}). Claims
-    that don't hold are dropped, with why; the statement is rebuilt from what's left."""
+    content contains the words it quotes, or a document in the codex ({"document": "workbooks/SSP.docx", "quote"}: a
+    Word, Excel or text file, its text containing the quote; its SHA-256 is kept, so a later change to it shows). A
+    claim a person told you cites who and when instead ({"person": ...}). Claims that don't hold are dropped, with
+    why; the statement is rebuilt from what's left."""
     index = {e["id"]: e for e in current_index(d)}
     kept, dropped = [], []
+    docs: dict[str, tuple] = {}
+
+    def document(rel):
+        if rel not in docs:
+            p = (d / rel).resolve()
+            if not p.is_relative_to(d.resolve()) or not p.is_file():
+                docs[rel] = (None, f"no document {rel!r} in the codex")
+            else:
+                try:
+                    text = doc_text(p) if p.suffix.lower() in (".docx", ".xlsx", ".xlsm") else p.read_text(errors="replace")
+                    docs[rel] = (text, hashlib.sha256(p.read_bytes()).hexdigest())
+                except AtoneError as e:
+                    docs[rel] = (None, str(e))
+        return docs[rel]
     for claim in draft.get("claims") or []:
         text, cites = (claim.get("text") or "").strip(), claim.get("cites") or []
         if claim.get("person"):
@@ -2066,6 +2109,16 @@ def verify_narrative(d: Path, draft: dict) -> dict:
             continue
         why = None if cites else "it cites nothing"
         for cite in cites:
+            if cite.get("document") and not cite.get("evidence"):
+                text, sha = document(cite["document"])
+                if text is None:
+                    why = sha
+                    break
+                if not cite.get("quote") or _norm(cite["quote"]) not in _norm(text):
+                    why = f"{cite['document']} doesn't say {clip_text(cite.get('quote') or '(no quote)', 80)!r}"
+                    break
+                cite["sha256"] = sha
+                continue
             e = index.get(cite.get("evidence"))
             if not e:
                 why = (f"{cite.get('evidence')} has been superseded by newer evidence"
@@ -2081,10 +2134,11 @@ def verify_narrative(d: Path, draft: dict) -> dict:
         if why:
             dropped.append({"text": text, "why": why})
         else:
-            kept.append({**claim, "basis": "evidence"})
+            kept.append({**claim, "basis": "evidence" if any(c.get("evidence") for c in cites) else "document"})
     return {"control": draft.get("control"), "statement": " ".join(c["text"].strip() for c in kept),
             "claims": kept, "dropped": dropped, "verified_at": time.time(),
             "coverage": {"evidence": sum(1 for c in kept if c["basis"] == "evidence"),
+                         "document": sum(1 for c in kept if c["basis"] == "document"),
                          "person": sum(1 for c in kept if c["basis"] == "person"), "dropped": len(dropped)}}
 
 
@@ -3949,18 +4003,31 @@ SKILLS = {
   Start from mappings/controls/starter.json; look the control up in the controls lore (its objective says what to check).
   `atone mappings {{system}}` shows what's wrong with any.
 - **Scanner mappings** (mappings/scanners/TOOL.mapping.json): `atone import {{system}} --sample FILE` shows the columns; map
-  host, finding, id, severity (in the customer's words), cve, first_seen, solution.
+  host, finding, id, severity (in the customer's words), cve, first_seen, solution. For example:
+  `{"tool": "vulnscanner", "format": "csv", "match": "vulns-*.csv", "fields": {"host": "Asset Names", "address":
+  "Asset IP Address", "finding": "Vulnerability Title", "id": "Vulnerability ID", "severity": "Severity Level",
+  "cve": "CVE IDs", "first_seen": "First Found", "solution": "Solution"}, "severity": {"critical": ">=9", "high":
+  ">=7", "moderate": ">=4", "low": ">=0"}}` (`severity` maps a numeric score; leave it out if the column is words).
 - **Template mappings** (mappings/workbooks/NAME.mapping.json): `atone workbook inspect FILE`; map the sheet, the header row,
   the columns, and `status_values` (atone's met, partly, not met, inherited, open, closed) to the workbook's own
-  drop-down values, exactly as written there.
+  drop-down values, exactly as written there. For example, an SSP matrix: `{"match": "ssp-*.xlsx", "kind": "ssp",
+  "sheet": "Controls", "header_row": 3, "columns": {"control": "Control ID", "status": "Status", "statement":
+  "Implementation Statement", "evidence": "Evidence"}, "status_values": {"met": "Implemented", "partly": "Partially
+  Implemented", "not met": "Planned", "inherited": "Inherited"}}`; a POA&M (`"kind": "poam"`) maps the columns id,
+  weakness, description, control, severity, detected, due, status, source and asset, and `status_values` open and
+  closed. Columns are named by their header text, exactly.
 - Commit them on a branch (`atone commit {{system}} "..."`) and ask the ISSE to confirm each; mappings are drafts
   until they're merged."""),
     "atone-narratives": ("Write implementation statements as cited claims, and verify them.", """
 1. `atone check {{system}} CONTROL` for its results and the quotes its checks found; `atone evidence {{system}}
    search ...` for more. The controls lore for what the control asks; the customer's examples for their voice.
 2. Write drafts/CONTROL.json: `{"control": "au-11", "claims": [{"text": "...", "cites": [{"evidence": ID, "quote":
-   "the exact words"}]}]}`. One fact per claim; quote words that are really in the evidence. A fact from a person:
-   `{"text": "...", "person": "who, when"}`.
+   "the exact words"}]}]}`. One fact per claim; quote words that are really in the evidence. A fact from the
+   customer's own documents (a policy, the SSP, a workbook's existing text) cites the document:
+   `{"document": "workbooks/SSP.docx", "quote": "the exact words"}`; it's the document's claim, not proof, so say
+   whose it is ("The SSP states..."). A fact a person told you: `{"text": "...", "person": "who, when"}`, only for
+   what they said themselves: never put a document's words in a person's mouth.
+   Evidence counts only from the system's own hosts (system.json): a scan of another host isn't this system's.
 3. `atone verify {{system}} drafts/CONTROL.json`: what holds goes into controls/CONTROL.json, committed, as a draft.
    Dropped claims say why: fix the claim or drop it; never re-word a claim so it says more than its evidence.
    Ask a person to review it (`atone review {{system}} CONTROL --by NAME`; `atone review {{system}}` lists what's
@@ -4241,7 +4308,8 @@ def main(argv: list[str] | None = None) -> int:
                 v = verify_narrative(d, read_json(p))
                 save_statement(d, v)
                 cov = v["coverage"]
-                print(f"{p.name}: {cov['evidence']} claims on evidence, {cov['person']} on a person's word, "
+                print(f"{p.name}: {cov['evidence']} claims on evidence, {cov['document']} on documents, "
+                      f"{cov['person']} on a person's word, "
                       f"{cov['dropped']} dropped" + "".join(f"\n  dropped: {x['text'][:80]} ({x['why']})"
                                                           for x in v["dropped"]))
         elif args.cmd == "mappings":
