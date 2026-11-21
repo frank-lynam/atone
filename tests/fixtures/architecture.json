@@ -1,0 +1,308 @@
+{
+ "spec": {
+  "hosts": [
+   {
+    "name": "web01",
+    "addresses": [
+     "10.0.1.10"
+    ]
+   },
+   {
+    "name": "app01",
+    "addresses": [
+     "10.0.2.20"
+    ]
+   },
+   {
+    "name": "db01",
+    "addresses": [
+     "10.0.3.30"
+    ]
+   }
+  ],
+  "components": [
+   {
+    "name": "web",
+    "hosts": [
+     "web01"
+    ]
+   },
+   {
+    "name": "app",
+    "hosts": [
+     "app01"
+    ]
+   },
+   {
+    "name": "db",
+    "hosts": [
+     "db01"
+    ]
+   }
+  ]
+ },
+ "records": [
+  [
+   "listeners",
+   "web01",
+   "/proc/net (listening)",
+   [
+    {
+     "proto": "tcp",
+     "state": "listen",
+     "local": "0.0.0.0:443",
+     "remote": "0.0.0.0:0",
+     "process": "nginx"
+    },
+    {
+     "proto": "tcp",
+     "state": "listen",
+     "local": "0.0.0.0:22",
+     "remote": "0.0.0.0:0",
+     "process": "sshd"
+    }
+   ]
+  ],
+  [
+   "listeners",
+   "app01",
+   "/proc/net (listening)",
+   [
+    {
+     "proto": "tcp",
+     "state": "listen",
+     "local": "10.0.2.20:9000",
+     "remote": "0.0.0.0:0",
+     "process": "java -jar app.jar"
+    }
+   ]
+  ],
+  [
+   "listeners",
+   "db01",
+   "/proc/net (listening)",
+   [
+    {
+     "proto": "tcp",
+     "state": "listen",
+     "local": "10.0.3.30:1521",
+     "remote": "0.0.0.0:0",
+     "process": "oracle"
+    }
+   ]
+  ],
+  [
+   "flows",
+   "web01",
+   "/proc/net (connected)",
+   [
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.1.10:443",
+     "remote": "34.200.1.7:51515",
+     "process": "nginx"
+    },
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.1.10:40000",
+     "remote": "10.0.2.20:9000",
+     "process": "nginx"
+    }
+   ]
+  ],
+  [
+   "flows",
+   "app01",
+   "/proc/net (connected)",
+   [
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.2.20:9000",
+     "remote": "10.0.1.10:40000",
+     "process": "java"
+    },
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.2.20:41000",
+     "remote": "10.0.3.30:1521",
+     "process": "java"
+    },
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.2.20:42000",
+     "remote": "52.94.0.10:443",
+     "process": "java"
+    }
+   ]
+  ],
+  [
+   "flows",
+   "db01",
+   "/proc/net (connected)",
+   [
+    {
+     "proto": "tcp",
+     "state": "established",
+     "local": "10.0.3.30:1521",
+     "remote": "10.0.2.20:41000",
+     "process": "oracle"
+    }
+   ]
+  ],
+  [
+   "aws",
+   "aws",
+   "ec2 describe-instances",
+   {
+    "Reservations": [
+     {
+      "Instances": [
+       {
+        "InstanceId": "i-web",
+        "PrivateIpAddress": "10.0.1.10",
+        "Tags": [
+         {
+          "Key": "Name",
+          "Value": "web01"
+         }
+        ],
+        "SecurityGroups": [
+         {
+          "GroupId": "sg-web"
+         }
+        ]
+       },
+       {
+        "InstanceId": "i-app",
+        "PrivateIpAddress": "10.0.2.20",
+        "Tags": [
+         {
+          "Key": "Name",
+          "Value": "app01"
+         }
+        ],
+        "SecurityGroups": [
+         {
+          "GroupId": "sg-app"
+         }
+        ]
+       },
+       {
+        "InstanceId": "i-db",
+        "PrivateIpAddress": "10.0.3.30",
+        "Tags": [
+         {
+          "Key": "Name",
+          "Value": "db01"
+         }
+        ],
+        "SecurityGroups": [
+         {
+          "GroupId": "sg-db"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   "aws",
+   "aws",
+   "ec2 describe-security-groups",
+   {
+    "SecurityGroups": [
+     {
+      "GroupId": "sg-web",
+      "GroupName": "web",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 443,
+        "ToPort": 443,
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       },
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 22,
+        "ToPort": 22,
+        "IpRanges": [
+         {
+          "CidrIp": "0.0.0.0/0"
+         }
+        ],
+        "UserIdGroupPairs": []
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-app",
+      "GroupName": "app",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 9000,
+        "ToPort": 9000,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-web"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "GroupId": "sg-db",
+      "GroupName": "db",
+      "IpPermissions": [
+       {
+        "IpProtocol": "tcp",
+        "FromPort": 1521,
+        "ToPort": 1521,
+        "IpRanges": [],
+        "UserIdGroupPairs": [
+         {
+          "GroupId": "sg-app"
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ ],
+ "documented": [
+  {
+   "from": "internet",
+   "to": "web",
+   "port": "tcp/443",
+   "data": "public",
+   "about": "users reach the site"
+  },
+  {
+   "from": "web",
+   "to": "app",
+   "port": "tcp/9000",
+   "data": "requests"
+  },
+  {
+   "from": "db",
+   "to": "backup.example.internal",
+   "port": "tcp/443",
+   "data": "backups"
+  }
+ ]
+}

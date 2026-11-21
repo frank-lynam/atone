@@ -16,6 +16,7 @@ this pack) drafts, by running the toolkit and reading what it says. See DESIGN.m
     atone verify SYSTEM [DRAFT]...   a drafted narrative's citations, each checked against the evidence it quotes
     atone workbook inspect FILE   a workbook's sheets, headers and drop-downs: for drafting its template mapping
     atone fill SYSTEM --out DIR   copies of the working documents, filled in, with what changed and why
+    atone draw SYSTEM --out DIR   the architecture as it is: actual, allowed and documented paths (draw.io, SVG)
     atone controls fetch          NIST's OSCAL catalog and baselines (recorded with their hashes)
     atone controls SYSTEM [list | show ID]   the system's controls: its baseline, tailored
     atone controls lore [--out FILE]   the catalog as a lore, compiled word for word (no model)
@@ -59,6 +60,7 @@ __version__ = "0.1.0"
 #   system        a system's folder: spec, tailoring, site file; collecting and importing into it
 #   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
 #   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed
+#   architecture  one graph of actual, allowed and documented paths; draw.io and SVG, with what differs
 #   command line  argument parsing, main
 
 
@@ -1804,6 +1806,414 @@ def fill_workbooks(name: str, out: Path, files: list[str] | None = None, log=pri
     return reports
 
 
+# ---- architecture: one graph of actual, allowed and documented paths; drawn as draw.io and SVG, with what differs
+
+EDGE_CLASSES = {
+    "normal": "seen, and allowed or documented",
+    "unused": "allowed but never seen: unused attack surface (tighten the rule)",
+    "undocumented": "seen but not documented: the SSP is out of date, or something is talking that shouldn't be",
+    "not allowed": "seen, but no rule we can see allows it (a rule we can't see, or a gap in the evidence)",
+    "documented only": "documented but not seen in the evidence",
+}
+
+
+def _json_content(d: Path, e: dict):
+    rec = load_record(d, e) or {}
+    try:
+        return json.loads(rec.get("content") or "null")
+    except json.JSONDecodeError:
+        return None
+
+
+def _port_text(proto: str, lo, hi) -> str:
+    if proto in ("-1", "all", None) or lo in (None, -1):
+        return "all"
+    return f"{proto}/{lo}" if lo == hi else f"{proto}/{lo}-{hi}"
+
+
+def _port_in(port_text: str, proto: str, port: int) -> bool:
+    if port_text == "all":
+        return True
+    p, _, rng = port_text.partition("/")
+    lo, _, hi = rng.partition("-")
+    return p == proto and int(lo) <= port <= int(hi or lo)
+
+
+def build_graph(name: str) -> dict:
+    """Nodes (hosts, and what's outside: the internet, address ranges, peers) and edges, each edge with the layers it
+    appears in (actual, allowed, documented) and its class (EDGE_CLASSES). Inside the boundary: the spec's hosts and
+    every host evidence was collected from."""
+    import ipaddress
+    d = system_dir(name)
+    spec = read_json(d / "system.json", {})
+    documented = read_json(d / "documented.json", []) or []
+    index = current_index(d)
+    nodes, addr, comp_of = {}, {}, {}
+
+    def node(nid, label=None, kind="host", inside=None, component=None):
+        n = nodes.setdefault(nid, {"id": nid, "label": label or nid, "kind": kind, "inside": bool(inside),
+                                   "component": component, "addresses": []})
+        if inside:
+            n["inside"] = True
+        if component and not n["component"]:
+            n["component"] = component
+        return n
+
+    for c in spec.get("components") or []:
+        for h in c.get("hosts") or []:
+            comp_of.setdefault(h, c.get("name"))
+    for h in spec.get("hosts") or []:
+        hn = h if isinstance(h, str) else h.get("name")
+        n = node(hn, inside=True, component=comp_of.get(hn))
+        for a in ([] if isinstance(h, str) else h.get("addresses") or []):
+            addr[a] = hn
+            n["addresses"].append(a)
+    listening = {}                                        # host -> {(proto, port)}
+    for e in index:
+        if e["kind"] == "listeners":
+            node(e["host"], inside=True, component=comp_of.get(e["host"]))
+            for r in _json_content(d, e) or []:
+                ip, _, port = r["local"].rpartition(":")
+                listening.setdefault(e["host"], set()).add((r["proto"], int(port)))
+                if ip not in ("0.0.0.0", "::", "127.0.0.1", "::1") and not ip.startswith("127."):
+                    addr.setdefault(ip, e["host"])
+                    if ip not in nodes[e["host"]]["addresses"]:
+                        nodes[e["host"]]["addresses"].append(ip)
+    groups = {}
+    instances = []                                        # (host node, [sg ids])
+    for e in index:
+        if e["kind"] != "aws":
+            continue
+        data = _json_content(d, e) or {}
+        if not isinstance(data, dict):
+            continue
+        for sg in data.get("SecurityGroups") or []:
+            if "IpPermissions" in sg:
+                groups[sg["GroupId"]] = sg
+        for res in data.get("Reservations") or []:
+            for inst in res.get("Instances") or []:
+                tags = {t.get("Key"): t.get("Value") for t in inst.get("Tags") or []}
+                ip = inst.get("PrivateIpAddress")
+                hn = addr.get(ip) or tags.get("Name") or inst.get("InstanceId")
+                n = node(hn, inside=True, component=comp_of.get(hn))
+                if ip:
+                    addr.setdefault(ip, hn)
+                    if ip not in n["addresses"]:
+                        n["addresses"].append(ip)
+                instances.append((hn, [g.get("GroupId") for g in inst.get("SecurityGroups") or []]))
+    members = {}
+    for hn, sgs in instances:
+        for g in sgs:
+            members.setdefault(g, []).append(hn)
+    edges = {}
+
+    def edge(src, dst, port, layer, **extra):
+        e = edges.setdefault((src, dst, port), {"from": src, "to": dst, "port": port, "layers": [], "evidence": []})
+        if layer not in e["layers"]:
+            e["layers"].append(layer)
+        for k, v in extra.items():
+            if k == "evidence":
+                if v not in e["evidence"]:
+                    e["evidence"].append(v)
+            else:
+                e.setdefault(k, v)
+
+    def peer(ip: str) -> str:
+        if ip in addr:
+            return addr[ip]
+        try:
+            private = ipaddress.ip_address(ip).is_private
+        except ValueError:
+            private = False
+        return node(ip, label=ip, kind="peer" if private else "internet-peer", inside=False)["id"]
+
+    # allowed: each instance's security groups' ingress rules
+    for hn, sgs in instances:
+        for g in sgs:
+            for perm in (groups.get(g) or {}).get("IpPermissions") or []:
+                port = _port_text(perm.get("IpProtocol"), perm.get("FromPort"), perm.get("ToPort"))
+                for r in perm.get("IpRanges") or []:
+                    cidr = r.get("CidrIp")
+                    src = "internet" if cidr == "0.0.0.0/0" else cidr
+                    node(src, label="the internet" if src == "internet" else cidr, kind="internet" if src == "internet"
+                         else "range", inside=False)
+                    edge(src, hn, port, "allowed", rule=f"{g} ({(groups.get(g) or {}).get('GroupName', '')})")
+                for pair in perm.get("UserIdGroupPairs") or []:
+                    for src in members.get(pair.get("GroupId"), []):
+                        if src != hn:
+                            edge(src, hn, port, "allowed", rule=f"{g} from {pair.get('GroupId')}")
+    # actual: connections seen (inbound to a listening port, else outbound)
+    for e in index:
+        if e["kind"] != "flows":
+            continue
+        for r in _json_content(d, e) or []:
+            lip, _, lport = r["local"].rpartition(":")
+            rip, _, rport = r["remote"].rpartition(":")
+            if rip.startswith("127.") or rip in ("::1", "0.0.0.0") or not rport:
+                continue
+            proto = r.get("proto", "tcp")
+            if (proto, int(lport)) in listening.get(e["host"], set()):
+                edge(peer(rip), e["host"], f"{proto}/{lport}", "actual", process=r.get("process"), evidence=e["id"])
+            else:
+                edge(e["host"], peer(rip), f"{proto}/{rport}", "actual", process=r.get("process"), evidence=e["id"])
+    # documented: the flows the SSP describes (documented.json, reviewed by a person)
+    hosts_of = {c.get("name"): c.get("hosts") or [] for c in spec.get("components") or []}
+    for f in documented:                                # a component stands for each of its hosts
+        for src in hosts_of.get(f.get("from")) or [f.get("from")]:
+            for dst in hosts_of.get(f.get("to")) or [f.get("to")]:
+                for n in (src, dst):
+                    if n not in nodes:
+                        node(n, label="the internet" if n == "internet" else n,
+                             kind="internet" if n == "internet" else "host", inside=n in comp_of)
+                edge(src, dst, f.get("port") or "all", "documented", data=f.get("data"), about=f.get("about"))
+    # classify: an actual edge matches allowed/documented ones whose port covers it and whose source covers its source
+    allowed = [e for e in edges.values() if "allowed" in e["layers"]]
+
+    def covered(e, among):
+        proto, _, p = e["port"].partition("/")
+        for a in among:
+            if a["to"] != e["to"] or not (a["port"] == "all" or (p.isdigit() and _port_in(a["port"], proto, int(p)))):
+                continue
+            if a["from"] == e["from"] or a["from"] == "internet":
+                return True
+            try:
+                if any(ipaddress.ip_address(x) in ipaddress.ip_network(a["from"], strict=False)
+                       for x in ([e["from"]] if nodes[e["from"]]["kind"] != "host" else nodes[e["from"]]["addresses"])):
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    docs = [e for e in edges.values() if "documented" in e["layers"]]
+    for e in edges.values():
+        L = e["layers"]
+        if "actual" in L:
+            e["allowed_by_rule"] = "allowed" in L or covered(e, allowed)
+            e["documented"] = "documented" in L or covered(e, docs)
+            e["class"] = ("undocumented" if documented and not e["documented"] else
+                          "not allowed" if instances and not e["allowed_by_rule"] and nodes[e["to"]]["inside"] and
+                          not nodes[e["from"]]["inside"] else "normal")
+        elif "allowed" in L:
+            seen = any("actual" in x["layers"] and x["to"] == e["to"] and covered(x, [e]) for x in edges.values())
+            e["class"] = "normal" if seen else "unused"
+        else:
+            e["class"] = "documented only"
+    out = {"system": name, "at": time.time(), "nodes": list(nodes.values()),
+           "edges": sorted(edges.values(), key=lambda e: (e["from"], e["to"], e["port"])),
+           "counts": {k: sum(1 for e in edges.values() if e["class"] == k) for k in EDGE_CLASSES},
+           "crossing": [f"{e['from']} -> {e['to']} {e['port']}" for e in edges.values()
+                        if nodes[e["from"]]["inside"] != nodes[e["to"]]["inside"]]}
+    return out
+
+
+def layout(graph: dict) -> dict[str, tuple[int, int]]:
+    """Positions by tier: outside first, then each component in order of its distance from outside, hosts stacked."""
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    depth = {nid: 0 for nid, n in nodes.items() if not n["inside"]}
+    changed = True
+    while changed:
+        changed = False
+        for e in graph["edges"]:
+            if e["from"] in depth and e["to"] not in depth and nodes[e["to"]]["inside"]:
+                depth[e["to"]] = depth[e["from"]] + 1
+                changed = True
+    for nid, n in nodes.items():
+        depth.setdefault(nid, 1)
+    comp_depth = {}
+    for nid, n in nodes.items():
+        if n["inside"]:
+            comp = n["component"] or nid
+            comp_depth[comp] = max(comp_depth.get(comp, 0), depth[nid])
+    last = max(comp_depth.values() or [1]) + 1
+    sources = {e["from"] for e in graph["edges"]}
+    cols: dict[int, list] = {}
+    for nid, n in nodes.items():                     # outside: what reaches in on the left, what's reached out to on the right
+        col = (0 if nid in sources else last) if not n["inside"] else comp_depth.get(n["component"] or nid, depth[nid]) or 1
+        cols.setdefault(col, []).append(nid)
+    pos = {}
+    for col, ids in sorted(cols.items()):
+        for i, nid in enumerate(sorted(ids, key=lambda x: (nodes[x]["component"] or "", x))):
+            pos[nid] = (60 + col * 260, 80 + i * 110)
+    return pos
+
+
+EDGE_STYLE = {"normal": ("#333333", ""), "unused": ("#888888", "dashed=1;"), "undocumented": ("#d62728", "strokeWidth=2;"),
+              "not allowed": ("#ff7f0e", "strokeWidth=2;"), "documented only": ("#1f77b4", "dashed=1;dashPattern=1 4;")}
+
+
+def edge_ends(pos: dict, e: dict, k: int, n: int) -> tuple[float, float, float, float]:
+    """Where an edge leaves and arrives: the sides facing each other, parallel edges (same two ends) spread apart."""
+    (x1, y1), (x2, y2) = pos[e["from"]], pos[e["to"]]
+    off = (k - (n - 1) / 2) * 16
+    if x2 > x1:
+        return x1 + 180, y1 + 35 + off, x2, y2 + 35 + off
+    if x2 < x1:
+        return x1, y1 + 35 + off, x2 + 180, y2 + 35 + off
+    return x1 + 90 + off, (y1 + 70 if y2 > y1 else y1), x2 + 90 + off, (y2 if y2 > y1 else y2 + 70)
+
+
+def detour(pos: dict, e: dict, k: int) -> list[tuple[float, float]]:
+    """Waypoints for an edge that would pass through boxes on its way (it skips a column, or runs along one): below
+    the boxes it passes, so it never crosses one. [] when the straight line is clear."""
+    (x1, y1), (x2, y2) = pos[e["from"]], pos[e["to"]]
+    lo, hi = sorted((x1, x2))
+    between = [(x, y) for nid, (x, y) in pos.items() if lo < x < hi and nid not in (e["from"], e["to"])]
+    if abs(x2 - x1) <= 260 or not between:
+        return []
+    below = max([y for _, y in between] + [y1, y2]) + 90 + k * 12
+    ax = x1 + 180 + 20 if x2 > x1 else x1 - 20
+    bx = x2 - 20 if x2 > x1 else x2 + 180 + 20
+    return [(ax, below), (bx, below)]
+
+
+def parallel(edges: list[dict]) -> list[tuple[int, int]]:
+    """(index among edges with the same two ends, how many there are) for each edge."""
+    groups: dict[tuple, list] = {}
+    for i, e in enumerate(edges):
+        groups.setdefault(tuple(sorted((e["from"], e["to"]))), []).append(i)
+    out = [(0, 1)] * len(edges)
+    for ids in groups.values():
+        for k, i in enumerate(ids):
+            out[i] = (k, len(ids))
+    return out
+
+
+def _x(s) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def drawio(graph: dict, title: str) -> str:
+    """The graph as a draw.io file: the authorization boundary as a container, hosts inside it by tier, what's outside
+    to its left, each path styled by its class (legend included). Editable: it's the engineers' to move about."""
+    pos = layout(graph)
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    cells, ids = [], {}
+    inside = [n for n in graph["nodes"] if n["inside"]]
+    if inside:
+        xs = [pos[n["id"]][0] for n in inside]
+        ys = [pos[n["id"]][1] for n in inside]
+        bx, by = min(xs) - 40, min(ys) - 50
+        cells.append(f'<mxCell id="boundary" value="{_x(title)}: authorization boundary" style="rounded=1;dashed=1;'
+                     f'fillColor=none;strokeColor=#2ca02c;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=8;" '
+                     f'vertex="1" parent="1"><mxGeometry x="{bx}" y="{by}" width="{max(xs) - bx + 220}" '
+                     f'height="{max(ys) - by + 110}" as="geometry"/></mxCell>')
+    for i, (nid, n) in enumerate(nodes.items()):
+        ids[nid] = f"n{i}"
+        x, y = pos[nid]
+        label = n["label"] + (f"<br><i>{_x(n['component'])}</i>" if n["component"] else "") + (
+            "<br>" + _x(", ".join(n["addresses"][:3])) if n["addresses"] else "")
+        style = ("ellipse;fillColor=#fdecea;strokeColor=#d62728;" if n["kind"] in ("internet", "internet-peer") else
+                 "rounded=1;fillColor=#f5f5f5;strokeColor=#666666;" if not n["inside"] else
+                 "rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;")
+        cells.append(f'<mxCell id="{ids[nid]}" value="{_x(label)}" style="{style}whiteSpace=wrap;html=1;" vertex="1" '
+                     f'parent="1"><mxGeometry x="{x}" y="{y}" width="180" height="70" as="geometry"/></mxCell>')
+    for i, (e, (k, n)) in enumerate(zip(graph["edges"], parallel(graph["edges"]))):
+        color, extra = EDGE_STYLE[e["class"]]
+        y = round(0.5 + (k - (n - 1) / 2) * 0.25, 2)            # parallel edges leave and arrive apart
+        sides = (f"exitX=1;exitY={y};entryX=0;entryY={y};" if pos[e["to"]][0] > pos[e["from"]][0] else
+                 f"exitX=0;exitY={y};entryX=1;entryY={y};" if pos[e["to"]][0] < pos[e["from"]][0] else "")
+        way = detour(pos, e, k)
+        points = ('<Array as="points">' + "".join(f'<mxPoint x="{x}" y="{y}"/>' for x, y in way) + "</Array>") if way else ""
+        if way:
+            sides = "exitX=0.5;exitY=1;entryX=0.5;entryY=1;"
+        cells.append(f'<mxCell id="e{i}" value="{_x(e["port"])}" style="endArrow=block;html=1;strokeColor={color};'
+                     f'fontColor={color};labelBackgroundColor=#ffffff;{sides}{extra}" edge="1" parent="1" '
+                     f'source="{ids[e["from"]]}" target="{ids[e["to"]]}"><mxGeometry relative="1" as="geometry">'
+                     f'{points}</mxGeometry></mxCell>')
+    ly = 80 + max([p[1] for p in pos.values()] or [0]) + 200
+    for i, (cls, about) in enumerate(EDGE_CLASSES.items()):
+        color, extra = EDGE_STYLE[cls]
+        y = ly + i * 30
+        cells.append(f'<mxCell id="l{i}" value="" style="endArrow=block;html=1;strokeColor={color};{extra}" edge="1" '
+                     f'parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="60" y="{y}" as="sourcePoint"/>'
+                     f'<mxPoint x="120" y="{y}" as="targetPoint"/></mxGeometry></mxCell>')
+        cells.append(f'<mxCell id="lt{i}" value="{_x(cls)}: {_x(about)}" style="text;html=1;align=left;" vertex="1" '
+                     f'parent="1"><mxGeometry x="130" y="{y - 12}" width="700" height="24" as="geometry"/></mxCell>')
+    return ('<mxfile host="atone" agent="atone ' + __version__ + '"><diagram name="' + _x(title) + '" id="network">'
+            '<mxGraphModel grid="1" gridSize="10"><root><mxCell id="0"/><mxCell id="1" parent="0"/>'
+            + "".join(cells) + "</root></mxGraphModel></diagram></mxfile>\n")
+
+
+def svg(graph: dict, title: str) -> str:
+    """The same picture as an SVG, to look at anywhere (the report shows it)."""
+    pos = layout(graph)
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    w = max([p[0] for p in pos.values()] or [0]) + 260
+    h = max([p[1] for p in pos.values()] or [0]) + 200 + 30 * len(EDGE_CLASSES) + 40
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" font-family="sans-serif" font-size="12">',
+           '<defs>' + "".join(f'<marker id="a{i}" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">'
+                              f'<path d="M0,0 L10,4 L0,8 z" fill="{EDGE_STYLE[c][0]}"/></marker>'
+                              for i, c in enumerate(EDGE_CLASSES)) + '</defs>',
+           f'<text x="20" y="30" font-size="16" font-weight="bold">{_x(title)}</text>']
+    cls_i = {c: i for i, c in enumerate(EDGE_CLASSES)}
+    inside = [pos[n["id"]] for n in graph["nodes"] if n["inside"]]
+    if inside:
+        bx, by = min(p[0] for p in inside) - 30, min(p[1] for p in inside) - 30
+        out.append(f'<rect x="{bx}" y="{by}" width="{max(p[0] for p in inside) - bx + 210}" height="'
+                   f'{max(p[1] for p in inside) - by + 100}" rx="12" fill="none" stroke="#2ca02c" stroke-width="2" '
+                   f'stroke-dasharray="8 4"/>')
+    for e, (k, n) in zip(graph["edges"], parallel(graph["edges"])):
+        way = detour(pos, e, k)
+        if way:                                   # down out of the box, along below the others, up into the target
+            (fx, fy), (tx, ty) = pos[e["from"]], pos[e["to"]]
+            pts = [(fx + 90, fy + 70), (fx + 90, way[0][1]), (tx + 90, way[1][1]), (tx + 90, ty + 70)]
+        else:
+            x1, y1, x2, y2 = edge_ends(pos, e, k, n)
+            pts = [(x1, y1), (x2, y2)]
+        color, extra = EDGE_STYLE[e["class"]]
+        dash = ' stroke-dasharray="6 4"' if "dashed" in extra else ""
+        out.append(f'<polyline points="{" ".join(f"{x},{y}" for x, y in pts)}" fill="none" stroke="{color}" '
+                   f'stroke-width="1.5"{dash} marker-end="url(#a{cls_i[e["class"]]})"/>')
+        mx, my = ((pts[1][0] + pts[2][0]) / 2, pts[1][1]) if len(pts) > 2 else ((pts[0][0] + pts[1][0]) / 2,
+                                                                               (pts[0][1] + pts[1][1]) / 2)
+        out.append(f'<text x="{mx}" y="{my - 4}" fill="{color}" text-anchor="middle" '
+                   f'paint-order="stroke" stroke="#ffffff" stroke-width="3">{_x(e["port"])}</text>')
+    for nid, n in nodes.items():
+        x, y = pos[nid]
+        fill, stroke = (("#fdecea", "#d62728") if n["kind"] in ("internet", "internet-peer") else
+                        ("#f5f5f5", "#666666") if not n["inside"] else ("#dae8fc", "#6c8ebf"))
+        out.append(f'<rect x="{x}" y="{y}" width="180" height="70" rx="8" fill="{fill}" stroke="{stroke}"/>')
+        lines = [n["label"]] + ([n["component"]] if n["component"] else []) + ([", ".join(n["addresses"][:2])]
+                                                                             if n["addresses"] else [])
+        for j, line in enumerate(lines[:3]):
+            out.append(f'<text x="{x + 90}" y="{y + 22 + j * 16}" text-anchor="middle"'
+                       f'{" font-style=" + chr(34) + "italic" + chr(34) if j == 1 and n["component"] else ""}>'
+                       f'{_x(clip_text(line, 28))}</text>')
+    ly = max([p[1] for p in pos.values()] or [0]) + 200
+    for i, (c, about) in enumerate(EDGE_CLASSES.items()):
+        color, extra = EDGE_STYLE[c]
+        dash = ' stroke-dasharray="6 4"' if "dashed" in extra else ""
+        out.append(f'<line x1="20" y1="{ly + i * 30}" x2="70" y2="{ly + i * 30}" stroke="{color}" stroke-width="1.5"{dash}/>'
+                   f'<text x="80" y="{ly + i * 30 + 4}">{_x(c)}: {_x(about)}</text>')
+    out.append("</svg>\n")
+    return "\n".join(out)
+
+
+def draw_system(name: str, out: Path, log=print) -> dict:
+    """The architecture: graph.json, network.drawio and network.svg in `out`, and what changed since the last
+    drawing (paths added, gone, or changed class) in graph.changes.json."""
+    d = system_dir(name)
+    g = build_graph(name)
+    out.mkdir(parents=True, exist_ok=True)
+    prev = read_json(d / "runs" / "graph-latest.json", None)
+    key = lambda e: f"{e['from']} -> {e['to']} {e['port']}"
+    changes = {}
+    if prev:
+        old = {key(e): e["class"] for e in prev.get("edges") or []}
+        new = {key(e): e["class"] for e in g["edges"]}
+        changes = {"added": sorted(k for k in new if k not in old), "gone": sorted(k for k in old if k not in new),
+                   "changed": sorted(f"{k}: {old[k]} -> {new[k]}" for k in new if k in old and old[k] != new[k])}
+    title = f"{name}: network"
+    (out / "network.drawio").write_text(drawio(g, title))
+    (out / "network.svg").write_text(svg(g, title))
+    write_json(out / "graph.json", g)
+    write_json(out / "graph.changes.json", changes)
+    write_json(d / "runs" / "graph-latest.json", g)
+    log(f"{len(g['nodes'])} nodes, {len(g['edges'])} paths: " + ", ".join(f"{v} {k}" for k, v in g["counts"].items() if v)
+        + f" -> {out / 'network.drawio'}")
+    return g
+
+
 # ---- command line: argument parsing, main
 
 def cmd_evidence(args) -> str:
@@ -1891,6 +2301,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: the system's workbooks/*.xlsx")
     p.add_argument("--out", required=True, help="the folder for the filled copies and their change reports")
+    p = sub.add_parser("draw", help="the architecture: actual, allowed and documented paths, as draw.io and SVG")
+    p.add_argument("system")
+    p.add_argument("--out", required=True)
     p = sub.add_parser("evidence", help="the current evidence (or --run's): list, show ID, search WORDS")
     p.add_argument("system")
     p.add_argument("what", nargs="?", choices=["list", "show", "search"])
@@ -1964,6 +2377,8 @@ def main(argv: list[str] | None = None) -> int:
             print(inspect_workbook(Path(args.file)))
         elif args.cmd == "fill":
             fill_workbooks(args.system, Path(args.out), args.files)
+        elif args.cmd == "draw":
+            draw_system(args.system, Path(args.out))
         elif args.cmd == "evidence":
             print(cmd_evidence(args))
         elif args.cmd == "controls":

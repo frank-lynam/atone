@@ -369,6 +369,52 @@ class Workbooks(unittest.TestCase):
         self.assertIn("Compliant", str(e.exception))
 
 
+class Architecture(unittest.TestCase):
+    """Actual (connections seen), allowed (security groups) and documented (the SSP's flows), and what differs."""
+
+    @classmethod
+    def setUpClass(cls):
+        fx = json.loads((FIX / "architecture.json").read_text())
+        cls.d = atone.init_system("arch", None)
+        atone.write_json(cls.d / "system.json", fx["spec"])
+        atone.write_json(cls.d / "documented.json", fx["documented"])
+        atone.save_records(cls.d, [atone.make_record("arch", k, h, src, c) for k, h, src, c in fx["records"]])
+        cls.out = Path(tempfile.mkdtemp())
+        cls.g = atone.draw_system("arch", cls.out, log=lambda *a: None)
+        cls.edges = {(e["from"], e["to"], e["port"]): e["class"] for e in cls.g["edges"]}
+
+    def test_each_path_is_classed_by_what_the_three_layers_say(self):
+        self.assertEqual(self.edges[("internet", "web01", "tcp/443")], "normal")
+        self.assertEqual(self.edges[("web01", "app01", "tcp/9000")], "normal")           # all three agree
+        self.assertEqual(self.edges[("internet", "web01", "tcp/22")], "unused")           # open, never used
+        self.assertEqual(self.edges[("app01", "db01", "tcp/1521")], "undocumented")       # allowed, used, not in the SSP
+        self.assertEqual(self.edges[("app01", "52.94.0.10", "tcp/443")], "undocumented")
+        self.assertEqual(self.edges[("db01", "backup.example.internal", "tcp/443")], "documented only")
+        self.assertEqual(self.edges[("34.200.1.7", "web01", "tcp/443")], "normal")         # covered by 0.0.0.0/0
+
+    def test_the_boundary_and_what_crosses_it(self):
+        inside = {n["id"] for n in self.g["nodes"] if n["inside"]}
+        self.assertEqual(inside, {"web01", "app01", "db01"})
+        self.assertIn("app01 -> 52.94.0.10 tcp/443", self.g["crossing"])
+
+    def test_drawio_and_svg_are_well_formed_and_say_what_they_show(self):
+        import xml.etree.ElementTree as ET
+        model = ET.parse(self.out / "network.drawio").getroot()
+        cells = model.findall(".//mxCell")
+        self.assertTrue(any(c.get("id") == "boundary" for c in cells))
+        self.assertEqual(sum(1 for c in cells if c.get("edge") == "1" and c.get("source")), len(self.g["edges"]))
+        self.assertTrue(any("dashed=1" in (c.get("style") or "") for c in cells if c.get("source")))
+        ET.parse(self.out / "network.svg")
+
+    def test_what_changed_since_the_last_drawing(self):
+        atone.write_json(self.d / "documented.json", json.loads((FIX / "architecture.json").read_text())["documented"]
+                         + [{"from": "app", "to": "db", "port": "tcp/1521"}])
+        out = Path(tempfile.mkdtemp())
+        atone.draw_system("arch", out, log=lambda *a: None)
+        ch = atone.read_json(out / "graph.changes.json")
+        self.assertIn("app01 -> db01 tcp/1521: undocumented -> normal", ch["changed"])
+
+
 class CommandLine(unittest.TestCase):
     def test_init_collect_and_look_at_the_evidence(self):
         code, out = run("init", "cli")
