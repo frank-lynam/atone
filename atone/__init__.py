@@ -3895,9 +3895,7 @@ def load_attack(d: Path) -> dict:
     risks = {}
     for f in sorted((d / "risks").glob("*.json")) if (d / "risks").is_dir() else []:
         r = {**read_json(f, {}), "_file": str(f.relative_to(d))}
-        if "closes" not in r:              # the POA&M's items live in poam/; risks/ is the lock-downs
-            continue
-        r.setdefault("id", f.stem)
+        r.setdefault("id", f.stem)         # every file here is a lock-down (the POA&M's items live in poam/)
         problems += [f"risk {r['id']}: {x}" for x in format_problems(RISK_FORMAT, r)]
         problems += [f"risk {r['id']}: closes {sid!r}, which isn't a step" for sid in r.get("closes") or [] if sid not in steps]
         risks[r["id"]] = r
@@ -3915,8 +3913,13 @@ def apply_risks(d: Path, g: dict) -> dict:
     index = [e for e in current_index(d) if e["kind"] == "site" or inside(e["host"])]
     for r in g["risks"].values():
         chk = r.get("check") or {}
-        if not chk.get("evidence"):
+        if not isinstance(chk, dict) or not chk.get("evidence"):
             r["status"] = "no check"
+            continue
+        if not isinstance(chk["evidence"], dict) or chk.get("type") not in CHECK_TYPES:
+            r["status"] = "bad check"
+            g["problems"].append(f"risk {r['id']}: its check isn't one atone can run (it needs \"evidence\": {{kind, "
+                                 f"source...}} and a \"type\" from {', '.join(CHECK_TYPES)}: atone attack --example risk)")
             continue
         recs = [x for x in (load_record(d, e) for e in select(index, chk["evidence"], spec)) if x]
         res = run_check({**chk, "id": r["id"], "evidence": None}, recs, "attack", {})
@@ -4229,12 +4232,18 @@ def attack_command(args) -> str:
         raise AtoneError("atone attack SYSTEM (or technique ID, search WORDS, lore, defaults, --example KIND)")
     d = system_dir(what)
     harden = {}
-    for pair in filter(None, (args.harden or "").split(",")):
+    for pair in filter(None, ",".join(args.harden).split(",")):
         sid, _, level = pair.partition("=")
         if level not in EFFORT_LEVELS:
             raise AtoneError(f"--harden {pair}: the level is one of {', '.join(EFFORT_LEVELS)}")
         harden[sid.strip()] = level
-    close = [x.strip() for x in (args.close or "").split(",") if x.strip()]
+    close = [x.strip() for x in ",".join(args.close).split(",") if x.strip()]
+    lockdowns = {r.get("id", p.stem): r for p in sorted((d / "risks").glob("*.json")) if (d / "risks").is_dir()
+                 for r in [read_json(p, {})] if isinstance(r, dict) and "closes" in r}
+    close = [s for x in close for s in (lockdowns[x].get("closes") or [] if x in lockdowns else [x])]
+    unknown = [x for x in close if x not in {p.stem for p in (d / "attack" / "steps").glob("*.json")}]
+    if unknown:
+        raise AtoneError(f"--close {', '.join(unknown)}: not a step, nor a lock-down that names its steps in \"closes\"")
     a = analyse_attack(d, close, harden)
     if not close and not harden:             # the real state, for the plan and the report (a what-if isn't)
         write_json(d / "runs" / "attack.json", {k: v for k, v in a.items() if k != "graph"})
@@ -4803,24 +4812,28 @@ evidence allows; not to check boxes.
      logs are blind; what each cloud role can actually reach; how a deploy could be tampered with.
    `atone attack defaults` says what each kind of cloud component exposes until the evidence says otherwise; the
    attacker library (`atone attack search WORDS`, `atone attack technique ID`, its lore) knows the techniques.
-4. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
+4. **Look for what stops each step, as hard as you look for the step.** An attacker's way in usually meets
+   something: a firewall rule, a permission, an IAM policy, MFA, a bind address, an SSH setting. Find it in the
+   evidence and record it: a *blocked* step beside the open one, naming its control. A graph with no controls in it
+   says the system has none, which is rarely true and helps nobody decide where a second layer belongs.
+5. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
    checks the quotes. A step with no evidence is *assumed*: write it anyway (it counts as commodity, and atone flags
    it), and go find out. Only cite a control as *blocked* when the evidence shows it: an unproven control is no
    control. Name the control on each blocked step (`"control": "iam:app-role-policy"`): one control blocking many
    steps is one control, and that's what tells you where you're leaning on it. Note what would detect each step, and
    only what really would.
-5. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
+6. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
    beyond its targets or its depth.
-6. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
+7. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
    cheapest way in, the controls in the way, the fewest lock-downs that cut every path, the paths that rest on one
    control, and what nothing detects. Try what-ifs (`--close STEP`, `--harden STEP=hard`) before you propose.
    `--controls` says how much each control carries (the attack paths it gates) and what its failing would open: a
    control that many paths lean on, with nothing behind it, needs a second layer even though it holds today.
-7. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
+8. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
    proves it's in place (as in a control mapping), so atone keeps checking it. Lead with the cut: the few changes
    that close the most. Commit on a branch, and tell your people what each buys ("closing these two cuts every path
    from a phished user to the payroll data").
-8. **Keep going** until a full pass finds nothing new and the analysis says the bar is met (or every open pair is a
+9. **Keep going** until a full pass finds nothing new and the analysis says the bar is met (or every open pair is a
    risk a person accepted: `atone decide {{system}} risk-acceptance "why" --item RISK --by NAME`). Then ask a person
    to confirm atonement: `atone decide {{system}} atonement "why" --by NAME`. Only then start on the documents."""),
     "atone-become-expert": ("Build the lores you need to be the expert for a system: NIST's controls exactly, public "
@@ -5052,8 +5065,10 @@ def parser() -> argparse.ArgumentParser:
                                       "WORDS, lore, defaults")
     p.add_argument("target", nargs="?", help="a system, or: technique ID | search WORDS | lore | defaults")
     p.add_argument("rest", nargs="*")
-    p.add_argument("--close", help="what if these steps were blocked (comma-separated step ids)")
-    p.add_argument("--harden", help="what if these steps were harder: STEP=LEVEL,... (free, commodity, hard)")
+    p.add_argument("--close", action="append", default=[], help="what if these steps were blocked: step ids, or a "
+                   "lock-down's id (the steps it closes); comma-separated or repeated")
+    p.add_argument("--harden", action="append", default=[], help="what if these steps were harder: STEP=LEVEL "
+                   "(free, commodity, hard); comma-separated or repeated")
     p.add_argument("--paths", type=int, default=0, metavar="N", help="list up to N attack paths for each")
     p.add_argument("--controls", action="store_true", help="how much each control carries, and what its failing would do")
     p.add_argument("--example", nargs="?", const="", metavar="KIND",

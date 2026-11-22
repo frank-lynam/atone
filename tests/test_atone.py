@@ -824,6 +824,15 @@ class Atonement(unittest.TestCase):
         self.assertIn("gates 2 attack paths across 1 profile-to-effect pair", text)
         self.assertIn("a single point of failure: add a layer here", text)
 
+    def test_a_misspelt_lock_down_or_a_check_atone_cant_run_is_reported_not_ignored(self):
+        d = self.system("atone5")
+        atone.write_json(d / "risks" / "typo.json", {"id": "typo", "steps_closed": ["imds"], "change": "x"})
+        atone.write_json(d / "risks" / "badcheck.json", {"id": "badcheck", "closes": ["imds"], "change": "x",
+                                                         "check": {"evidence": "file.*", "expect": "mode 600"}})
+        probs = atone.analyse_attack(d)["problems"]
+        self.assertIn("risk typo: no 'closes'", probs)
+        self.assertTrue(any(p.startswith("risk badcheck: its check isn't one atone can run") for p in probs), probs)
+
     def test_the_library_and_the_formats(self):
         self.assertIn("Cloud Instance Metadata API", atone.describe_technique("t1552.005"))
         self.assertIn("ac-2", atone.describe_technique("T1078.004"))                # mapped to 800-53, ids as the catalog's
