@@ -2034,8 +2034,17 @@ def save_statement(d: Path, verified: dict) -> str | None:
                         paths=[str(control_path(d, cid).relative_to(d))])
 
 
+def people_only(what: str, command: str) -> None:
+    """Reviews and decisions are people's: in an agent's shell (hobkin sets HOBKIN_ID) atone won't record one, even on
+    a person's say-so in chat. The agent gives the person the command to run."""
+    if os.environ.get("HOBKIN_ID"):
+        raise AtoneError(f"{what} is a person's to record, not an agent's (this is {os.environ['HOBKIN_ID']}'s shell). "
+                         f"Give them the command to run themselves: {command}")
+
+
 def review_statements(d: Path, cids: list[str], by: str) -> str | None:
     """A person's review of drafted statements: who, and when, committed (Reviewed-by)."""
+    people_only("A review", f"atone review {d.name} {' '.join(cids)} --by NAME")
     today = time.strftime("%Y-%m-%d", time.gmtime())
     done = []
     for cid in cids:
@@ -2060,6 +2069,8 @@ def decide(d: Path, kind: str, what: str, by: str, controls: list[str] | None = 
     items (--item)."""
     if kind not in DECISION_KINDS:
         raise AtoneError(f"a decision is one of: {', '.join(DECISION_KINDS)}")
+    people_only("A decision", f"atone decide {d.name} {kind} {shlex.quote(what)}"
+                + "".join(f" --item {shlex.quote(i)}" for i in items or []) + " --by NAME")
     today = time.strftime("%Y-%m-%d", time.gmtime())
     rec = {"kind": kind, "what": what, "by": by, "at": today, "controls": controls or [], "until": until}
     paths = ["decisions"]
@@ -3725,7 +3736,9 @@ RISK_FORMAT = {
     "keys": {"id": "its id (the file's name)", "closes": "[the step ids it blocks]", "change": "the exact change",
              "check": "a check, as in a control mapping: {evidence: {kind, source, host...}, type, pattern...}",
              "state": "open, fixed (its check passes), or accepted (a person decided: atone decide risk-acceptance)",
-             "owner": "who makes the change"},
+             "owner": "who makes the change",
+             "accepted_by": "written by atone decide ... risk-acceptance (never by hand)", "accepted_at": "(the same)",
+             "accepted_because": "(the same)", "until": "(the same: when the acceptance ends, if it does)"},
     "required": ["id", "closes", "change"],
     "example": {"id": "block-public-bucket", "closes": ["public-bucket-read"],
                 "change": "turn on S3 Block Public Access for the account, and remove the bucket policy's * grant",
@@ -3737,7 +3750,8 @@ ENGAGEMENT_FORMAT = {
     "keys": {"targets": "[hosts it may test: the replicas, never others]", "represents": "the system they stand in for",
              "depth": "think, read (the default), probe, or exploit (on the targets only)",
              "out_of_bounds": "[what never to do, even on a target]", "windows": "when, if that matters",
-             "gate": "{layers: 2, detected: true}: the bar for atonement (lower it only by a recorded decision)"},
+             "gate": "{layers: 2, detected: true}: the bar for atonement (lower it only by a recorded decision)",
+             "agreed": "written by atone decide ... engagement: who agreed it, when, and what they said (never by hand)"},
     "required": [],
     "example": {"targets": ["replica-app01", "replica-db01"], "represents": "payroll (production)", "depth": "exploit",
                 "out_of_bounds": ["deleting data", "anything on shared infrastructure"],
@@ -4358,6 +4372,18 @@ def attack_report(a: dict, paths: int = 0) -> str:
     return "\n".join(lines)
 
 
+def uncommitted(d: Path) -> int:
+    """How many changed or new files in the codex aren't committed (what's ignored doesn't count)."""
+    r = git(d, "status", "--porcelain", check=False)
+    return len([l for l in r.stdout.splitlines() if l.strip()]) if r.returncode == 0 else 0
+
+
+def uncommitted_note(d: Path) -> str:
+    n = uncommitted(d)
+    return (f"\n\nthe codex has {n} uncommitted change{'s' if n != 1 else ''}: nothing is done until it's committed "
+            f"(atone commit {d.name} \"what and why\", on a branch)") if n else ""
+
+
 def attack_command(args) -> str:
     """atone attack: the analysis of a system's attack graph, or the attacker library."""
     if args.example is not None:
@@ -4398,7 +4424,7 @@ def attack_command(args) -> str:
         write_json(d / "runs" / "attack.json", {k: v for k, v in a.items() if k != "graph"})
     if args.steps or args.derived:
         return steps_report(a["graph"], derived=args.derived)
-    text = attack_report(a, args.paths)
+    text = attack_report(a, args.paths) + uncommitted_note(d)
     if args.controls:
         text += "\n\nThe controls, by what their failing would do:\n" + controls_report(control_importance(a["graph"], a))
     if close or harden:
@@ -4893,7 +4919,8 @@ hard you may push.
 - **People decide.** The ISSE owns the system spec and the mappings; the ISSO owns the package. You draft, prove,
   and propose.
 - **Only the access you're given.** A key, token or password you come across on a host isn't yours to use, even
-  to unblock yourself (and it's a finding: tell the ISSE where it is, never what it is). Ask for what you need.
+  to unblock yourself (and it's a finding: tell the ISSE where it is, never what it is: not in chat, not in a step,
+  not in a lock-down). Ask for what you need.
 
 ## The codex
 
@@ -4907,7 +4934,10 @@ what's where), and its history is the system's security history. So:
   mappings or a schedule; push it to the team's git server and ask for a review. Merging is approval: never merge
   your own work into main.
 - **People review and decide through atone:** `atone review {{system}} CONTROL --by NAME`, `atone decide {{system}}
-  KIND "what and why" --by NAME`. Tell them the exact command; never run these for them.
+  KIND "what and why" --by NAME`. Tell them the exact command (copy it from `atone plan {{system}}`, which prints each
+  one ready to run); never run these for them, even when they say yes in chat: atone refuses to in your shell.
+- **Commit before you report.** Nothing you drafted counts until it's committed; `atone plan` and `atone attack` say
+  when the codex has uncommitted changes.
 - **Keep it in step:** `git pull` before you start, push when you're done (on a branch).
 
 ## The plan comes first
@@ -5446,7 +5476,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "plan":
             p = plan(args.system)
             print(f"{p['done']} done; open: " + ", ".join(f"{v} for {k}" for k, v in p["open"].items())
-                  + f"\n  {system_dir(args.system) / 'PLAN.md'}")
+                  + f"\n  {system_dir(args.system) / 'PLAN.md'}" + uncommitted_note(system_dir(args.system)))
         elif args.cmd == "due":
             for line in due(args.system):
                 print(line)

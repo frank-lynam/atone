@@ -870,6 +870,23 @@ class Atonement(unittest.TestCase):
         self.assertEqual(pair[("lan", "effect:shell")]["exposure"], "commodity")
         self.assertIn("net/lan->web01:tcp/22", atone.steps_report(atone.load_attack(d), derived=True))
 
+    def test_people_decide_an_agent_only_hands_them_the_command(self):
+        d = self.system("atone7")
+        atone.write_json(d / "engagement.json", {"targets": [], "depth": "read"})
+        os.environ["HOBKIN_ID"] = "atonecheck"
+        try:
+            with self.assertRaises(atone.AtoneError) as e:
+                atone.decide(d, "engagement", "read only", "ISSE")
+            self.assertIn("atone decide atone7 engagement 'read only' --by NAME", str(e.exception))
+            with self.assertRaises(atone.AtoneError):
+                atone.review_statements(d, ["ac-2"], "ISSE")
+        finally:
+            del os.environ["HOBKIN_ID"]
+        atone.decide(d, "engagement", "read only", "pat")                      # a person, in their own shell
+        self.assertEqual([p for p in atone.load_attack(d)["problems"] if p.startswith("engagement")], [])   # agreed is atone's
+        (d / "attack" / "steps" / "new-step.json").write_text("{}")
+        self.assertIn("uncommitted change", atone.uncommitted_note(d))
+
     def test_the_library_and_the_formats(self):
         self.assertIn("Cloud Instance Metadata API", atone.describe_technique("t1552.005"))
         self.assertIn("ac-2", atone.describe_technique("T1078.004"))                # mapped to 800-53, ids as the catalog's
