@@ -301,6 +301,15 @@ the rest:
 | `risks/ID.json` | a lock-down: the steps it closes, the exact change, the check that proves it's in place, its state |
 | `engagement.json` | the rules of engagement (below) |
 
+**Who can reach what is derived, not drafted.** atone works the network steps out from the evidence it already has
+(each host's listeners, security groups, routes and public addresses, internet-facing load balancers, and the system
+spec's `ingress` for a tunnel or port forward): `net:internet`, `net:lan` and code on a host lead to `access:HOST:PORT`.
+Binding a port to loopback and a world-open rule with no public route come out as *controls*. The hobkin's steps
+start from those access conditions, so its effort goes to what needs judgement; its execution conditions are per
+host and account (`exec:HOST:USER`), so one account's compromise isn't another's. A step's citations can match
+fields in structured evidence, not only quote text, and `--steps` puts each claim beside what it cites, since a
+quote can be true and still not support the claim.
+
 **Effort, not time.** On real systems the paths are mostly misconfigurations, exposed credentials and too much
 access: known weaknesses, not new ones. So each step has a level:
 

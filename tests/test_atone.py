@@ -833,6 +833,43 @@ class Atonement(unittest.TestCase):
         self.assertIn("risk typo: no 'closes'", probs)
         self.assertTrue(any(p.startswith("risk badcheck: its check isn't one atone can run") for p in probs), probs)
 
+    def test_who_can_reach_what_is_worked_out_from_the_evidence(self):
+        d = evidence_system("atone6", [
+            ("listeners", "web01", "/proc/net (listening)", json.dumps([
+                {"proto": "tcp", "state": "listen", "local": "0.0.0.0:22", "remote": "0.0.0.0:0", "process": "sshd"},
+                {"proto": "tcp", "state": "listen", "local": "127.0.0.1:25", "remote": "0.0.0.0:0"},
+                {"proto": "tcp", "state": "listen", "local": "0.0.0.0:41977", "remote": "0.0.0.0:0"}])),
+            ("accounts", "web01", "passwd entries", json.dumps([{"user": "root", "uid": 0, "home": "/root"},
+                                                               {"home": "/home/alice", "uid": 1009, "user": "alice"}]))])
+        spec = atone.read_json(d / "system.json", {})
+        atone.write_json(d / "system.json", {**spec, "ingress": [{"host": "web01", "port": 41977, "via": "a Cloudflare tunnel"}]})
+        ids = {e["source"]: e["id"] for e in atone.current_index(d)}
+        atone.write_json(d / "attack" / "conditions.json", [
+            {"id": "exec:web01:alice", "kind": "execution"}, {"id": "effect:shell", "kind": "effect", "impact": "high"}])
+        atone.write_json(d / "attack" / "profiles.json", [{"id": "lan", "starts": ["net:lan"]},
+                                                          {"id": "internet", "starts": ["net:internet"]}])
+        step = lambda sid, **kw: atone.write_json(d / "attack" / "steps" / f"{sid}.json", {"id": sid, **kw})
+        step("ssh-login", **{"from": "access:web01:tcp/22", "to": "exec:web01:alice", "effort": "commodity", "basis":
+                             "evidence", "weakness": "password logins", "cites": [{"evidence": ids["passwd entries"],
+                                                                               "match": {"user": "alice", "home": "/home/alice"}}]})
+        step("shell", **{"from": "exec:web01:alice", "to": "effect:shell", "effort": "free", "basis": "assumed"})
+        step("skips-the-network", **{"from": "net:internet", "to": "exec:web01:alice", "effort": "hard", "basis": "assumed",
+                                     "control": "mfa"})
+        g = atone.load_attack(d)
+        st = g["steps"]
+        self.assertEqual(st["net/lan->web01:tcp/22"]["effort"], "free")
+        self.assertEqual((st["net/lan->web01:tcp/25"]["effort"], st["net/lan->web01:tcp/25"]["control"]),
+                         ("blocked", "bind:web01:loopback"))                       # loopback only: a control
+        self.assertIn("Cloudflare tunnel", st["net/internet->web01:tcp/41977"]["about"])
+        self.assertIn("net/web01:alice->host:web01", st)                           # code there reaches its own ports
+        self.assertEqual(st["ssh-login"]["basis"], "evidence")                     # a citation by field holds
+        probs = g["problems"]
+        self.assertTrue(any("skips-the-network: \"control\" names what blocks a step" in p for p in probs), probs)
+        self.assertTrue(any("skips-the-network: network reach is worked out" in p for p in probs), probs)
+        pair = {(x["profile"], x["effect"]): x for x in atone.analyse_attack(d)["pairs"]}
+        self.assertEqual(pair[("lan", "effect:shell")]["exposure"], "commodity")
+        self.assertIn("net/lan->web01:tcp/22", atone.steps_report(atone.load_attack(d), derived=True))
+
     def test_the_library_and_the_formats(self):
         self.assertIn("Cloud Instance Metadata API", atone.describe_technique("t1552.005"))
         self.assertIn("ac-2", atone.describe_technique("T1078.004"))                # mapped to 800-53, ids as the catalog's
@@ -863,6 +900,10 @@ class PlanAndReport(unittest.TestCase):
 
     def test_due_is_quiet_until_something_is(self):
         d = evidence_system("due", [("file", "h1", "/etc/audit/auditd.conf", AUDITD)])
+        lines = atone.due("due")                                  # atonement first: the attack analysis, not checks
+        self.assertTrue(any(l.startswith("attack:") for l in lines) and not any(l.startswith(("check:", "conmon:"))
+                                                                             for l in lines), lines)
+        atone.decide(d, "atonement", "locked down as far as it goes", "pat")
         lines = atone.due("due")
         self.assertTrue(any(l.startswith("check:") for l in lines))
         atone.check_system("due", log=lambda *a: None)

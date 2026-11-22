@@ -2177,6 +2177,16 @@ def verify_narrative(d: Path, draft: dict) -> dict:
             continue
         why = None if cites else "it cites nothing"
         for cite in cites:
+            if isinstance(cite.get("match"), dict) and cite.get("evidence"):
+                e = index.get(cite["evidence"])
+                rec = load_record(d, e) if e else None
+                if not rec or rec.get("tampered") or not check_record(rec):
+                    why = (f"no evidence {cite['evidence']!r}" if not e else f"{e['id']} doesn't match its hash")
+                    break
+                if not json_has(rec["content"], cite["match"]):
+                    why = f"{e['id']} has no record with {json.dumps(cite['match'])[:80]}"
+                    break
+                continue
             if cite.get("document") and not cite.get("evidence"):
                 text, sha = document(cite["document"])
                 if text is None:
@@ -2208,6 +2218,25 @@ def verify_narrative(d: Path, draft: dict) -> dict:
             "coverage": {"evidence": sum(1 for c in kept if c["basis"] == "evidence"),
                          "document": sum(1 for c in kept if c["basis"] == "document"),
                          "person": sum(1 for c in kept if c["basis"] == "person"), "dropped": len(dropped)}}
+
+
+def json_has(content: str, want: dict) -> bool:
+    """Whether structured evidence (JSON) holds a record with all of `want`'s fields at those values, anywhere in it:
+    how a citation points into a list of accounts or listeners without quoting its layout."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return False
+    stack = [data]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if all(k in x and str(x[k]) == str(v) for k, v in want.items()):
+                return True
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    return False
 
 
 def clip_text(text: str, n: int) -> str:
@@ -3652,7 +3681,8 @@ COMPONENT_DEFAULTS = [
     ("a person (an admin, a developer)", "their credentials and sessions, by phishing or a stolen laptop"),
 ]
 
-_CITES = "[{evidence: ID, quote: \"exact words\"} or {document: PATH, quote}] (checked like a narrative's)"
+_CITES = ("[{evidence: ID, quote: \"exact words\"}, {evidence: ID, match: {field: value...}} for structured evidence "
+          "(a record with those values), or {document: PATH, quote}] (checked like a narrative's)")
 CONDITION_FORMAT = {
     "file": "attack/conditions.json (a list)", "about": "what an attacker can come to hold, ending in mission effects",
     "keys": {"id": "a short id (net:internet, exec:app01:root, cred:deploy-key, data:payroll, effect:payroll-read)",
@@ -3680,8 +3710,9 @@ STEP_FORMAT = {
              "basis": "evidence, demonstrated or assumed (assumed counts as commodity, and is flagged)",
              "cites": _CITES, "detection": "[{by: what sees it, cites: [...]}] ([] or left out: nothing does)",
              "component": "which part of the system (the system spec's component), for the defaults",
-             "control": "blocked steps: the control that blocks it (iam:app-role-policy, sg:web, imdsv2), so one control "
-                        "blocking many steps counts as one",
+             "control": "blocked steps only: the control that blocks it (iam:app-role-policy, sg:web, imdsv2), so one "
+                        "control blocking many steps counts as one",
+             "weakness": "open steps: what makes it open (a setting, a CWE id: CWE-798)",
              "if_bypassed": "blocked steps: its effort if the control failed (default free)"},
     "required": ["id", "from", "to", "effort", "basis"],
     "example": {"id": "public-bucket-read", "from": "net:internet", "to": "data:payroll", "technique": "T1530",
@@ -3864,6 +3895,9 @@ def load_attack(d: Path) -> dict:
         problems += [f"profile {p.get('id')}: {x}" for x in format_problems(PROFILE_FORMAT, p)]
         problems += [f"profile {p.get('id')}: starts at {s!r}, which isn't a condition" for s in p.get("starts") or []
                      if s not in conditions]
+    derived_c, derived_s = network_steps(d, conditions)      # who can reach what: from the evidence, not drafted
+    for cid, c in derived_c.items():
+        conditions.setdefault(cid, c)
     techniques = attack_library("attack").get("techniques") or {}
     steps = {}
     for f in sorted((d / "attack" / "steps").glob("*.json")) if (d / "attack" / "steps").is_dir() else []:
@@ -3881,6 +3915,13 @@ def load_attack(d: Path) -> dict:
             s["basis"] = "assumed"
         if s.get("technique") and str(s["technique"]).upper() not in techniques:
             problems.append(f"step {s['id']}: {s['technique']} isn't an ATT&CK technique (in {attack_library('attack').get('version')})")
+        if s.get("control") and s["effort"] != "blocked":
+            problems.append(f"step {s['id']}: \"control\" names what blocks a step, and this one isn't blocked (what "
+                            "makes it open goes in \"weakness\"; a control goes on its own blocked step)")
+        if str(s.get("from", "")).startswith(("net:internet", "net:lan", "net:range:")) and \
+                not str(s.get("to", "")).startswith("access:"):
+            problems.append(f"step {s['id']}: network reach is worked out from the evidence (atone attack SYSTEM "
+                            "--derived): start from access:HOST:PROTO/PORT instead of {s.get('from')}")
         s["claimed"] = (s["effort"], s["basis"])
         if s["basis"] in ("evidence", "demonstrated"):
             v = verify_narrative(d, {"control": "attack", "claims": [{"text": s.get("about") or s["id"],
@@ -3899,10 +3940,95 @@ def load_attack(d: Path) -> dict:
         problems += [f"risk {r['id']}: {x}" for x in format_problems(RISK_FORMAT, r)]
         problems += [f"risk {r['id']}: closes {sid!r}, which isn't a step" for sid in r.get("closes") or [] if sid not in steps]
         risks[r["id"]] = r
+    for sid, st in derived_s.items():
+        steps.setdefault(sid, st)
     engagement = read_json(d / "engagement.json", {})
     problems += [f"engagement: {x}" for x in format_problems(ENGAGEMENT_FORMAT, engagement)]
     return {"conditions": conditions, "profiles": profiles, "steps": steps, "risks": risks, "engagement": engagement,
             "gate": {**GATE, **(engagement.get("gate") or {})}, "problems": problems}
+
+
+LOOPBACK = ("127.", "::1", "localhost")
+
+
+def network_steps(d: Path, conditions: dict) -> tuple[dict, dict]:
+    """Who can reach what, worked out from the evidence, not drafted: the mechanical part of the attack graph.
+    - code running on a host (exec:HOST, or exec:HOST:USER) reaches every port it listens on (net:host:HOST);
+    - the LAN (net:lan) reaches what a host listens on outside loopback, where no security group says otherwise; a
+      port bound to loopback only is *blocked* for it (the control: binding to loopback);
+    - the internet (net:internet) reaches what the architecture says it can: a security group open to the world on a
+      host with a public address and a route, an internet-facing load balancer's listeners, and the system spec's
+      "ingress" (a tunnel, a port forward: [{host, port, via}]); a world-open rule with no public address is *blocked*
+      (the control: no public route);
+    - a host's security groups let others in where they say (net:host:OTHER).
+    Each derived step cites the evidence it came from. Host firewalls aren't evaluated yet: the LAN steps say so."""
+    conds, steps = {}, {}
+    spec = read_json(d / "system.json", {})
+    inside = in_boundary(spec)
+    index = [e for e in current_index(d) if inside(e["host"])]
+
+    def cond(cid, kind, about):
+        conds.setdefault(cid, {"id": cid, "kind": kind, "about": about, "derived": True})
+        return cid
+
+    def step(frm, to, effort, about, evidence=(), control=None):
+        sid = f"net/{frm.split(':', 1)[1]}->{to.split(':', 1)[1]}"
+        steps[sid] = {"id": sid, "from": frm, "to": to, "effort": effort, "basis": "evidence", "about": about,
+                      "derived": True, "evidence": list(evidence), "detection": [], "detected_by": [],
+                      "claimed": (effort, "evidence"), **({"control": control} if control else {})}
+    try:
+        graph = build_graph(d.name)
+    except Exception:                            # no architecture yet (no evidence): nothing to derive
+        graph = {"nodes": [], "edges": []}
+    aws_nodes = {n["id"] for n in graph["nodes"] if n.get("aws")}
+    listening = {}
+    for e in index:
+        if e["kind"] != "listeners":
+            continue
+        for r in _json_content(d, e) or []:
+            ip, _, port = str(r.get("local", "")).rpartition(":")
+            listening.setdefault(e["host"], []).append((r.get("proto", "tcp"), port, ip, r.get("process") or "", e["id"]))
+    for host, rows in sorted(listening.items()):
+        here = cond(f"net:host:{host}", "access", f"code running on {host} (any account)")
+        for cid, c in list(conditions.items()):
+            if c.get("kind") in ("execution", "privilege") and (cid == f"exec:{host}" or cid.startswith(f"exec:{host}:")
+                                                                or cid == f"root:{host}"):
+                step(cid, here, "free", f"code running on {host} can reach its local ports")
+        for proto, port, ip, proc, eid in sorted(set(rows)):
+            what = f"{proto}/{port}"
+            acc = cond(f"access:{host}:{what}", "access", f"can talk to {host}'s {what}" + (f" ({proc})" if proc else ""))
+            step(here, acc, "free", f"{host} listens on {ip}:{port}", [eid])
+            if host in aws_nodes:
+                continue                         # its security groups decide who else gets in (below)
+            if ip.startswith(LOOPBACK) or ip in ("localhost",):
+                step(cond("net:lan", "access", "anyone on the local network"), acc, "blocked",
+                     f"{host} binds {what} to {ip} only", [eid], control=f"bind:{host}:loopback")
+            else:
+                step(cond("net:lan", "access", "anyone on the local network"), acc, "free",
+                     f"{host} listens on {ip or 'every address'}:{port} (the host's firewall isn't evaluated yet)", [eid])
+    for e in graph.get("edges") or []:
+        dst, port = e["to"], e["port"]
+        if dst not in listening and dst not in aws_nodes:
+            continue
+        acc = cond(f"access:{dst}:{port}", "access", f"can talk to {dst}'s {port}")
+        if e["from"] == "internet" and ("allowed" in e["layers"] or "configured" in e["layers"]):
+            inet = cond("net:internet", "access", "anyone on the internet")
+            if e.get("reachable") is False:
+                step(inet, acc, "blocked", f"a rule lets the world in to {dst} {port}, but it has no public route",
+                     e.get("evidence") or [], control=f"route:{dst}:no-public-address")
+            else:
+                step(inet, acc, "free", f"the internet reaches {dst} {port} ({e.get('rule') or e.get('how') or 'allowed'})",
+                     e.get("evidence") or [])
+        elif "allowed" in e["layers"] and e["from"] in listening:
+            step(cond(f"net:host:{e['from']}", "access", f"code running on {e['from']} (any account)"), acc, "free",
+                 f"{e['from']} may reach {dst} {port} ({e.get('rule') or 'allowed'})", e.get("evidence") or [])
+    for x in spec.get("ingress") or []:          # a tunnel, a port forward: the way in the spec says there is
+        if isinstance(x, dict) and x.get("host") and x.get("port"):
+            what = x["port"] if "/" in str(x["port"]) else f"tcp/{x['port']}"
+            acc = cond(f"access:{x['host']}:{what}", "access", f"can talk to {x['host']}'s {what}")
+            step(cond("net:internet", "access", "anyone on the internet"), acc, "free",
+                 f"the internet reaches {x['host']} {what} through {x.get('via') or 'an ingress the system spec names'}")
+    return conds, steps
 
 
 def apply_risks(d: Path, g: dict) -> dict:
@@ -4173,6 +4299,23 @@ def controls_report(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def steps_report(g: dict, derived: bool = False) -> str:
+    """Each step's claim beside what it cites, so a quote that's true but doesn't support the claim shows."""
+    lines = []
+    for sid, s in sorted(g["steps"].items()):
+        if bool(s.get("derived")) != derived:
+            continue
+        lines.append(f"{sid}: {s['from']} -> {s['to']} [{s['effort']}, {s['basis']}]"
+                     + (f" control {s['control']}" if s.get("control") else ""))
+        lines.append(f"     claims: {clip_text(s.get('about') or '(says nothing)', 200)}")
+        for c in s.get("cites") or []:
+            lines.append(f"     cites:  {c.get('evidence') or c.get('document')}: "
+                         + (json.dumps(c["match"]) if c.get("match") else repr(clip_text(c.get("quote") or "", 160))))
+        if derived and s.get("evidence"):
+            lines.append(f"     from:   {', '.join(s['evidence'][:3])}")
+    return "\n".join(lines) or "no steps"
+
+
 def attack_report(a: dict, paths: int = 0) -> str:
     """The analysis as people read it."""
     g, lines = a["graph"], []
@@ -4241,12 +4384,14 @@ def attack_command(args) -> str:
     lockdowns = {r.get("id", p.stem): r for p in sorted((d / "risks").glob("*.json")) if (d / "risks").is_dir()
                  for r in [read_json(p, {})] if isinstance(r, dict) and "closes" in r}
     close = [s for x in close for s in (lockdowns[x].get("closes") or [] if x in lockdowns else [x])]
-    unknown = [x for x in close if x not in {p.stem for p in (d / "attack" / "steps").glob("*.json")}]
+    unknown = [x for x in close if x not in load_attack(d)["steps"]]
     if unknown:
         raise AtoneError(f"--close {', '.join(unknown)}: not a step, nor a lock-down that names its steps in \"closes\"")
     a = analyse_attack(d, close, harden)
     if not close and not harden:             # the real state, for the plan and the report (a what-if isn't)
         write_json(d / "runs" / "attack.json", {k: v for k, v in a.items() if k != "graph"})
+    if args.steps or args.derived:
+        return steps_report(a["graph"], derived=args.derived)
     text = attack_report(a, args.paths)
     if args.controls:
         text += "\n\nThe controls, by what their failing would do:\n" + controls_report(control_importance(a["graph"], a))
@@ -4410,7 +4555,8 @@ def plan(name: str) -> dict:
 
 def due(name: str) -> list[str]:
     """What's due, by the system's cadence (atone.json "cadence": collect 24h, check 7d, conmon 30d): one line each,
-    nothing when nothing is. The chore's watch: a quiet day costs no model calls."""
+    nothing when nothing is. The chore's watch: a quiet day costs no model calls. Until a person confirms atonement,
+    only collecting and the attack analysis are: the compliance work comes after."""
     d = system_dir(name)
     cad = {**CADENCE, **(read_json(d / "atone.json", {}).get("cadence") or {})}
     now = time.time()
@@ -4423,6 +4569,13 @@ def due(name: str) -> list[str]:
     if now - newest > duration(cad["collect"]):
         out.append(f"collect: the newest evidence is {'never' if not newest else f'{(now - newest) / 3600:.0f}h old'} "
                    f"(every {cad['collect']}): atone collect {name}, and import new scans")
+    atoned = (d / "decisions").is_dir() and any((d / "decisions").glob("*-atonement-*.json"))
+    if not atoned:                       # phase 1: the attack analysis, not the compliance checks or packages yet
+        analysed = (d / "runs" / "attack.json").stat().st_mtime if (d / "runs" / "attack.json").exists() else 0
+        if newest and newest > analysed:
+            out.append(f"attack: new evidence since the last analysis: atone attack {name} (atonement comes first; "
+                       "the compliance checks and packages wait until a person confirms it)")
+        return out
     if now - checked > duration(cad["check"]) or (checked and newest > checked):
         out.append(f"check: {'new evidence since the last check' if checked and newest > checked else 'due'}: "
                    f"atone check {name}, then atone plan {name}")
@@ -4800,7 +4953,14 @@ evidence allows; not to check boxes.
    whom) and its impact. Your people refine them; that's expected.
 2. **Attacker profiles** (attack/profiles.json): at least someone on the internet, a phished user, an insider, a
    compromised dependency or supplier, a stolen admin laptop. Each starts with the conditions they hold.
-3. **The steps, in passes** (attack/steps/, one file each; `atone attack --example step`). Do every pass, every time:
+3. **Who can reach what is atone's job, not yours.** From the evidence (listeners, security groups, routes, load
+   balancers) atone works out the network steps itself: `atone attack {{system}} --derived` lists them, ending in
+   conditions like `access:HOST:tcp/22` (can talk to that port). Start your steps there: what an attacker does once
+   they can talk to a port. Never write steps from net:internet or net:lan; if the internet reaches something atone
+   can't see (a tunnel, a port forward), add it to system.json's "ingress" ([{host, port, via}]) and it follows.
+   Name what an attacker runs as per host and account: `exec:HOST:USER`, and `root:HOST`. atone connects those to
+   the host's own ports, and one account's compromise isn't another's: that's what makes a permission a control.
+4. **The steps, in passes** (attack/steps/, one file each; `atone attack --example step`). Do every pass, every time:
    - each component and each flow, from every angle: spoofing, tampering, repudiation, leaking, denial of service,
      gaining privilege;
    - each profile through the stages of an intrusion (ATT&CK's tactics): first foothold, running code, staying in,
@@ -4812,28 +4972,31 @@ evidence allows; not to check boxes.
      logs are blind; what each cloud role can actually reach; how a deploy could be tampered with.
    `atone attack defaults` says what each kind of cloud component exposes until the evidence says otherwise; the
    attacker library (`atone attack search WORDS`, `atone attack technique ID`, its lore) knows the techniques.
-4. **Look for what stops each step, as hard as you look for the step.** An attacker's way in usually meets
+5. **Look for what stops each step, as hard as you look for the step.** An attacker's way in usually meets
    something: a firewall rule, a permission, an IAM policy, MFA, a bind address, an SSH setting. Find it in the
-   evidence and record it: a *blocked* step beside the open one, naming its control. A graph with no controls in it
-   says the system has none, which is rarely true and helps nobody decide where a second layer belongs.
-5. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
-   checks the quotes. A step with no evidence is *assumed*: write it anyway (it counts as commodity, and atone flags
+   evidence and record it: a *blocked* step beside the open one, naming its control (`"control"` goes only on blocked
+   steps; what makes an open step open goes in `"weakness"`). A graph with no controls in it says the system has
+   none, which is rarely true and helps nobody decide where a second layer belongs.
+6. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
+   checks the quotes. For structured evidence (accounts, listeners, AWS), cite fields instead of quoting its layout:
+   `{"evidence": ID, "match": {"user": "alice", "home": "/home/alice"}}`. A quote must support the claim, not just be
+   true somewhere: `atone attack {{system}} --steps` shows each claim beside what it cites, so read it back. A step with no evidence is *assumed*: write it anyway (it counts as commodity, and atone flags
    it), and go find out. Only cite a control as *blocked* when the evidence shows it: an unproven control is no
    control. Name the control on each blocked step (`"control": "iam:app-role-policy"`): one control blocking many
    steps is one control, and that's what tells you where you're leaning on it. Note what would detect each step, and
    only what really would.
-6. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
+7. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
    beyond its targets or its depth.
-7. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
+8. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
    cheapest way in, the controls in the way, the fewest lock-downs that cut every path, the paths that rest on one
    control, and what nothing detects. Try what-ifs (`--close STEP`, `--harden STEP=hard`) before you propose.
    `--controls` says how much each control carries (the attack paths it gates) and what its failing would open: a
    control that many paths lean on, with nothing behind it, needs a second layer even though it holds today.
-8. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
+9. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
    proves it's in place (as in a control mapping), so atone keeps checking it. Lead with the cut: the few changes
    that close the most. Commit on a branch, and tell your people what each buys ("closing these two cuts every path
    from a phished user to the payroll data").
-9. **Keep going** until a full pass finds nothing new and the analysis says the bar is met (or every open pair is a
+10. **Keep going** until a full pass finds nothing new and the analysis says the bar is met (or every open pair is a
    risk a person accepted: `atone decide {{system}} risk-acceptance "why" --item RISK --by NAME`). Then ask a person
    to confirm atonement: `atone decide {{system}} atonement "why" --by NAME`. Only then start on the documents."""),
     "atone-become-expert": ("Build the lores you need to be the expert for a system: NIST's controls exactly, public "
@@ -5071,6 +5234,8 @@ def parser() -> argparse.ArgumentParser:
                    "(free, commodity, hard); comma-separated or repeated")
     p.add_argument("--paths", type=int, default=0, metavar="N", help="list up to N attack paths for each")
     p.add_argument("--controls", action="store_true", help="how much each control carries, and what its failing would do")
+    p.add_argument("--steps", action="store_true", help="each drafted step's claim beside what it cites")
+    p.add_argument("--derived", action="store_true", help="the network steps atone works out from the evidence")
     p.add_argument("--example", nargs="?", const="", metavar="KIND",
                    help="a file's format (condition, profile, step, risk, engagement): its keys and an example")
     p.add_argument("--out", help="lore: where to write it")

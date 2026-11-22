@@ -51,7 +51,9 @@ atone import tst --eaveswatch s3://bucket/ew   # logging evidence (AU) from an e
 atone evidence tst search keep_logs            # ranked full-text search over the current evidence
 atone doc SSP.docx --out ssp.txt               # a Word or Excel document as text: headings, lists, tables
 atone attack tst [--paths 5]                   # atonement: attack paths, the controls in the way, what to lock down
-atone attack tst --close STEP                  # what if that step were blocked?
+atone attack tst --close STEP                  # what if that step (or lock-down) were blocked?
+atone attack tst --controls                    # how much each control carries, and what its failing would open
+atone attack tst --steps                       # each step's claim beside what it cites (--derived: atone's own)
 atone attack technique T1552.005               # the attacker library: a technique, its mitigations, 800-53, AWS
 atone attack search instance metadata          # ...or search it (atone attack lore: as a lore)
 atone check tst                                # every control: met, partly, not met, unknown, inherited
