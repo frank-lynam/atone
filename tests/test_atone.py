@@ -808,6 +808,22 @@ class Atonement(unittest.TestCase):
         self.assertEqual((x["ok"], x["accepted"]), (False, ["imdsv2"]))       # accepted, never called safe
         self.assertIn("ACCEPTED internet -> effect:payroll-read", atone.attack_report(atone.analyse_attack(d)))
 
+    def test_how_much_each_control_carries_and_what_its_failing_would_do(self):
+        d = self.system("atone4")
+        for sid in ("bucket-public", "bucket-read"):        # one bucket policy blocks both ways to the data
+            p = d / "attack" / "steps" / f"{sid}.json"
+            atone.write_json(p, {**atone.read_json(p, {}), "effort": "blocked", "control": "s3:payroll-bucket-policy"})
+        a = atone.analyse_attack(d)
+        x = {(x["profile"], x["effect"]): x for x in a["pairs"]}[("internet", "effect:payroll-read")]
+        self.assertEqual((x["exposure"], x["layers"]), (None, 1))
+        [c] = atone.control_importance(a["graph"], a)
+        self.assertEqual((c["control"], c["steps"], c["paths"], c["pairs"]),
+                         ("s3:payroll-bucket-policy", ["bucket-public", "bucket-read"], 2, ["internet -> effect:payroll-read"]))
+        self.assertEqual(c["if_failed_open"], ["internet -> effect:payroll-read"])      # nothing else in the way
+        text = atone.controls_report([c])
+        self.assertIn("gates 2 attack paths across 1 profile-to-effect pair", text)
+        self.assertIn("a single point of failure: add a layer here", text)
+
     def test_the_library_and_the_formats(self):
         self.assertIn("Cloud Instance Metadata API", atone.describe_technique("t1552.005"))
         self.assertIn("ac-2", atone.describe_technique("T1078.004"))                # mapped to 800-53, ids as the catalog's

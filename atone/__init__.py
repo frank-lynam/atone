@@ -3679,7 +3679,10 @@ STEP_FORMAT = {
              "effort": "free, demonstrated, commodity, hard, or blocked (a control stops it: cite it)",
              "basis": "evidence, demonstrated or assumed (assumed counts as commodity, and is flagged)",
              "cites": _CITES, "detection": "[{by: what sees it, cites: [...]}] ([] or left out: nothing does)",
-             "component": "which part of the system (the system spec's component), for the defaults"},
+             "component": "which part of the system (the system spec's component), for the defaults",
+             "control": "blocked steps: the control that blocks it (iam:app-role-policy, sg:web, imdsv2), so one control "
+                        "blocking many steps counts as one",
+             "if_bypassed": "blocked steps: its effort if the control failed (default free)"},
     "required": ["id", "from", "to", "effort", "basis"],
     "example": {"id": "public-bucket-read", "from": "net:internet", "to": "data:payroll", "technique": "T1530",
                 "about": "the payroll export bucket allows public reads", "effort": "free", "basis": "evidence",
@@ -4036,6 +4039,11 @@ def analyse_attack(d: Path, close=(), harden=None) -> dict:
     for sid, level in (harden or {}).items():
         if sid in g["steps"]:
             g["steps"][sid].update(effort=level, whatif=True)
+    return analyse_graph(g)
+
+
+def analyse_graph(g: dict) -> dict:
+    """analyse_attack's work, on a graph already loaded (so a what-if can change a copy and look again)."""
     effects = [c for c, x in g["conditions"].items() if x.get("kind") == "effect"]
     out = []
     for pid, p in g["profiles"].items():
@@ -4090,6 +4098,76 @@ def attack_paths(g: dict, sources, sink, n: int = 10) -> list[list[str]]:
         walk(s, [], {s})
     found.sort(key=lambda p: (sum(g["steps"][k]["effort"] == "blocked" for k in p), len(p)))
     return found[:n]
+
+
+def count_paths(g: dict, sources, sink, cap: int = 5000) -> tuple[collections.Counter, int, bool]:
+    """Every attack path (simple, through the subgraph the spanning tree leaves) from the sources to `sink`, counted:
+    how many cross each step, the total, and whether it stopped at `cap` (then the counts are a floor)."""
+    sub = attack_subgraph(g, sources, [sink], include_blocked=True)
+    through, total = collections.Counter(), 0
+    stack = [(s, (), frozenset([s])) for s in sources]
+    while stack and total < cap:
+        node, path, seen = stack.pop()
+        if node == sink:
+            total += 1
+            through.update(set(path))
+            continue
+        for nxt, k in sub.get(node, ()):
+            if nxt not in seen:
+                stack.append((nxt, path + (k,), seen | {nxt}))
+    return through, total, bool(stack)
+
+
+def control_importance(g: dict, a: dict) -> list[dict]:
+    """How much each control carries: the steps it blocks, the attack paths and profile-to-effect pairs it gates, and
+    what its failing would do (the analysis again, with its steps at their effort if bypassed): pairs left with no
+    control at all, and pairs that fall below the bar. Most important first: where an extra layer belongs."""
+    controls = {}
+    for s in g["steps"].values():
+        if s["effort"] == "blocked":
+            controls.setdefault(s.get("control") or s.get("locked_by") or s["id"], []).append(s["id"])
+    through, capped, pairs_of = collections.Counter(), False, collections.defaultdict(set)
+    for x in a["pairs"]:
+        starts = g["profiles"][x["profile"]].get("starts") or []
+        t, _, c = count_paths(g, starts, x["effect"])
+        through.update(t)
+        capped = capped or c
+        for k in x["steps"]:
+            pairs_of[k].add((x["profile"], x["effect"]))
+    before = {(x["profile"], x["effect"]): x for x in a["pairs"]}
+    bar = int(a["gate"].get("layers", 2))
+    out = []
+    for name, steps in controls.items():
+        h = json.loads(json.dumps({k: v for k, v in g.items() if k != "problems"}, default=list))
+        h["problems"] = []
+        for sid in steps:
+            h["steps"][sid]["effort"] = h["steps"][sid].get("if_bypassed") or "free"
+        after = {(x["profile"], x["effect"]): x for x in analyse_graph(h)["pairs"]}
+        opened = sorted(f"{p} -> {e}" for (p, e), x in after.items() if x["exposure"] and not (before.get((p, e)) or {}).get("exposure"))
+        below = sorted(f"{p} -> {e}" for (p, e), x in after.items() if x["layers"] < bar <= (before.get((p, e)) or {}).get("layers", 0))
+        out.append({"control": name, "steps": sorted(steps), "paths": sum(through[s] for s in steps), "capped": capped,
+                    "pairs": sorted(f"{p} -> {e}" for s in steps for p, e in pairs_of[s]), "if_failed_open": opened,
+                    "if_failed_below_bar": below})
+    for c in out:
+        c["pairs"] = sorted(set(c["pairs"]))
+    out.sort(key=lambda c: (-len(c["if_failed_open"]), -len(c["if_failed_below_bar"]), -c["paths"], c["control"]))
+    return out
+
+
+def controls_report(rows: list[dict]) -> str:
+    if not rows:
+        return "no controls in the graph yet (blocked steps, each naming its control)"
+    lines = []
+    for c in rows:
+        lines.append(f"{c['control']}: blocks {len(c['steps'])} step{'s' if len(c['steps']) != 1 else ''}, gates "
+                     f"{c['paths']}{'+' if c['capped'] else ''} attack path{'s' if c['paths'] != 1 else ''} across "
+                     f"{len(c['pairs'])} profile-to-effect pair{'s' if len(c['pairs']) != 1 else ''}")
+        if c["if_failed_open"]:
+            lines.append(f"     if it failed, nothing else stands in the way: {', '.join(c['if_failed_open'])}"
+                         " (a single point of failure: add a layer here)")
+        if c["if_failed_below_bar"]:
+            lines.append(f"     if it failed, these fall below the bar: {', '.join(c['if_failed_below_bar'])}")
+    return "\n".join(lines)
 
 
 def attack_report(a: dict, paths: int = 0) -> str:
@@ -4161,6 +4239,8 @@ def attack_command(args) -> str:
     if not close and not harden:             # the real state, for the plan and the report (a what-if isn't)
         write_json(d / "runs" / "attack.json", {k: v for k, v in a.items() if k != "graph"})
     text = attack_report(a, args.paths)
+    if args.controls:
+        text += "\n\nThe controls, by what their failing would do:\n" + controls_report(control_importance(a["graph"], a))
     if close or harden:
         base = {(x["profile"], x["effect"]): x for x in analyse_attack(d)["pairs"]}
         diffs = []
@@ -4726,12 +4806,16 @@ evidence allows; not to check boxes.
 4. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
    checks the quotes. A step with no evidence is *assumed*: write it anyway (it counts as commodity, and atone flags
    it), and go find out. Only cite a control as *blocked* when the evidence shows it: an unproven control is no
-   control. Note what would detect each step, and only what really would.
+   control. Name the control on each blocked step (`"control": "iam:app-role-policy"`): one control blocking many
+   steps is one control, and that's what tells you where you're leaning on it. Note what would detect each step, and
+   only what really would.
 5. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
    beyond its targets or its depth.
 6. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
    cheapest way in, the controls in the way, the fewest lock-downs that cut every path, the paths that rest on one
    control, and what nothing detects. Try what-ifs (`--close STEP`, `--harden STEP=hard`) before you propose.
+   `--controls` says how much each control carries (the attack paths it gates) and what its failing would open: a
+   control that many paths lean on, with nothing behind it, needs a second layer even though it holds today.
 7. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
    proves it's in place (as in a control mapping), so atone keeps checking it. Lead with the cut: the few changes
    that close the most. Commit on a branch, and tell your people what each buys ("closing these two cuts every path
@@ -4971,6 +5055,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--close", help="what if these steps were blocked (comma-separated step ids)")
     p.add_argument("--harden", help="what if these steps were harder: STEP=LEVEL,... (free, commodity, hard)")
     p.add_argument("--paths", type=int, default=0, metavar="N", help="list up to N attack paths for each")
+    p.add_argument("--controls", action="store_true", help="how much each control carries, and what its failing would do")
     p.add_argument("--example", nargs="?", const="", metavar="KIND",
                    help="a file's format (condition, profile, step, risk, engagement): its keys and an example")
     p.add_argument("--out", help="lore: where to write it")

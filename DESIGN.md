@@ -266,7 +266,8 @@ with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture s
 ## 4a. Atonement: interrogate the system first, then derive compliance
 
 *Built: the attacker library; the attack graph's formats and checks (citations verified, unproven controls not
-counted); `atone attack` (exposure, controls, the cut, single-control paths, blind spots, what-ifs, paths); lock-downs
+counted); `atone attack` (exposure, controls, the cut, single-control paths, blind spots, what-ifs, paths, how much each
+control carries); lock-downs
 whose checks keep them locked; the plan's atonement items; the engagement, risk-acceptance and atonement decisions;
 the hobkin's atone-engagement and atone-atonement skills. Not yet: active tests that enforce the engagement's targets
 and depth, comparing a replica's evidence with the real system's, the compliance view (the mapping to controls and
@@ -362,6 +363,11 @@ new.
   Every proposed lock-down comes with that difference.
 - **Layers:** for each pair, how many independent controls (blocked steps) stand in the way on its best path. A path
   held by a single control is a weak point, however good that control is.
+- **How much each control carries:** each blocked step names its control, so one IAM policy blocking a dozen steps
+  is one control. For each: the attack paths and profile-to-effect pairs it gates, and what its failing would do (the
+  analysis again with its steps bypassed): pairs left with nothing else in the way, and pairs that fall below the bar.
+  Ranked by that, it says where an extra layer belongs: "the app role's policy gates 92 paths; if it failed, four
+  pairs would be open".
 - **Detection:** the steps no log source would show (with eaveswatch: sources it reads and patterns it has). The
   steps nobody watches are blind spots to close too.
 - **Optionally, time:** a TRACE-style Monte Carlo over the same subgraph (each level given a rate), for a mean time
