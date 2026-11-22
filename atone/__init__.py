@@ -4287,7 +4287,10 @@ def controls_report(rows: list[dict]) -> str:
     if not rows:
         return "no controls in the graph yet (blocked steps, each naming its control)"
     lines = []
+    idle = [c["control"] for c in rows if not c["paths"] and not c["if_failed_open"] and not c["if_failed_below_bar"]]
     for c in rows:
+        if c["control"] in idle:
+            continue
         lines.append(f"{c['control']}: blocks {len(c['steps'])} step{'s' if len(c['steps']) != 1 else ''}, gates "
                      f"{c['paths']}{'+' if c['capped'] else ''} attack path{'s' if c['paths'] != 1 else ''} across "
                      f"{len(c['pairs'])} profile-to-effect pair{'s' if len(c['pairs']) != 1 else ''}")
@@ -4296,6 +4299,9 @@ def controls_report(rows: list[dict]) -> str:
                          " (a single point of failure: add a layer here)")
         if c["if_failed_below_bar"]:
             lines.append(f"     if it failed, these fall below the bar: {', '.join(c['if_failed_below_bar'])}")
+    if idle:
+        lines.append(f"{len(idle)} more gate no attack path yet (nothing an attacker does goes on from what they guard): "
+                     + ", ".join(idle[:12]) + (" ..." if len(idle) > 12 else ""))
     return "\n".join(lines)
 
 
