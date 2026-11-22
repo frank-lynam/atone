@@ -60,7 +60,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # ---- map: `grep -n '^# ----' atone.py` lists these sections.
 #   settings      where things live, the redaction floor, the credential deny-list
