@@ -265,7 +265,12 @@ with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture s
 
 ## 4a. Atonement: interrogate the system first, then derive compliance
 
-*Designed, not built yet.*
+*Built: the attacker library; the attack graph's formats and checks (citations verified, unproven controls not
+counted); `atone attack` (exposure, controls, the cut, single-control paths, blind spots, what-ifs, paths); lock-downs
+whose checks keep them locked; the plan's atonement items; the engagement, risk-acceptance and atonement decisions;
+the hobkin's atone-engagement and atone-atonement skills. Not yet: active tests that enforce the engagement's targets
+and depth, comparing a replica's evidence with the real system's, the compliance view (the mapping to controls and
+the coverage check), paths drawn on the architecture, and the optional time model.*
 
 NIST asks whether controls exist. An attacker asks how to get in. atone answers the attacker's question first. A
 hobkin studies the real system (or a replica of it) to find every way it can be broken into or broken, and the

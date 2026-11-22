@@ -52,5 +52,61 @@
     "sha256": "f2048a90c3559747a8282088b0627c457147cf8eca706b1a22a99637cfffa2fa",
     "from_pdf_sha256": "2d1c0bf459f5e1bfd41ceb5eac83bf62e4c34bf08e2e7088b37cb73a11442b98",
     "converted_with": "pdftotext (poppler), UTF-8"
+  },
+  "attack/attack.json": {
+    "derived_by": "tools/attack_data.py",
+    "fetched": "2026-11-22",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack.json",
+        "sha256": "539a843a7b53ed9749740b2123dddae3726b1a4831841c32aca740b011b910b5"
+      }
+    ],
+    "bytes": 1289409,
+    "sha256": "4d602f2005b031d77a7f5a0d2aec6854085c6d9b67e60af5123885bb52599ebe"
+  },
+  "attack/capec.json": {
+    "derived_by": "tools/attack_data.py",
+    "fetched": "2026-11-22",
+    "sources": [
+      {
+        "url": "https://capec.mitre.org/data/xml/capec_latest.xml",
+        "sha256": "70279a2dff0cb0ad79e546adb07828335a704ad5210e047e09e986172fc9e34d"
+      }
+    ],
+    "bytes": 665319,
+    "sha256": "1911de0bdad9f3c3977c10708f3745529fc680176fc8451c6dc9e380dcf474be"
+  },
+  "attack/cwe.json": {
+    "derived_by": "tools/attack_data.py",
+    "fetched": "2026-11-22",
+    "sources": [
+      {
+        "url": "https://cwe.mitre.org/data/xml/cwec_latest.xml.zip",
+        "sha256": "bcda44c9abf61ff977f50c3c6649eea5a97a7b0626b0396c2c3ec4bfb973a3dc"
+      }
+    ],
+    "bytes": 1059189,
+    "sha256": "71b2448bfacbfb978927060d6a84f5289918a9e052cfc4874b0ce6473f88d23f"
+  },
+  "attack/mappings.json": {
+    "derived_by": "tools/attack_data.py",
+    "fetched": "2026-11-22",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/center-for-threat-informed-defense/mappings-explorer/main/mappings/nist_800_53/attack-16.1/nist_800_53-rev5/enterprise/nist_800_53-rev5_attack-16.1-enterprise.json",
+        "sha256": "355ae97d309c00eb2428e5af07754ff4ca16cfe63928194081d0e883aed929c8"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/center-for-threat-informed-defense/mappings-explorer/main/mappings/aws/attack-19.1/aws-11.06.2026/enterprise/aws-11.06.2026_attack-19.1-enterprise.json",
+        "sha256": "f123e4f0f67fbc21a7415679f3dbf082a6e382904d5b4b38898a61df1bc220bb"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/center-for-threat-informed-defense/mappings-explorer/main/mappings/kev/attack-16.1/kev-07.28.2025/enterprise/kev-07.28.2025_attack-16.1-enterprise.json",
+        "sha256": "b57b3d382809d9159fdda6701d21f0e67a2d655444d89301caab2c39ad54bdc7"
+      }
+    ],
+    "bytes": 455823,
+    "sha256": "a0a746c70ebbe956b781fcd0c4cbea8e2cc2347b85a1cde7172fc810d84168c0"
   }
 }

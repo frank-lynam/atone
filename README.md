@@ -16,6 +16,13 @@ listening ports, and **no internet needed**: NIST's 800-53 catalog and baselines
 No sudo either: it reads what the account can, and says so where it can't. Any system, any customer: nothing about
 one product is in it.
 
+**Security first.** Before the compliance documents comes **atonement**: the hobkin studies the system the way a
+capable, automated attacker would, builds an attack graph from the evidence (each step cited, or flagged as
+assumed), and `atone attack` works out, for each attacker profile and mission effect, the cheapest way in, the
+controls in the way, and the fewest lock-downs that cut every path. The bar defaults high (AI attackers assumed):
+every path crosses two controls and every step on it is detected. MITRE ATT&CK, CAPEC and CWE, and the mappings from
+ATT&CK to 800-53 and AWS, ship in the package. The design: DESIGN.md 4a.
+
 ## With a hobkin
 
 ```sh
@@ -43,6 +50,10 @@ atone import tst                               # scans in imports/: OpenSCAP nat
 atone import tst --eaveswatch s3://bucket/ew   # logging evidence (AU) from an eaveswatch store
 atone evidence tst search keep_logs            # ranked full-text search over the current evidence
 atone doc SSP.docx --out ssp.txt               # a Word or Excel document as text: headings, lists, tables
+atone attack tst [--paths 5]                   # atonement: attack paths, the controls in the way, what to lock down
+atone attack tst --close STEP                  # what if that step were blocked?
+atone attack technique T1552.005               # the attacker library: a technique, its mitigations, 800-53, AWS
+atone attack search instance metadata          # ...or search it (atone attack lore: as a lore)
 atone check tst                                # every control: met, partly, not met, unknown, inherited
 atone verify tst                               # drafted narratives: each claim's citation checked
 atone fill tst --out package/                  # copies of the workbooks, filled in, with what changed and why
@@ -76,6 +87,9 @@ on branches, merging is approval, and each package is a tag.
 | `site.json` | commands atone doesn't have, and extra redaction patterns; evidence from them is marked as such | a person's, never the agent's |
 | `mappings/controls/` | the evidence that bears on each control, checks as data (`starter.json` to begin from) | drafted by the agent, owned by the ISSE |
 | `mappings/scanners/`, `mappings/workbooks/` | how to read each scanner export and fill each working document | drafted by the agent, confirmed by the ISSE |
+| `attack/` | the attack graph: mission effects and other conditions, attacker profiles, `steps/` (each cited, or flagged as assumed) | drafted by the hobkin, effects refined by the team |
+| `risks/` | lock-downs: the exact change, and a check that keeps proving it's in place | proposed by the hobkin, made by people (or accepted) |
+| `engagement.json` | the rules of engagement: the replicas it may test, how deep, the bar for atonement | agreed with the hobkin (`atone decide ... engagement`) |
 | `evidence/HOST/KIND/` | redacted evidence at stable paths, committed only when it changes | atone's |
 | `controls/` | each control's status, findings and implementation statement (drafted, verified, reviewed) | atone's and the reviewers' |
 | `poam/` | the POA&M items, opened as findings appear | atone's; closed by decisions |

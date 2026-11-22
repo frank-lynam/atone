@@ -44,5 +44,5 @@ atone = "atone:hobkin_pack"   # hobkin --chore atone: the chore and its skills
 name = "atone"
 
 [tool.flit.sdist]
-include = ["tests/"]
+include = ["tests/", "tools/"]
 exclude = ["CLAUDE.md", "AGENTS.md"]

@@ -42,6 +42,7 @@ Standard library only, plus lorewell for lores.
 from __future__ import annotations
 
 import argparse
+import collections
 import fnmatch
 import glob
 import hashlib
@@ -72,6 +73,7 @@ __version__ = "0.2.1"
 #   checks        control mappings (the ISSE's), the check engine, verifying a narrative's citations
 #   workbooks     the customer's Excel files: read, filled in (a copy, only cell values), what changed; Word as text
 #   architecture  one graph of actual, allowed and documented paths; draw.io and SVG, with what differs
+#   attack        atonement: the attacker library, the attack graph, its analysis (the self-pruning spanning tree)
 #   plan          the engagement plan (what's left, who does it), what's due, the report people read
 #   oscal         the SSP, assessment results and POA&M as OSCAL 1.1.2
 #   pack          atone as an expert pack for hobkin: a chore and its skills (the hobkin.packs entry point)
@@ -2047,7 +2049,8 @@ def review_statements(d: Path, cids: list[str], by: str) -> str | None:
                         [("Reviewed-by", by)] + [("Control", c) for c in cids], paths=["controls"])
 
 
-DECISION_KINDS = ("risk-acceptance", "deviation", "false-positive", "tailoring", "poam-schedule", "poam-close", "other")
+DECISION_KINDS = ("risk-acceptance", "deviation", "false-positive", "tailoring", "poam-schedule", "poam-close",
+                  "engagement", "atonement", "other")
 
 
 def decide(d: Path, kind: str, what: str, by: str, controls: list[str] | None = None, until: str | None = None,
@@ -2066,6 +2069,20 @@ def decide(d: Path, kind: str, what: str, by: str, controls: list[str] | None = 
             raise AtoneError("an approved schedule needs the proposed one: --from FILE ({item key: date})")
         write_json(d / "decisions" / "poam-schedule.json", {**rec, "dates": dates})
     else:
+        if kind == "engagement":                 # the rules of engagement the hobkin drafted with them: agreed
+            eng = read_json(d / "engagement.json", None)
+            if not isinstance(eng, dict):
+                raise AtoneError("there's no engagement.json to agree yet: draft it with the hobkin first")
+            write_json(d / "engagement.json", {**eng, "agreed": {"by": by, "at": today, "what": what}})
+            paths.append("engagement.json")
+        if kind == "risk-acceptance" and items:  # lock-downs nobody will make: accepted, by name, with why
+            for rid in items:
+                p = d / "risks" / f"{rid}.json"
+                if not p.exists():
+                    raise AtoneError(f"no lock-down {rid} in risks/")
+                write_json(p, {**read_json(p, {}), "state": "accepted", "accepted_by": by, "accepted_at": today,
+                               "accepted_because": what, "until": until})
+            paths.append("risks")
         if kind == "poam-close":
             if not items:
                 raise AtoneError("poam-close needs --item KEY (one or more)")
@@ -2598,12 +2615,12 @@ def mapping_formats() -> dict:
     return {"controls": CONTROL_MAPPING, "scanner": SCANNER_MAPPING, "ssp": SSP_MAPPING, "poam": POAM_MAPPING}
 
 
-def describe_format(kind: str) -> str:
-    """A mapping format as text: the same definitions the readers check mappings against."""
-    formats = mapping_formats()
+def describe_format(kind: str, formats: dict | None = None, command: str = "mappings") -> str:
+    """A format as text: the same definitions the readers check the files against."""
+    formats = formats or mapping_formats()
     if kind not in formats:
-        return "mapping formats: " + ", ".join(f"{k} ({f['about']})" for k, f in formats.items()) + \
-               "\n  atone mappings --example KIND"
+        return f"{command} formats: " + ", ".join(f"{k} ({f['about']})" for k, f in formats.items()) + \
+               f"\n  atone {command} --example KIND"
     f = formats[kind]
     out = [f"# {kind}: {f['about']}", f"file: {f['file']}", "", "keys:"]
     out += [f"  {k}{' (required)' if k in f.get('required', []) else ''}: {v}" for k, v in f["keys"].items()]
@@ -3605,6 +3622,558 @@ def draw_system(name: str, out: Path, log=print) -> dict:
     return g
 
 
+# ---- attack: atonement (DESIGN.md 4a): the attacker library, the attack graph, its analysis
+
+# How much an attacker has to do for a step. On real systems the paths are mostly misconfigurations, exposed
+# credentials and too much access, so it's a level, not a time; and with AI attackers assumed, *hard* is no
+# protection on its own: only *blocked* (a control, cited) is.
+EFFORTS = ("free", "demonstrated", "commodity", "hard", "blocked")
+EFFORT_COST = {"free": 0, "demonstrated": 0, "commodity": 1, "hard": 2}
+EFFORT_LEVELS = ("free", "commodity", "hard")
+BASES = ("evidence", "demonstrated", "assumed")
+CONDITION_KINDS = ("access", "execution", "privilege", "credential", "data", "effect")
+GATE = {"layers": 2, "detected": True}     # the default bar: every path crosses two controls, every step is seen
+
+# What a kind of cloud component exposes until the evidence says otherwise: where the hobkin starts its steps
+COMPONENT_DEFAULTS = [
+    ("public endpoint (load balancer, API gateway, web server)", "reachable from the internet; its software's known "
+     "flaws (commodity)"),
+    ("identity: a cloud role, a user, a service account, an access key", "everything its policy allows; anything that "
+     "can assume or use it gets the same"),
+    ("storage (bucket, file share, snapshot, backup)", "read and write by anyone its policy and ACLs allow; public if "
+     "the account allows public access"),
+    ("managed database", "reachable from its security groups; credentials wherever the app keeps them"),
+    ("compute (VM, container, function)", "its instance or task role's permissions; its metadata service; secrets in "
+     "its environment"),
+    ("secrets store, key service", "every secret or key its policies let a principal read or use"),
+    ("CI/CD and its runners", "the deploy: whatever it can push, and every credential it holds"),
+    ("an outside service it trusts (SaaS, a partner, an identity provider)", "whatever that trust grants, if the "
+     "outside service is taken"),
+    ("a person (an admin, a developer)", "their credentials and sessions, by phishing or a stolen laptop"),
+]
+
+_CITES = "[{evidence: ID, quote: \"exact words\"} or {document: PATH, quote}] (checked like a narrative's)"
+CONDITION_FORMAT = {
+    "file": "attack/conditions.json (a list)", "about": "what an attacker can come to hold, ending in mission effects",
+    "keys": {"id": "a short id (net:internet, exec:app01:root, cred:deploy-key, data:payroll, effect:payroll-read)",
+             "kind": "access, execution, privilege, credential, data or effect (a mission effect)",
+             "about": "what holding it means", "consequence": "effects only: what it does to the mission, and to whom",
+             "impact": "effects only: low, moderate or high"},
+    "required": ["id", "kind"],
+    "example": {"id": "effect:payroll-read", "kind": "effect", "about": "the payroll records read out of the system",
+                "consequence": "every employee's pay and bank details exposed", "impact": "high"},
+}
+PROFILE_FORMAT = {
+    "file": "attack/profiles.json (a list)", "about": "who attacks, and where they start",
+    "keys": {"id": "a short id (internet, phished-user, insider-vpn, poisoned-dependency, stolen-laptop)",
+             "about": "who they are, and what they can do", "starts": "[the condition ids they hold at the start]"},
+    "required": ["id", "starts"],
+    "example": {"id": "internet", "about": "anyone on the internet, with automated tools and AI help",
+                "starts": ["net:internet"]},
+}
+STEP_FORMAT = {
+    "file": "attack/steps/ID.json", "about": "one way from a condition to another: an edge of the attack graph",
+    "keys": {"id": "its id (the file's name)", "from": "the condition it starts from",
+             "to": "the condition it gives", "requires": "[other conditions it needs too] (a credential and access)",
+             "technique": "an ATT&CK id (T1078.004), where there is one", "about": "what the attacker does",
+             "effort": "free, demonstrated, commodity, hard, or blocked (a control stops it: cite it)",
+             "basis": "evidence, demonstrated or assumed (assumed counts as commodity, and is flagged)",
+             "cites": _CITES, "detection": "[{by: what sees it, cites: [...]}] ([] or left out: nothing does)",
+             "component": "which part of the system (the system spec's component), for the defaults"},
+    "required": ["id", "from", "to", "effort", "basis"],
+    "example": {"id": "public-bucket-read", "from": "net:internet", "to": "data:payroll", "technique": "T1530",
+                "about": "the payroll export bucket allows public reads", "effort": "free", "basis": "evidence",
+                "cites": [{"evidence": "aws.aws.20261122T101500Z.1a2b3c4d", "quote": "\"Principal\": \"*\""}],
+                "detection": [{"by": "S3 server access logs, reviewed by eaveswatch"}]},
+}
+RISK_FORMAT = {
+    "file": "risks/ID.json", "about": "a lock-down: the steps it closes, the exact change, and the check that proves it",
+    "keys": {"id": "its id (the file's name)", "closes": "[the step ids it blocks]", "change": "the exact change",
+             "check": "a check, as in a control mapping: {evidence: {kind, source, host...}, type, pattern...}",
+             "state": "open, fixed (its check passes), or accepted (a person decided: atone decide risk-acceptance)",
+             "owner": "who makes the change"},
+    "required": ["id", "closes", "change"],
+    "example": {"id": "block-public-bucket", "closes": ["public-bucket-read"],
+                "change": "turn on S3 Block Public Access for the account, and remove the bucket policy's * grant",
+                "check": {"evidence": {"kind": "aws", "source": "s3control get-public-access-block*"},
+                          "type": "present", "pattern": "\"BlockPublicPolicy\": true"}, "owner": "devops"},
+}
+ENGAGEMENT_FORMAT = {
+    "file": "engagement.json", "about": "the rules of engagement, agreed with the hobkin (atone decide engagement)",
+    "keys": {"targets": "[hosts it may test: the replicas, never others]", "represents": "the system they stand in for",
+             "depth": "think, read (the default), probe, or exploit (on the targets only)",
+             "out_of_bounds": "[what never to do, even on a target]", "windows": "when, if that matters",
+             "gate": "{layers: 2, detected: true}: the bar for atonement (lower it only by a recorded decision)"},
+    "required": [],
+    "example": {"targets": ["replica-app01", "replica-db01"], "represents": "payroll (production)", "depth": "exploit",
+                "out_of_bounds": ["deleting data", "anything on shared infrastructure"],
+                "gate": {"layers": 2, "detected": True}},
+}
+
+
+def attack_formats() -> dict:
+    return {"condition": CONDITION_FORMAT, "profile": PROFILE_FORMAT, "step": STEP_FORMAT, "risk": RISK_FORMAT,
+            "engagement": ENGAGEMENT_FORMAT}
+
+
+_LIBRARY: dict = {}
+
+
+def attack_library(part: str) -> dict:
+    """The attacker library shipped in atone/data/attack/: attack (ATT&CK), capec, cwe, mappings."""
+    if part not in _LIBRARY:
+        _LIBRARY[part] = read_json(DATA / "attack" / f"{part}.json", {})
+    return _LIBRARY[part]
+
+
+def describe_technique(tid: str) -> str:
+    """An ATT&CK technique, word for word, with its mitigations, the 800-53 controls and AWS services mapped to it,
+    and the attack patterns that use it."""
+    a, m = attack_library("attack"), attack_library("mappings")
+    tid = tid.upper()
+    t = (a.get("techniques") or {}).get(tid)
+    if not t:
+        raise AtoneError(f"no ATT&CK technique {tid} (atone attack search WORDS)")
+    out = [f"{tid} {t['name']} (ATT&CK {a.get('version')})", f"tactics: {', '.join(t['tactics'])}",
+           f"platforms: {', '.join(t['platforms'])}", "", t["description"].strip(), "", "mitigations:"]
+    out += [f"  {mid} {a['mitigations'].get(mid, {}).get('name', '?')}" for mid in t["mitigations"]] or ["  (none in ATT&CK)"]
+    if t["detection"]:
+        out += ["", "detection strategies:"] + [f"  {x}" for x in t["detection"]]
+    ctl = (m.get("nist_800_53") or {}).get("techniques", {}).get(tid)
+    out += ["", "800-53 controls that mitigate it: " + (", ".join(ctl) if ctl else "none mapped (mappings are for ATT&CK "
+                                                         f"{(m.get('nist_800_53') or {}).get('about', {}).get('attack_version')})")]
+    aws = (m.get("aws") or {}).get("techniques", {}).get(tid) or []
+    if aws:
+        out += ["", "AWS:"] + [f"  {x['service']}: {x['category']} ({x['value']})" for x in aws]
+    caps = [f"{k} {p['name']}" for k, p in attack_library("capec").get("patterns", {}).items()
+            if tid in p["attack"] or tid.split(".")[0] in p["attack"]]
+    if caps:
+        out += ["", "attack patterns (CAPEC):"] + [f"  {c}" for c in caps[:20]]
+    return "\n".join(out)
+
+
+def search_library(words: str, n: int = 15) -> list[tuple[str, str]]:
+    """The techniques, mitigations, attack patterns and weaknesses whose names and descriptions share the most
+    words with `words`: [(id, name)]."""
+    want = {w for w in re.findall(r"[a-z0-9]+", words.lower()) if len(w) > 2}
+    rows = []
+    for kind, key in (("attack", "techniques"), ("attack", "mitigations"), ("capec", "patterns"), ("cwe", "weaknesses")):
+        for i, x in (attack_library(kind).get(key) or {}).items():
+            name = x.get("name", "")
+            score = 3 * len(want & set(re.findall(r"[a-z0-9]+", name.lower()))) + \
+                len(want & set(re.findall(r"[a-z0-9]+", (x.get("description") or "")[:2000].lower())))
+            if score:
+                rows.append((score, i, name))
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    return [(i, name) for _, i, name in rows[:n]]
+
+
+def compile_attack_lore(out: Path) -> dict:
+    """The attacker library as a lorewell lore, word for word: ATT&CK's tactics, techniques and mitigations, CAPEC's
+    attack patterns and CWE's weaknesses, a section each and a symbol per id. No model touches it."""
+    import lorewell
+    a, cap, cwe_ = attack_library("attack"), attack_library("capec"), attack_library("cwe")
+    sections, symbols = [], []
+    for sid, title, about in (("attack", f"MITRE ATT&CK Enterprise {a.get('version')}", "Tactics and techniques."),
+                              ("mitigations", "ATT&CK mitigations", "What blocks techniques."),
+                              ("capec", f"CAPEC {cap.get('version')}", "Attack patterns."),
+                              ("cwe", f"CWE {cwe_.get('version')}", "Weaknesses.")):
+        sections.append({"id": sid, "parent": None, "title": title, "body": about, "source": ""})
+    for tid, t in (a.get("tactics") or {}).items():
+        sections.append({"id": t["short"], "parent": "attack", "title": f"{tid} {t['name']}", "body": t["description"],
+                         "source": ""})
+    for tid, t in (a.get("techniques") or {}).items():
+        body = [f"{tid} {t['name']}", f"Tactics: {', '.join(t['tactics'])}. Platforms: {', '.join(t['platforms'])}.",
+                "", t["description"].strip()]
+        if t["mitigations"]:
+            body += ["", "Mitigations: " + ", ".join(f"{m} {a['mitigations'].get(m, {}).get('name', '')}"
+                                                     for m in t["mitigations"])]
+        ctl = (attack_library("mappings").get("nist_800_53") or {}).get("techniques", {}).get(tid)
+        if ctl:
+            body += ["", "800-53 controls that mitigate it: " + ", ".join(ctl)]
+        sections.append({"id": tid, "parent": (t["tactics"] or ["attack"])[0], "title": f"{tid} {t['name']}",
+                         "body": "\n".join(body), "source": "https://attack.mitre.org/"})
+        symbols.append({"name": tid, "kind": "keyword", "signature": tid, "summary": t["name"], "section": tid,
+                        "body": t["description"][:4000]})
+    for mid, m in (a.get("mitigations") or {}).items():
+        sections.append({"id": mid, "parent": "mitigations", "title": f"{mid} {m['name']}", "body": m["description"],
+                         "source": "https://attack.mitre.org/"})
+        symbols.append({"name": mid, "kind": "keyword", "signature": mid, "summary": m["name"], "section": mid,
+                        "body": m["description"][:4000]})
+    for kind, coll, url in (("capec", cap.get("patterns") or {}, "https://capec.mitre.org/"),
+                            ("cwe", cwe_.get("weaknesses") or {}, "https://cwe.mitre.org/")):
+        for i, x in coll.items():
+            body = [f"{i} {x['name']}", "", x["description"]]
+            for label, key in (("Prerequisites", "prerequisites"), ("Mitigations", "mitigations")):
+                if x.get(key):
+                    body += ["", f"{label}:"] + [f"- {v}" for v in x[key]]
+            sections.append({"id": i, "parent": kind, "title": f"{i} {x['name']}", "body": "\n".join(body), "source": url})
+            symbols.append({"name": i, "kind": "keyword", "signature": i, "summary": x["name"], "section": i,
+                            "body": x["description"][:4000]})
+    with tempfile.TemporaryDirectory() as t:
+        src = Path(t)
+        (src / "pack.json").write_text(json.dumps({
+            "name": "attacker-library", "title": "The attacker library: ATT&CK, CAPEC and CWE, compiled exactly",
+            "language": "MITRE ATT&CK", "version": str(a.get("version")), "description": "MITRE's attack techniques, "
+            "mitigations, attack patterns and weaknesses, word for word (see atone/data/attack/LICENSES.md)"}))
+        for name, rows in (("sections.jsonl", sections), ("symbols.jsonl", symbols)):
+            (src / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        (src / "cheatsheet.md").write_text(
+            "Look an id up (`symbol T1078.004`, `symbol CAPEC-560`, `symbol CWE-798`), or search its words (`search "
+            "metadata service credentials`). A technique's section lists its mitigations and the 800-53 controls "
+            "mapped to it. All of it is MITRE's text, word for word.\n")
+        return lorewell.compile_pack(src, out, check=False, log=lambda *a: None)
+
+
+def spst(adj: dict, sources, sinks) -> dict:
+    """The self-pruning spanning tree (Frank Lynam, github.com/frank-lynam/self-pruning-spanning-tree, Apache-2.0):
+    a spanning tree from the sources stored with its edges reversed, then a spanning tree of *that* from the sinks,
+    leaves exactly the subgraph of every path from a source to a sink. `adj`: {node: [(next, key)]}; returns the
+    same shape, holding only those edges."""
+    def span(graph, starts):
+        tree = {s: [] for s in starts}
+        stack, seen, i = list(tree), set(tree), 0
+        while i < len(stack):
+            node = stack[i]
+            i += 1
+            for nxt, key in graph.get(node, ()):
+                tree.setdefault(nxt, []).append((node, key))
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return tree
+    back = span(adj, [s for s in sources])
+    return {k: v for k, v in span(back, [s for s in sinks if s in back]).items() if v}
+
+
+def load_attack(d: Path) -> dict:
+    """The system's attack graph: conditions, profiles, steps (each checked: a citation that doesn't hold makes the
+    step assumed, and a blocked step without proof isn't blocked), risks and their checks, the engagement, and
+    every problem found doing that."""
+    problems = []
+    conditions = {c.get("id"): c for c in read_json(d / "attack" / "conditions.json", []) if isinstance(c, dict)}
+    profiles = {p.get("id"): p for p in read_json(d / "attack" / "profiles.json", []) if isinstance(p, dict)}
+    for c in conditions.values():
+        problems += [f"condition {c.get('id')}: {x}" for x in format_problems(CONDITION_FORMAT, c)]
+        if c.get("kind") not in CONDITION_KINDS:
+            problems.append(f"condition {c.get('id')}: kind {c.get('kind')!r} isn't one of {', '.join(CONDITION_KINDS)}")
+    for p in profiles.values():
+        problems += [f"profile {p.get('id')}: {x}" for x in format_problems(PROFILE_FORMAT, p)]
+        problems += [f"profile {p.get('id')}: starts at {s!r}, which isn't a condition" for s in p.get("starts") or []
+                     if s not in conditions]
+    techniques = attack_library("attack").get("techniques") or {}
+    steps = {}
+    for f in sorted((d / "attack" / "steps").glob("*.json")) if (d / "attack" / "steps").is_dir() else []:
+        s = {**read_json(f, {}), "_file": str(f.relative_to(d))}
+        s.setdefault("id", f.stem)
+        problems += [f"step {s['id']}: {x}" for x in format_problems(STEP_FORMAT, s)]
+        for key, cid in [("from", s.get("from")), ("to", s.get("to"))] + [("requires", r) for r in s.get("requires") or []]:
+            if cid not in conditions:
+                problems.append(f"step {s['id']}: {key} {cid!r} isn't a condition")
+        if s.get("effort") not in EFFORTS:
+            problems.append(f"step {s['id']}: effort {s.get('effort')!r} isn't one of {', '.join(EFFORTS)}")
+            s["effort"] = "commodity"
+        if s.get("basis") not in BASES:
+            problems.append(f"step {s['id']}: basis {s.get('basis')!r} isn't one of {', '.join(BASES)}")
+            s["basis"] = "assumed"
+        if s.get("technique") and str(s["technique"]).upper() not in techniques:
+            problems.append(f"step {s['id']}: {s['technique']} isn't an ATT&CK technique (in {attack_library('attack').get('version')})")
+        s["claimed"] = (s["effort"], s["basis"])
+        if s["basis"] in ("evidence", "demonstrated"):
+            v = verify_narrative(d, {"control": "attack", "claims": [{"text": s.get("about") or s["id"],
+                                                                      "cites": s.get("cites") or []}]})
+            if v["dropped"]:
+                problems.append(f"step {s['id']}: its evidence doesn't hold ({v['dropped'][0]['why']}): counted as assumed")
+                s["basis"] = "assumed"
+        if s["basis"] == "assumed" and s["effort"] in ("free", "demonstrated", "blocked"):
+            s["effort"] = "commodity"        # unproven: open to anyone with a tool, and no control is counted
+        s["detected_by"] = [x.get("by") for x in s.get("detection") or [] if isinstance(x, dict) and x.get("by")]
+        steps[s["id"]] = s
+    risks = {}
+    for f in sorted((d / "risks").glob("*.json")) if (d / "risks").is_dir() else []:
+        r = {**read_json(f, {}), "_file": str(f.relative_to(d))}
+        if "closes" not in r:              # the POA&M's items live in poam/; risks/ is the lock-downs
+            continue
+        r.setdefault("id", f.stem)
+        problems += [f"risk {r['id']}: {x}" for x in format_problems(RISK_FORMAT, r)]
+        problems += [f"risk {r['id']}: closes {sid!r}, which isn't a step" for sid in r.get("closes") or [] if sid not in steps]
+        risks[r["id"]] = r
+    engagement = read_json(d / "engagement.json", {})
+    problems += [f"engagement: {x}" for x in format_problems(ENGAGEMENT_FORMAT, engagement)]
+    return {"conditions": conditions, "profiles": profiles, "steps": steps, "risks": risks, "engagement": engagement,
+            "gate": {**GATE, **(engagement.get("gate") or {})}, "problems": problems}
+
+
+def apply_risks(d: Path, g: dict) -> dict:
+    """Each lock-down's check, run on the current evidence: a passing one blocks the steps it closes (the check is
+    the control), so the analysis counts what's really in place, and a lapse reopens them."""
+    spec = read_json(d / "system.json", {})
+    inside = in_boundary(spec)
+    index = [e for e in current_index(d) if e["kind"] == "site" or inside(e["host"])]
+    for r in g["risks"].values():
+        chk = r.get("check") or {}
+        if not chk.get("evidence"):
+            r["status"] = "no check"
+            continue
+        recs = [x for x in (load_record(d, e) for e in select(index, chk["evidence"], spec)) if x]
+        res = run_check({**chk, "id": r["id"], "evidence": None}, recs, "attack", {})
+        r["status"], r["result"] = res["status"], res
+        if res["status"] == "pass":
+            for sid in r.get("closes") or []:
+                if sid in g["steps"]:
+                    g["steps"][sid].update(effort="blocked", basis="evidence", locked_by=r["id"])
+    return g
+
+
+def _edges(g: dict, level: str | None = None, include_blocked: bool = False) -> dict:
+    """The graph as {condition: [(next, step id)]}: steps at or below an effort level (free, commodity, hard), and
+    with include_blocked, the blocked ones too. A step that requires other conditions is usable once they're
+    reachable (worked out by the caller)."""
+    limit = EFFORT_COST[level] if level else 99
+    adj = {}
+    for s in g["steps"].values():
+        if s["effort"] == "blocked" and not include_blocked:
+            continue
+        if s["effort"] != "blocked" and EFFORT_COST[s["effort"]] > limit:
+            continue
+        adj.setdefault(s["from"], []).append((s["to"], s["id"]))
+    return adj
+
+
+def _usable(g: dict, adj: dict, sources) -> dict:
+    """Drop steps whose other requirements can't be reached, until nothing changes."""
+    while True:
+        reach = set(spst_reach(adj, sources))
+        keep = {n: [(t, k) for t, k in v if set(g["steps"][k].get("requires") or []) <= reach] for n, v in adj.items()}
+        if keep == adj:
+            return adj
+        adj = keep
+
+
+def spst_reach(adj: dict, sources) -> list:
+    out, seen, i = list(sources), set(sources), 0
+    while i < len(out):
+        for nxt, _ in adj.get(out[i], ()):
+            if nxt not in seen:
+                seen.add(nxt)
+                out.append(nxt)
+        i += 1
+    return out
+
+
+def attack_subgraph(g: dict, sources, sinks, level: str | None = None, include_blocked: bool = False) -> dict:
+    """Every step on a path from `sources` to `sinks` (and on the paths to what those steps require)."""
+    adj = _usable(g, _edges(g, level, include_blocked), sources)
+    want = set(sinks)
+    while True:
+        sub = spst(adj, sources, want)
+        need = {r for v in sub.values() for _, k in v for r in g["steps"][k].get("requires") or []}
+        if need <= want:
+            return sub
+        want |= need
+
+
+def _layers(g: dict, sources, sink) -> int | None:
+    """The fewest controls (blocked steps) an attacker must get past to reach `sink`: 0-1 breadth first, blocked
+    steps costing 1. None: no path at all."""
+    adj = _usable(g, _edges(g, include_blocked=True), sources)
+    dist = {s: 0 for s in sources}
+    queue = collections.deque(sources)
+    while queue:
+        n = queue.popleft()
+        for nxt, k in adj.get(n, ()):
+            w = dist[n] + (1 if g["steps"][k]["effort"] == "blocked" else 0)
+            if w < dist.get(nxt, 1 << 30):
+                dist[nxt] = w
+                (queue.append if w > dist[n] else queue.appendleft)(nxt)
+    return dist.get(sink)
+
+
+def min_cut(g: dict, sources, sink, level: str = "hard") -> list[str]:
+    """The fewest steps whose closing leaves no path from the sources to `sink` without a control (each step a unit
+    capacity; Edmonds-Karp on the subgraph the spanning tree leaves): the lock-downs that matter most, together."""
+    sub = attack_subgraph(g, sources, [sink], level)
+    arcs = [(n, t, k) for n, v in sub.items() for t, k in v]
+    if not arcs:
+        return []
+    src = "\0source"
+    arcs += [(src, s, None) for s in sources]
+    cap, graph = {}, collections.defaultdict(list)
+    for i, (a, b, k) in enumerate(arcs):
+        cap[(i, 1)] = 10 ** 9 if k is None else 1
+        cap[(i, -1)] = 0
+        graph[a].append((b, i, 1))
+        graph[b].append((a, i, -1))
+    while True:                             # augmenting paths, breadth first
+        prev, queue = {src: None}, collections.deque([src])
+        while queue and sink not in prev:
+            n = queue.popleft()
+            for m, i, way in graph[n]:
+                if m not in prev and cap[(i, way)] > 0:
+                    prev[m] = (n, i, way)
+                    queue.append(m)
+        if sink not in prev:
+            break
+        n = sink
+        while prev[n]:
+            p, i, way = prev[n]
+            cap[(i, way)] -= 1
+            cap[(i, -way)] += 1
+            n = p
+    side = set(prev)                        # what the source still reaches: the cut is the arcs leaving it
+    return sorted({k for a, b, k in arcs if k and a in side and b not in side})
+
+
+def analyse_attack(d: Path, close=(), harden=None) -> dict:
+    """For every attacker profile and mission effect: its exposure (the cheapest effort level with a path that
+    crosses no control), its layers (the fewest controls on any path), the fewest lock-downs that cut every path
+    without a control, the paths that rest on a single control, and the steps on its paths that nothing detects.
+    `close` and `harden` ({step: level}) are what-ifs."""
+    g = apply_risks(d, load_attack(d))
+    for sid in close or ():
+        if sid in g["steps"]:
+            g["steps"][sid].update(effort="blocked", whatif=True)
+    for sid, level in (harden or {}).items():
+        if sid in g["steps"]:
+            g["steps"][sid].update(effort=level, whatif=True)
+    effects = [c for c, x in g["conditions"].items() if x.get("kind") == "effect"]
+    out = []
+    for pid, p in g["profiles"].items():
+        starts = [s for s in p.get("starts") or [] if s in g["conditions"]]
+        for eff in effects:
+            reaches = lambda sub: any(t == eff for v in sub.values() for t, _ in v)
+            exposure = next((lv for lv in EFFORT_LEVELS if reaches(attack_subgraph(g, starts, [eff], lv))), None)
+            layers = _layers(g, starts, eff)
+            if layers is None:
+                continue                    # no way there at all
+            full = attack_subgraph(g, starts, [eff], include_blocked=True)
+            on_paths = sorted({k for v in full.values() for _, k in v})
+            unseen = [k for k in on_paths if not g["steps"][k]["detected_by"]]
+            free_reach = set(spst_reach(_usable(g, _edges(g), starts), starts))
+            back = {}
+            for n, v in _usable(g, _edges(g), starts).items():
+                for t, k in v:
+                    back.setdefault(t, []).append((n, k))
+            to_eff = set(spst_reach(back, [eff]))
+            single = sorted(k for k in on_paths if g["steps"][k]["effort"] == "blocked"
+                            and g["steps"][k]["from"] in free_reach and g["steps"][k]["to"] in to_eff)
+            gate = g["gate"]
+            ok = layers >= int(gate.get("layers", 2)) and (not gate.get("detected", True) or not unseen)
+            accepted = sorted(r["id"] for r in g["risks"].values() if r.get("state") == "accepted"
+                              and set(r.get("closes") or []) & set(on_paths))
+            out.append({"profile": pid, "effect": eff, "impact": g["conditions"][eff].get("impact"),
+                        "exposure": exposure, "layers": layers, "cut": min_cut(g, starts, eff) if exposure else [],
+                        "single_control": single if layers == 1 else [], "unseen": unseen, "steps": on_paths, "ok": ok,
+                        "accepted": accepted if not ok else []})
+    assumed = sorted(k for k, s in g["steps"].items() if s["basis"] == "assumed")
+    return {"pairs": out, "assumed": assumed, "problems": g["problems"], "gate": g["gate"],
+            "risks": {k: r.get("status") for k, r in g["risks"].items()}, "graph": g,
+            "done": bool(out) and all(x["ok"] or x["accepted"] for x in out) and not g["problems"]}
+
+
+def attack_paths(g: dict, sources, sink, n: int = 10) -> list[list[str]]:
+    """Up to `n` paths (as step ids) from the sources to `sink`, through the subgraph only: fewest controls first,
+    then shortest. For reading, not for counting."""
+    sub = attack_subgraph(g, sources, [sink], include_blocked=True)
+    found = []
+
+    def walk(node, path, seen):
+        if len(found) >= n * 20:
+            return
+        if node == sink:
+            found.append(list(path))
+            return
+        for nxt, k in sub.get(node, ()):
+            if nxt not in seen:
+                walk(nxt, path + [k], seen | {nxt})
+    for s in sources:
+        walk(s, [], {s})
+    found.sort(key=lambda p: (sum(g["steps"][k]["effort"] == "blocked" for k in p), len(p)))
+    return found[:n]
+
+
+def attack_report(a: dict, paths: int = 0) -> str:
+    """The analysis as people read it."""
+    g, lines = a["graph"], []
+    if not a["pairs"]:
+        lines.append("no attacker profile reaches a mission effect yet: draft the graph (attack/conditions.json, "
+                     "profiles.json, steps/), or check the problems below")
+    for x in sorted(a["pairs"], key=lambda x: (x["ok"], x["layers"], x["exposure"] or "z")):
+        head = (f"{'ok  ' if x['ok'] else 'ACCEPTED' if x['accepted'] else 'OPEN'} {x['profile']} -> {x['effect']} "
+                f"({x['impact'] or '?'} impact): "
+                + (f"a path with no control, at {x['exposure']} effort" if x["exposure"] else f"{x['layers']} control"
+                   + ("s" if x["layers"] != 1 else "") + " on the best path"))
+        lines.append(head)
+        if x["accepted"]:
+            lines.append(f"     the risk is accepted, not closed: {', '.join(x['accepted'])}")
+        if x["cut"]:
+            lines.append(f"     closing these together cuts every path without a control: {', '.join(x['cut'])}")
+        if x["single_control"]:
+            lines.append(f"     paths that rest on one control: {', '.join(x['single_control'])}")
+        if x["unseen"]:
+            lines.append(f"     steps nothing detects: {', '.join(x['unseen'])}")
+        if paths:
+            starts = g["profiles"][x["profile"]].get("starts") or []
+            for p in attack_paths(g, starts, x["effect"], paths):
+                lines.append("     path: " + " -> ".join(f"{k} [{g['steps'][k]['effort']}]" for k in p))
+    if a["assumed"]:
+        lines.append(f"assumed (no evidence yet; counted as commodity): {', '.join(a['assumed'])}")
+    for k, st in a["risks"].items():
+        lines.append(f"lock-down {k}: {st}")
+    lines += [f"problem: {p}" for p in a["problems"]]
+    gate = a["gate"]
+    lines.append(f"the bar: every path crosses {gate.get('layers')} controls" + (", and every step on it is detected"
+                                                                              if gate.get("detected") else "")
+                 + f": {'met' if a['done'] else 'not met yet'}")
+    return "\n".join(lines)
+
+
+def attack_command(args) -> str:
+    """atone attack: the analysis of a system's attack graph, or the attacker library."""
+    if args.example is not None:
+        return describe_format(args.example, attack_formats(), "attack")
+    what, rest = args.target, args.rest
+    if what == "technique":
+        if not rest:
+            raise AtoneError("atone attack technique ID (T1078.004)")
+        return "\n\n".join(describe_technique(t) for t in rest)
+    if what == "search":
+        return "\n".join(f"{i}  {name}" for i, name in search_library(" ".join(rest))) or "nothing matches"
+    if what == "lore":
+        out = Path(args.out or HOME / "lores" / "attacker-library.lore.db")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        r = compile_attack_lore(out)
+        return f"{out}: {r['sections']} sections, {r['symbols']} symbols (install it: lorewell install {out})"
+    if what == "defaults":
+        return "What a kind of cloud component exposes until the evidence says otherwise:\n" + \
+            "\n".join(f"- {k}: {v}" for k, v in COMPONENT_DEFAULTS)
+    if not what:
+        raise AtoneError("atone attack SYSTEM (or technique ID, search WORDS, lore, defaults, --example KIND)")
+    d = system_dir(what)
+    harden = {}
+    for pair in filter(None, (args.harden or "").split(",")):
+        sid, _, level = pair.partition("=")
+        if level not in EFFORT_LEVELS:
+            raise AtoneError(f"--harden {pair}: the level is one of {', '.join(EFFORT_LEVELS)}")
+        harden[sid.strip()] = level
+    close = [x.strip() for x in (args.close or "").split(",") if x.strip()]
+    a = analyse_attack(d, close, harden)
+    if not close and not harden:             # the real state, for the plan and the report (a what-if isn't)
+        write_json(d / "runs" / "attack.json", {k: v for k, v in a.items() if k != "graph"})
+    text = attack_report(a, args.paths)
+    if close or harden:
+        base = {(x["profile"], x["effect"]): x for x in analyse_attack(d)["pairs"]}
+        diffs = []
+        for x in a["pairs"]:
+            b = base.get((x["profile"], x["effect"]))
+            if b and (b["exposure"], b["layers"]) != (x["exposure"], x["layers"]):
+                diffs.append(f"  {x['profile']} -> {x['effect']}: exposure {b['exposure'] or 'none'} -> "
+                             f"{x['exposure'] or 'none'}, controls {b['layers']} -> {x['layers']}")
+        text = ("what if " + ", ".join([f"{c} were blocked" for c in close] + [f"{k} were {v}" for k, v in harden.items()])
+                + ":\n" + ("\n".join(diffs) or "  it changes no path") + "\n\n" + text)
+    return text
+
+
 # ---- plan: the engagement plan (what's left, who does it), what's due, the report people read
 
 GUIDANCE = {      # guidance worth a lore (lorewell build, then lorewell review): help, never cited as a control
@@ -3639,6 +4208,40 @@ def plan(name: str) -> dict:
         items.append({"id": iid, "who": who, "what": what, "done": bool(done), "unblocks": unblocks,
                       "control": control})
 
+    # Atonement first (DESIGN.md 4a): how the system can be broken, locked down, before the documents
+    eng = read_json(d / "engagement.json", {})
+    conds = read_json(d / "attack" / "conditions.json", [])
+    has_graph = (d / "attack" / "steps").is_dir() and any((d / "attack" / "steps").glob("*.json"))
+    item("engagement", "hobkin", "the rules of engagement, drafted with your people (engagement.json: the replicas it "
+         "may test, how deep, what's out of bounds, the bar; atone attack --example engagement)", eng, "testing the replicas")
+    item("engagement-agreed", "person", f"agree the rules of engagement (atone decide {name} engagement \"what and "
+         "why\" --by NAME)", eng.get("agreed"), "active tests on the replicas")
+    item("attack-graph", "hobkin", "the attack graph: the mission effects and their consequences (recommended, for the "
+         "team to refine), attacker profiles, and the steps, from the evidence (your atone-atonement skill)",
+         has_graph, "knowing how the system can be broken")
+    item("effects", "person", "refine the mission effects the hobkin recommended (attack/conditions.json: what each does "
+         "to the mission, and its impact); mark one \"confirmed\" when the team agrees",
+         any(c.get("kind") == "effect" and c.get("confirmed") for c in conds if isinstance(c, dict)), "what matters most")
+    if has_graph:
+        a = analyse_attack(d)
+        for x in a["pairs"]:
+            if not x["ok"] and not x["accepted"]:
+                item(f"atone:{x['profile']}->{x['effect']}", "hobkin", f"lock down {x['profile']} -> {x['effect']}: "
+                     + (f"a path with no control at {x['exposure']} effort; propose lock-downs (risks/) for the cut: "
+                        f"{', '.join(x['cut'])}" if x["exposure"] else f"{x['layers']} control(s) on its best path; "
+                        "the bar is " + str(a["gate"].get("layers")))
+                     + (f"; nothing detects {', '.join(x['unseen'])}" if x["unseen"] else ""), False, "atonement")
+        item("assumed", "hobkin", f"evidence, or a test on a replica, for the assumed steps ({', '.join(a['assumed'][:8])}"
+             + ("..." if len(a["assumed"]) > 8 else "") + ")", not a["assumed"], "knowing, not assuming")
+        for rid, r in a["graph"]["risks"].items():
+            if r.get("state") != "accepted" and r.get("status") != "pass":
+                item(f"risk:{rid}", "person", f"make the change ({r.get('owner') or 'whoever owns it'}): "
+                     f"{clip_text(r.get('change') or rid, 160)}; or accept the risk (atone decide {name} risk-acceptance "
+                     f"\"why\" --item {rid} --by NAME)", False, "atonement")
+        decided = any((d / "decisions").glob("*-atonement-*.json")) if (d / "decisions").is_dir() else False
+        item("atonement", "person", f"confirm atonement is done when the bar is met (atone decide {name} atonement "
+             "\"why\" --by NAME): then the compliance documents" + ("" if a["done"] else " (not met yet)"),
+             decided, "the compliance documents")
     wbs = sorted((d / "workbooks").glob("*.xlsx"))
     item("documents", "person", "the working documents (SSP matrix, POA&M, inventories...), blank or partly done, "
          f"in {d / 'workbooks'}", wbs, "filling them in")
@@ -4021,6 +4624,12 @@ CHORE_MD = """# Your chore: atone, for {{system}}
 You keep the authorization of the system **{{system}}** true to the system. Assessors mostly take what the package
 says on trust, so being right matters more than being complete: when in doubt, say less, and say why.
 
+**Security first, then compliance.** The work has two phases. First, **atonement**: you study {{system}} the way an
+attacker would (a capable, automated one: assume AI attackers) to find every way it can be broken into or broken,
+and your people lock those ways down, until you can't find a lock-down that's still worth making. Only then the
+compliance documents, written from that work. Your atone-atonement skill is the method; atone-engagement sets how
+hard you may push.
+
 ## How it works
 
 - **atone is your toolkit; you are its apprentice.** `atone` (run it like any command; `atone --help`) collects
@@ -4073,10 +4682,63 @@ After each: `atone plan {{system}}`, and tell your people what changed and what 
 
 ## Your skills
 
+atone-engagement (the rules of engagement, first), atone-atonement (interrogating the system: phase 1),
 atone-become-expert (the lores), atone-system-spec, atone-mappings, atone-narratives, atone-drift, atone-conmon.
 Open the one for the step you're on, and follow it.
 """
 SKILLS = {
+    "atone-engagement": ("Agree the rules of engagement with your people: which replicas you may test, how hard, and "
+                         "the bar atonement must meet.", """
+1. Ask: which hosts stand in for {{system}} (replicas, dummy systems you may attack), and which real system they
+   represent; how deep you may go on them (*think*: reasoning only; *read*: read-only checks; *probe*: active scans and
+   attempts, like trying a login or reaching a port from outside; *exploit*: real exploitation); what's out of bounds
+   even there (deleting data, shared infrastructure); and any windows. On replicas, pushing hard is the point.
+2. Draft engagement.json (`atone attack --example engagement`). The bar defaults high, for AI attackers: every path
+   to a mission effect crosses two controls, and every step on it is detected. Lower it only if they ask, and say what
+   that gives up.
+3. Commit it, and ask a person to agree it: `atone decide {{system}} engagement "what and why" --by NAME`.
+4. Keep to it, always: test only the targets it names, no deeper than it says. Never the real system. If you're
+   unsure whether something's in bounds, it isn't: ask."""),
+    "atone-atonement": ("Interrogate the system as an attacker would, build the attack graph from the evidence, and "
+                        "propose the lock-downs that matter most.", """
+**Think like the attacker.** Assume a capable, automated one: AI attackers make known techniques instant and new bugs
+a matter of time. Your job is to find every way into and through {{system}}, and every way to break it, that the
+evidence allows; not to check boxes.
+
+1. **Mission effects first.** From the system spec, its data and its flows, recommend what an attacker could do that
+   would matter: data read out, data changed, the service stopped, a deploy tampered with, money moved. Each is a
+   condition of kind *effect* in attack/conditions.json, with its consequence (what it does to the mission, and to
+   whom) and its impact. Your people refine them; that's expected.
+2. **Attacker profiles** (attack/profiles.json): at least someone on the internet, a phished user, an insider, a
+   compromised dependency or supplier, a stolen admin laptop. Each starts with the conditions they hold.
+3. **The steps, in passes** (attack/steps/, one file each; `atone attack --example step`). Do every pass, every time:
+   - each component and each flow, from every angle: spoofing, tampering, repudiation, leaking, denial of service,
+     gaining privilege;
+   - each profile through the stages of an intrusion (ATT&CK's tactics): first foothold, running code, staying in,
+     gaining privilege, reaching the next host, collecting, getting data out, causing harm;
+   - what-ifs: this credential leaks; this host is taken; this dependency is poisoned; this admin is careless;
+   - what compliance never asks: who can read the backups and snapshots; secrets in configs, environments, shell
+     histories, CI variables and user data; what runs as root and can be reached; trust between hosts (SSH keys,
+     shared service accounts, roles that can be assumed); what expires and what fails open when it does; where the
+     logs are blind; what each cloud role can actually reach; how a deploy could be tampered with.
+   `atone attack defaults` says what each kind of cloud component exposes until the evidence says otherwise; the
+   attacker library (`atone attack search WORDS`, `atone attack technique ID`, its lore) knows the techniques.
+4. **Every step says how sure it is.** Cite the evidence (`atone evidence {{system}} search ...`), and quote it: atone
+   checks the quotes. A step with no evidence is *assumed*: write it anyway (it counts as commodity, and atone flags
+   it), and go find out. Only cite a control as *blocked* when the evidence shows it: an unproven control is no
+   control. Note what would detect each step, and only what really would.
+5. **Test what the engagement allows** on the replicas, to turn assumed steps into demonstrated or blocked ones. Never
+   beyond its targets or its depth.
+6. `atone attack {{system}}` (with `--paths 5` to read them): each attacker profile against each mission effect, the
+   cheapest way in, the controls in the way, the fewest lock-downs that cut every path, the paths that rest on one
+   control, and what nothing detects. Try what-ifs (`--close STEP`, `--harden STEP=hard`) before you propose.
+7. **Propose lock-downs** (risks/, `atone attack --example risk`): the exact change, who makes it, and a check that
+   proves it's in place (as in a control mapping), so atone keeps checking it. Lead with the cut: the few changes
+   that close the most. Commit on a branch, and tell your people what each buys ("closing these two cuts every path
+   from a phished user to the payroll data").
+8. **Keep going** until a full pass finds nothing new and the analysis says the bar is met (or every open pair is a
+   risk a person accepted: `atone decide {{system}} risk-acceptance "why" --item RISK --by NAME`). Then ask a person
+   to confirm atonement: `atone decide {{system}} atonement "why" --by NAME`. Only then start on the documents."""),
     "atone-become-expert": ("Build the lores you need to be the expert for a system: NIST's controls exactly, public "
                             "guidance, and the customer's own documents.", """
 1. The controls, word for word (NIST's files ship with atone: no internet needed): `atone controls lore`, then
@@ -4302,6 +4964,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system", nargs="?")
     p.add_argument("--example", nargs="?", const="", metavar="KIND",
                    help="a mapping format (controls, scanner, ssp, poam): its keys, what each means, an example")
+    p = sub.add_parser("attack", help="atonement: SYSTEM's attack paths, what to lock down; or technique ID, search "
+                                      "WORDS, lore, defaults")
+    p.add_argument("target", nargs="?", help="a system, or: technique ID | search WORDS | lore | defaults")
+    p.add_argument("rest", nargs="*")
+    p.add_argument("--close", help="what if these steps were blocked (comma-separated step ids)")
+    p.add_argument("--harden", help="what if these steps were harder: STEP=LEVEL,... (free, commodity, hard)")
+    p.add_argument("--paths", type=int, default=0, metavar="N", help="list up to N attack paths for each")
+    p.add_argument("--example", nargs="?", const="", metavar="KIND",
+                   help="a file's format (condition, profile, step, risk, engagement): its keys and an example")
+    p.add_argument("--out", help="lore: where to write it")
     p = sub.add_parser("workbook", help="inspect FILE: a workbook's sheets, headers and drop-downs (for its mapping)")
     p.add_argument("what", choices=["inspect"])
     p.add_argument("file")
@@ -4341,7 +5013,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--control", action="append", default=[], help="a control it concerns (repeatable)")
     p.add_argument("--until", help="when it's to be looked at again (YYYY-MM-DD)")
     p.add_argument("--from", dest="from_file", help="poam-schedule: the proposed schedule to approve")
-    p.add_argument("--item", action="append", default=[], help="poam-close: the POA&M item (key or file name)")
+    p.add_argument("--item", action="append", default=[], help="poam-close: the POA&M item (key or file name); risk-acceptance: the lock-down (risks/ID)")
     p = sub.add_parser("package", help="the package, generated into packages/TAG/, committed and tagged")
     p.add_argument("system")
     p.add_argument("--tag", required=True)
@@ -4478,6 +5150,8 @@ def main(argv: list[str] | None = None) -> int:
                         fmt = SCANNER_MAPPING if kind == "scanner" else POAM_MAPPING if m.get("kind") == "poam" else SSP_MAPPING
                         probs = format_problems(fmt, m)
                         print(f"{kind:<10} {f.relative_to(d)}" + ("".join(f"\n  ! {x}" for x in probs) or "  ok"))
+        elif args.cmd == "attack":
+            print(attack_command(args))
         elif args.cmd == "workbook":
             print(inspect_workbook(Path(args.file)))
         elif args.cmd == "fill":

@@ -711,6 +711,112 @@ class Codex(unittest.TestCase):
             atone.HOME = old
 
 
+class Atonement(unittest.TestCase):
+    """The attack graph: drafted as data, checked against its evidence, analysed by plain code (the self-pruning
+    spanning tree): exposure, controls, the fewest lock-downs, what-ifs, blind spots, and lock-downs that stay."""
+
+    def system(self, name):
+        d = evidence_system(name, [
+            ("file", "web01", "/etc/nginx/sites-enabled/app", "server { listen 443 ssl; proxy_pass http://127.0.0.1:8080; }"),
+            ("aws", "aws", "s3api get-bucket-policy payroll-export", '{"Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::1:role/app"}}]}'),
+            ("aws", "aws", "ec2 describe-instances", '{"HttpTokens": "optional", "IamInstanceProfile": "app"}')])
+        ids = {e["source"]: e["id"] for e in atone.current_index(d)}
+        atone.write_json(d / "attack" / "conditions.json", [
+            {"id": "net:internet", "kind": "access"}, {"id": "access:web", "kind": "access"},
+            {"id": "exec:web", "kind": "execution"}, {"id": "cred:app-role", "kind": "credential"},
+            {"id": "data:payroll", "kind": "data"}, {"id": "cond:elsewhere", "kind": "access"},
+            {"id": "cred:admin", "kind": "credential"},
+            {"id": "effect:payroll-read", "kind": "effect", "impact": "high", "consequence": "everyone's pay exposed"},
+            {"id": "effect:payroll-tamper", "kind": "effect", "impact": "high"}])
+        atone.write_json(d / "attack" / "profiles.json", [{"id": "internet", "starts": ["net:internet"]}])
+        step = lambda sid, **kw: atone.write_json(d / "attack" / "steps" / f"{sid}.json", {"id": sid, **kw})
+        nginx, policy, ec2 = ids["/etc/nginx/sites-enabled/app"], ids["s3api get-bucket-policy payroll-export"], ids["ec2 describe-instances"]
+        step("web-open", **{"from": "net:internet", "to": "access:web", "effort": "free", "basis": "evidence",
+                            "cites": [{"evidence": nginx, "quote": "listen 443 ssl"}], "detection": [{"by": "ALB logs"}]})
+        step("web-rce", **{"from": "access:web", "to": "exec:web", "technique": "T1190", "effort": "commodity",
+                           "basis": "assumed", "detection": [{"by": "WAF"}]})
+        step("imds", **{"from": "exec:web", "to": "cred:app-role", "technique": "T1552.005", "effort": "free",
+                        "basis": "evidence", "cites": [{"evidence": ec2, "quote": '"HttpTokens": "optional"'}]})
+        step("bucket-read", **{"from": "cred:app-role", "to": "data:payroll", "technique": "T1530", "effort": "free",
+                               "basis": "evidence", "cites": [{"evidence": policy, "quote": "role/app"}],
+                               "detection": [{"by": "CloudTrail data events"}]})
+        step("exfil", **{"from": "data:payroll", "to": "effect:payroll-read", "effort": "free", "basis": "assumed",
+                         "detection": [{"by": "VPC flow logs"}]})
+        step("bucket-public", **{"from": "net:internet", "to": "data:payroll", "effort": "blocked", "basis": "evidence",
+                                 "cites": [{"evidence": policy, "quote": "role/app"}], "detection": [{"by": "CloudTrail"}]})
+        step("side-trip", **{"from": "exec:web", "to": "cond:elsewhere", "effort": "free", "basis": "assumed"})
+        step("tamper", **{"from": "net:internet", "to": "effect:payroll-tamper", "requires": ["cred:admin"],
+                          "effort": "free", "basis": "assumed"})
+        step("claims-too-much", **{"from": "net:internet", "to": "cond:elsewhere", "effort": "blocked",
+                                   "basis": "evidence", "cites": [{"evidence": nginx, "quote": "mTLS required"}]})
+        return d
+
+    def test_the_spanning_tree_keeps_exactly_the_paths(self):
+        adj = {"a": [("b", 1), ("x", 2)], "b": [("c", 3)], "x": [("y", 4)], "c": [("b", 5)], "z": [("c", 6)]}
+        sub = atone.spst(adj, ["a"], ["c"])
+        self.assertEqual({k for v in sub.values() for _, k in v}, {1, 3, 5})   # not the dead end, nor z (unreachable)
+
+    def test_exposure_controls_the_fewest_lock_downs_and_blind_spots(self):
+        d = self.system("atone1")
+        a = atone.analyse_attack(d)
+        pair = {(x["profile"], x["effect"]): x for x in a["pairs"]}
+        x = pair[("internet", "effect:payroll-read")]
+        self.assertEqual((x["exposure"], x["layers"], x["ok"]), ("commodity", 0, False))   # through the assumed RCE
+        self.assertEqual(len(x["cut"]), 1)                                           # one lock-down cuts it
+        self.assertNotIn("side-trip", x["steps"])                                    # not on a path: pruned
+        self.assertEqual(x["unseen"], ["imds"])                                      # nothing watches the metadata grab
+        self.assertNotIn(("internet", "effect:payroll-tamper"), pair)                # needs cred:admin: no way there
+        self.assertIn("web-rce", a["assumed"])
+        self.assertTrue(any("claims-too-much" in p and "doesn't hold" in p for p in a["problems"]))   # unproven control
+        self.assertFalse(a["done"])
+        # what if the metadata service needed tokens: only the bucket's own control stands, so one control
+        w = atone.analyse_attack(d, close=["imds"])
+        y = {(x["profile"], x["effect"]): x for x in w["pairs"]}[("internet", "effect:payroll-read")]
+        self.assertEqual((y["exposure"], y["layers"]), (None, 1))
+        self.assertEqual(y["single_control"], ["bucket-public", "imds"])
+        text = atone.attack_report(a, paths=3)
+        self.assertIn("OPEN internet -> effect:payroll-read", text)
+        self.assertIn("path: web-open [free] -> web-rce [commodity] -> imds [free] -> bucket-read [free] -> exfil [commodity]", text)
+
+    def test_a_lock_down_holds_while_its_check_passes(self):
+        d = self.system("atone2")
+        atone.write_json(d / "risks" / "imdsv2.json", {
+            "id": "imdsv2", "closes": ["imds"], "change": "require IMDSv2 tokens on the instances",
+            "check": {"evidence": {"kind": "aws", "source": "ec2 describe-instances"}, "type": "present",
+                      "pattern": '"HttpTokens": "required"'}})
+        self.assertEqual(atone.analyse_attack(d)["risks"]["imdsv2"], "fail")       # not done yet: still open
+        atone.save_records(d, [atone.make_record("atone2", "aws", "aws", "ec2 describe-instances",
+                                                 '{"HttpTokens": "required", "IamInstanceProfile": "app"}')])
+        a = atone.analyse_attack(d)
+        self.assertEqual(a["risks"]["imdsv2"], "pass")
+        x = {(x["profile"], x["effect"]): x for x in a["pairs"]}[("internet", "effect:payroll-read")]
+        self.assertEqual((x["exposure"], x["layers"]), (None, 1))                   # locked: the check is the control
+
+    def test_the_plan_puts_atonement_first_and_people_decide(self):
+        d = self.system("atone3")
+        atone.write_json(d / "risks" / "imdsv2.json", {"id": "imdsv2", "closes": ["web-rce"],
+                                                       "change": "patch the app and put a WAF rule in front"})
+        ids = [i["id"] for i in atone.plan("atone3")["items"]]
+        self.assertLess(ids.index("attack-graph"), ids.index("documents"))
+        self.assertIn("atone:internet->effect:payroll-read", ids)
+        self.assertIn("risk:imdsv2", ids)
+        atone.write_json(d / "engagement.json", {"targets": ["replica-web01"], "depth": "exploit"})
+        atone.decide(d, "engagement", "replicas only, push hard", "pat")
+        self.assertEqual(atone.read_json(d / "engagement.json", {})["agreed"]["by"], "pat")
+        atone.decide(d, "risk-acceptance", "the app is retired next month", "pat", items=["imdsv2"])
+        x = {(x["profile"], x["effect"]): x for x in atone.analyse_attack(d)["pairs"]}[("internet", "effect:payroll-read")]
+        self.assertEqual((x["ok"], x["accepted"]), (False, ["imdsv2"]))       # accepted, never called safe
+        self.assertIn("ACCEPTED internet -> effect:payroll-read", atone.attack_report(atone.analyse_attack(d)))
+
+    def test_the_library_and_the_formats(self):
+        self.assertIn("Cloud Instance Metadata API", atone.describe_technique("t1552.005"))
+        self.assertIn("ac-2", atone.describe_technique("T1078.004"))                # mapped to 800-53, ids as the catalog's
+        self.assertIn("T1552.005", [i for i, _ in atone.search_library("instance metadata credentials")])
+        for kind, fmt in atone.attack_formats().items():
+            self.assertEqual(atone.format_problems(fmt, fmt["example"]), [], kind)
+        self.assertIn("attack formats", atone.describe_format("", atone.attack_formats(), "attack"))
+
+
 class PlanAndReport(unittest.TestCase):
     def test_the_plan_says_who_does_what_and_ticks_what_is_done(self):
         d = evidence_system("plan", [("file", "app01", "/etc/audit/auditd.conf", AUDITD)])
