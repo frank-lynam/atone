@@ -4230,10 +4230,49 @@ def cmd_controls(args) -> str:
     raise AtoneError("controls fetch | lore | SYSTEM [list | show ID]")
 
 
+class HelpFormat(argparse.RawDescriptionHelpFormatter):
+    """--help laid out the way hobkin, lorewell, eaveswatch, atone and hearthboard all do it: a short usage line,
+    then each command and option on one line with what it does (argparse's {a,b,c} list of choices left out)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=26, width=min(100, shutil.get_terminal_size((100, 24)).columns))
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(self._format_action(a) for a in action._get_subactions())
+        return super()._format_action(action)
+
+    @classmethod
+    def everywhere(cls, parser, prog=None):
+        """This layout for a parser and all its commands, at every level: commands shown as COMMAND, and listed
+        under "commands" (or "arguments", where there are others too)."""
+        parser.formatter_class = cls
+        subs = [a for a in parser._positionals._group_actions if isinstance(a, argparse._SubParsersAction)]
+        for action in subs:
+            action.metavar = action.metavar or "COMMAND"
+            for each in action.choices.values():
+                cls.everywhere(each)
+        if subs:
+            parser._positionals.title = "commands" if len(subs) == len(parser._positionals._group_actions) else "arguments"
+        return parser
+
+
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="atone", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--version", action="version", version=f"atone {__version__}")
-    sub = ap.add_subparsers(dest="cmd")
+    ap = argparse.ArgumentParser(
+        prog="atone", usage="atone COMMAND [options]", formatter_class=HelpFormat,
+        description="atone: keeps a system's authorization (ATO) true to the system. It collects evidence, checks\n"
+                    "NIST SP 800-53 controls against it, verifies every claim a narrative cites, fills in the\n"
+                    "customer's workbooks, and draws the architecture as it is. Each system is a git repository\n"
+                    "(its codex), whose history is its security history. People decide; atone drafts and proves.",
+        epilog="examples:\n"
+               "  atone init tst --remote GIT_URL      a system's codex\n"
+               "  atone collect tst --ssh user@host    evidence from a host\n"
+               "  atone check tst && atone plan tst    every control, then what's left and who can do it\n"
+               "  atone package tst --tag conmon-2026-11\n\n"
+               "atone COMMAND --help: that command's options. The first run on a real system:\n"
+               "docs/RUNBOOK.md. More: https://github.com/frank-lynam/atone")
+    ap.add_argument("--version", action="version", version=f"atone {__version__}", help="show the version and exit")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", prog="atone")
     p = sub.add_parser("init", help="a system's codex (a git repository), or a clone of one (--from)")
     p.add_argument("system")
     p.add_argument("--from", dest="from_url", help="clone the system's codex from here (a fresh machine)")
@@ -4246,7 +4285,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("system")
     p.add_argument("--kind", action="append", choices=list(COLLECTORS), help="only these collectors")
     p.add_argument("--ssh", action="append", default=[], help="user@host (repeatable; default: this host)")
-    p = sub.add_parser("import", help="scanner results into evidence (OpenSCAP; others through imports/*.mapping.json)")
+    p = sub.add_parser("import", help="scanner results into evidence (OpenSCAP; others through mappings/scanners/)")
     p.add_argument("system")
     p.add_argument("files", nargs="*", help="default: everything in the system's imports/ folder")
     p.add_argument("--sample", metavar="FILE", help="a file's columns and first rows, for drafting its mapping")
@@ -4328,7 +4367,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("rest", nargs="*")
     p.add_argument("--out")
     p.add_argument("--from", dest="from_dir", help="fetch: NIST's files from this folder (no internet needed)")
-    return ap
+    return HelpFormat.everywhere(ap)
 
 
 def main(argv: list[str] | None = None) -> int:
