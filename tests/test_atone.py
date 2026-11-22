@@ -859,7 +859,7 @@ class Atonement(unittest.TestCase):
         st = g["steps"]
         self.assertEqual(st["net/lan->web01:tcp/22"]["effort"], "free")
         self.assertEqual((st["net/lan->web01:tcp/25"]["effort"], st["net/lan->web01:tcp/25"]["control"]),
-                         ("blocked", "bind:web01:loopback"))                       # loopback only: a control
+                         ("blocked", "bind:web01:tcp/25"))                          # loopback only: a control
         self.assertIn("Cloudflare tunnel", st["net/internet->web01:tcp/41977"]["about"])
         self.assertIn("net/web01:alice->host:web01", st)                           # code there reaches its own ports
         self.assertEqual(st["ssh-login"]["basis"], "evidence")                     # a citation by field holds

@@ -4002,7 +4002,7 @@ def network_steps(d: Path, conditions: dict) -> tuple[dict, dict]:
                 continue                         # its security groups decide who else gets in (below)
             if ip.startswith(LOOPBACK) or ip in ("localhost",):
                 step(cond("net:lan", "access", "anyone on the local network"), acc, "blocked",
-                     f"{host} binds {what} to {ip} only", [eid], control=f"bind:{host}:loopback")
+                     f"{host} binds {what} to {ip} only", [eid], control=f"bind:{host}:{what}")   # each port's own
             else:
                 step(cond("net:lan", "access", "anyone on the local network"), acc, "free",
                      f"{host} listens on {ip or 'every address'}:{port} (the host's firewall isn't evaluated yet)", [eid])
