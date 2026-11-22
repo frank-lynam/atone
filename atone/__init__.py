@@ -5088,9 +5088,12 @@ readers check mappings against, so it's always current. How a mapping is used is
 
 
 def hobkin_pack() -> str:
-    """The hobkin.packs entry point: atone's chore and skills as a folder (written once per version), for hobkin to
-    find with --chore atone."""
-    root = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "atone" / f"pack-{__version__}"
+    """The hobkin.packs entry point: atone's chore and skills as a folder, for hobkin to find with --chore atone.
+    Written once for each version of their text (the folder's name has a hash of it), so a change to a skill
+    between releases reaches the agents that take the chore again."""
+    text = json.dumps([CHORE_MD, SKILLS, CHORE_JSON], sort_keys=True, default=str)
+    root = Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "atone" / \
+        f"pack-{__version__}-{hashlib.sha256(text.encode()).hexdigest()[:10]}"
     chore = root / "chores" / "atone"
     if not (chore / "chore.json").exists():
         (chore / "skills").mkdir(parents=True, exist_ok=True)
