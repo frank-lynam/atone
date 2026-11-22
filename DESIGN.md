@@ -306,9 +306,26 @@ access: known weaknesses, not new ones. So each step has a level:
 | **hard** | it would take a new bug, or a lot of work |
 | **blocked** | a control stops it, and the control is cited (and checked, where atone can check it) |
 
-**Basis** says how sure that is: *evidence* (cited), *demonstrated*, or *assumed* (no evidence either way; the level
-comes from a default for that kind of component, an ECHO-style starting point, and the step is flagged until someone
-looks). Nothing assumed is ever reported as found.
+**Basis** says how sure that is: *evidence* (cited), *demonstrated*, or *assumed* (no evidence either way; the step
+is flagged until someone looks). Nothing assumed is ever reported as found.
+
+**Assume a capable, automated attacker.** AI attackers make known techniques instant and new bugs a matter of
+time, not skill. So an assumed step counts as *commodity* (if nobody has looked, assume it's open to anyone with a
+tool), and *hard* is no protection on its own: only *blocked* is. The defaults for what a kind of component
+exposes are a short table written for cloud systems (ECHO's on-premises catalog doesn't fit), in the package, that a
+team can override:
+
+| Component | Usually exposes, until evidence says otherwise |
+|---|---|
+| public endpoint (load balancer, API gateway, web server) | reachable from the internet; its software's known flaws (commodity) |
+| identity: a cloud role, a user, a service account, an access key | everything its policy allows; anything that can assume or use it gets the same |
+| storage (bucket, file share, snapshot, backup) | read and write by anyone its policy and ACLs allow; public if the account allows public access |
+| managed database | reachable from its security groups; credentials wherever the app keeps them |
+| compute (VM, container, function) | its instance or task role's permissions; its metadata service; secrets in its environment |
+| secrets store, key service | every secret or key its policies let a principal read or use |
+| CI/CD and its runners | the deploy: whatever it can push, and every credential it holds |
+| an outside service it trusts (SaaS, a partner, an identity provider) | whatever that trust grants, if the outside service is taken |
+| a person (an admin, a developer) | their credentials and sessions, by phishing or a stolen laptop |
 
 ### The interrogation: the hobkin's method
 
@@ -342,8 +359,8 @@ new.
   held by a single control is a weak point, however good that control is.
 - **Detection:** the steps no log source would show (with eaveswatch: sources it reads and patterns it has). The
   steps nobody watches are blind spots to close too.
-- **Optionally, time:** a TRACE-style Monte Carlo over the same subgraph (each tier given a rate), for a mean time to
-  compromise and each step's share of it, when a number for trade-offs helps.
+- **Optionally, time:** a TRACE-style Monte Carlo over the same subgraph (each level given a rate), for a mean time
+  to compromise and each step's share of it, when a number for trade-offs helps.
 - **Paths for people:** the extracted subgraph listed as readable attack narratives (capped), and drawn over the
   architecture diagram in draw.io.
 
@@ -370,9 +387,15 @@ over to the real system, and which don't because the two differ.
 
 ### The gate: when atonement is done
 
-Atonement is done when, for each attacker profile, no path to a mission effect is cheaper than the level set for
-it; every remaining path has at least the number of layers set; every step on those paths is detected somewhere; and
-every risk is fixed or accepted by a person (`atone decide risk-acceptance`). The hobkin proposes that it's done
+The bar is high by default, because AI attackers are assumed. Atonement is done when, for every attacker profile:
+- **no path reaches a mission effect without crossing a control:** no path made only of free, demonstrated,
+  commodity or even hard steps (a new bug is within an AI attacker's reach);
+- **every remaining path crosses at least two independent controls** (defence in depth: one control is one mistake
+  away from none);
+- **every step on those paths is detected somewhere**;
+- and every risk is fixed or accepted by a person (`atone decide risk-acceptance`).
+
+A system can set its own bar in the engagement (a lower one for a low-impact system, say), recorded as a decision. The hobkin proposes that it's done
 when a full pass and the analysis find nothing worth closing; a person confirms (`atone decide atonement`).
 
 ### Then compliance, as a view
@@ -393,13 +416,13 @@ MITRE ATT&CK (techniques, tactics, mitigations), CAPEC (attack patterns), CWE (w
 mappings, and the ECHO threat concepts and component defaults (from TRACE). Built into lores for the hobkin,
 compiled exactly like the controls: what it cites is the source's own words.
 
-### Open questions
+### Settled
 
-- The effort levels' defaults per component kind: start from ECHO's catalog and observed-rate data, or a simpler
-  table the team writes?
-- The levels the gate asks for, per attacker profile: set per system in the engagement, with suggested defaults?
-- Mission effects: the hobkin drafts them from the system spec and data flows, and the system owner confirms. Is
-  the owner the right person to confirm, or the ISSE?
+- **Defaults per component** are the short cloud table above, not ECHO's catalog: the work is mostly in the cloud.
+- **The bar is high by default** (AI attackers): every path to a mission effect crosses at least two controls, and
+  every step on it is detected. A system can lower it in its engagement, as a recorded decision.
+- **Mission effects:** the hobkin recommends them, with their consequences, from the system spec, the data and the
+  flows; the team refines them from there.
 
 ## 4b. The atone codex: the system's security history, as a git history
 
