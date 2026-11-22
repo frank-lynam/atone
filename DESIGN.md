@@ -1,6 +1,6 @@
 # atone: design
 
-*A draft for discussion, written for the ISSE first. Nothing here is built yet.*
+*A draft for discussion, written for the ISSE first. Sections say what's built.*
 
 atone keeps a system's authorization true to the system. It is an **expert pack for hobkin**: install it, and a
 hobkin becomes a compliance engineer's apprentice, with a deterministic toolkit, prepared knowledge, and the skills
@@ -13,6 +13,9 @@ It works on any system and for any customer. Nothing about PeopleSoft, or any ot
 
 ## 1. Principles
 
+- **Security first; compliance is a view of it.** The hobkin first interrogates the system the way an attacker
+  would, and the team locks down what it finds (§4a, atonement). The compliance documents come after, derived from
+  that work, with a check that it covered what compliance needs.
 - **Code is the source of truth; the agent is the apprentice.** Evidence collection, imports, checks, the workbook
   round trip, diagrams and OSCAL are plain, deterministic code: the atone toolkit. It never calls a model, an ISSE
   can run it without any agent, and an assessor can re-run anything it did. The hobkin does the judgement work
@@ -260,6 +263,144 @@ with a diff. They feed SC-7, AC-4, CA-3, CM-7, CM-8 and the SSP's architecture s
   a click away;
 - `oscal/`: the SSP, assessment results and POA&M as OSCAL, for whoever takes machine-readable packages.
 
+## 4a. Atonement: interrogate the system first, then derive compliance
+
+*Designed, not built yet.*
+
+NIST asks whether controls exist. An attacker asks how to get in. atone answers the attacker's question first. A
+hobkin studies the real system (or a replica of it) to find every way it can be broken into or broken, and the
+team locks those ways down. Only once the hobkin can't find a lock-down that's still worth making does the work
+turn to compliance documents. The documents are then a view of security work already done: narratives cite real
+fixes and the checks that prove them, not generic text. That's the first phase, **atonement**: atoning for the
+system's sins before confessing them on paper.
+
+Two ideas started this, both Apache-2.0 and credited in the code:
+- **TRACE** (Traversal-driven Risk Assessment of Composite Effects, MITRE, github.com/mitre/trace). It treats risk
+  as whole attack paths, from a way in to a mission effect; ranks each step by how much it contributes to an
+  end-to-end compromise; and asks "what if this step were closed?".
+- **The self-pruning spanning tree** (github.com/frank-lynam/self-pruning-spanning-tree). A spanning tree from the
+  sources, stored reversed, then a spanning tree of that from the sinks, leaves exactly the subgraph of every path
+  from one set to the other. It's the core of every question below.
+
+### The attack graph: part of the system model
+
+The codex holds an attack graph beside the system spec, drafted by the hobkin from the evidence and reviewed like
+the rest:
+
+| Path | What it is |
+|---|---|
+| `attack/conditions.json` | what an attacker can come to hold: network access to a host or port, code running on a host (as a user, as root), a credential, read or write on a data store, and the **mission effects** (records read out, payroll stopped, a deploy tampered with), each with what it means for the mission |
+| `attack/profiles.json` | who attacks, and where they start: someone on the internet, a phished user, an insider with VPN, a compromised dependency, a stolen admin laptop; each with the conditions it starts with |
+| `attack/steps/ID.json` | one way from conditions to a condition: the technique (an ATT&CK id where there is one), from, to, its **effort**, its **basis**, the evidence for it (cited and verified like a narrative's), and the **detection** (what would see it happen) |
+| `risks/ID.json` | a lock-down: the steps it closes, the exact change, the check that proves it's in place, its state |
+| `engagement.json` | the rules of engagement (below) |
+
+**Effort, not time.** On real systems the paths are mostly misconfigurations, exposed credentials and too much
+access: known weaknesses, not new ones. So each step has a level:
+
+| Effort | Means |
+|---|---|
+| **free** | the evidence shows it's open: no authentication, a world-readable key, a default password, a rule open to the world |
+| **demonstrated** | it was done on the replica (evidence from the test) |
+| **commodity** | a known technique, or a public exploit for a version that's installed |
+| **hard** | it would take a new bug, or a lot of work |
+| **blocked** | a control stops it, and the control is cited (and checked, where atone can check it) |
+
+**Basis** says how sure that is: *evidence* (cited), *demonstrated*, or *assumed* (no evidence either way; the level
+comes from a default for that kind of component, an ECHO-style starting point, and the step is flagged until someone
+looks). Nothing assumed is ever reported as found.
+
+### The interrogation: the hobkin's method
+
+Depth comes from a method, not a mood. The hobkin works in passes, each recorded in the codex:
+1. **Each component and each flow, from every angle of attack** (STRIDE: spoofing, tampering, repudiation, leaking
+   information, denial of service, gaining privilege).
+2. **Each attacker profile, through each stage of an intrusion** (ATT&CK's tactics: first foothold, running code,
+   staying in, gaining privilege, finding and reaching the next host, collecting, getting data out, causing harm).
+3. **What-ifs:** this credential leaks; this host is taken; this dependency is poisoned; this admin is careless.
+4. **What compliance never asks:** who can read the backups; which secrets sit in configs, environments, shell
+   histories and CI; what runs as root and can be reached; trust between hosts (SSH keys, shared service accounts);
+   what expires (certificates, keys) and what fails open when it does; where the logs are blind; what the cloud
+   account's roles can reach; how a deploy could be tampered with.
+
+The hobkin uses the attacker library (below) to know techniques and weaknesses, the evidence to tie each step to
+this system, and the rules of engagement to decide what it may test. It keeps going until a full pass adds nothing
+new.
+
+### The analysis: deterministic code
+
+`atone attack` analyses the graph (plain code, no model):
+- **Exposure:** for each profile and mission effect, the self-pruning spanning tree over the steps at or below an
+  effort level. *Empty means no path at that level.* Raising the level one tier at a time shows what a stronger
+  attacker adds. The cheapest level at which a path exists is the pair's exposure.
+- **The fewest fixes that cut every cheap path:** a minimum cut on that subgraph, so the answer reads "these three
+  changes together cut every path cheaper than *hard* from a phished user to the payroll data", not a list of
+  findings.
+- **What-if:** close a step, or harden it a tier, and recompute: what it does to exposure, and which paths it cuts.
+  Every proposed lock-down comes with that difference.
+- **Layers:** for each pair, how many independent controls (blocked steps) stand in the way on its best path. A path
+  held by a single control is a weak point, however good that control is.
+- **Detection:** the steps no log source would show (with eaveswatch: sources it reads and patterns it has). The
+  steps nobody watches are blind spots to close too.
+- **Optionally, time:** a TRACE-style Monte Carlo over the same subgraph (each tier given a rate), for a mean time to
+  compromise and each step's share of it, when a number for trade-offs helps.
+- **Paths for people:** the extracted subgraph listed as readable attack narratives (capped), and drawn over the
+  architecture diagram in draw.io.
+
+### Lock-downs, and keeping them locked
+
+Each risk names the exact change (to the system, to a config, to a rule) and a **check, as data**, that proves it's
+in place. When the check passes, the steps it closes become *blocked*, with the check cited. Every collect re-runs
+the checks and re-derives the steps from the evidence: a port reopened or a permission widened brings the step back
+and reopens the path. The codex's history shows when each path opened and closed, and who decided what.
+
+### Rules of engagement: how hard it pushes, defined with the hobkin
+
+`engagement.json` is agreed in conversation with the hobkin and recorded with `atone decide engagement`:
+- **targets:** the hosts it may test (the replicas: dummy systems that stand in for the real one), never others;
+- **depth:** *think* (reasoning only), *read* (read-only checks, the default), *probe* (active scans and attempts,
+  such as trying a login or reaching a port from outside), or *exploit* (real exploitation, on the targets only);
+- **out of bounds:** anything never to do, even on a target (deleting data, attacking shared infrastructure);
+- **windows:** when, if that matters.
+
+On a replica, pushing hard is the point. atone's active tests refuse any host the engagement doesn't name. What a
+test shows is evidence like any other, and a step it proves is *demonstrated*. The codex records which system the
+replica **represents**, and atone compares their evidence (packages, configs, rules) to say which findings carry
+over to the real system, and which don't because the two differ.
+
+### The gate: when atonement is done
+
+Atonement is done when, for each attacker profile, no path to a mission effect is cheaper than the level set for
+it; every remaining path has at least the number of layers set; every step on those paths is detected somewhere; and
+every risk is fixed or accepted by a person (`atone decide risk-acceptance`). The hobkin proposes that it's done
+when a full pass and the analysis find nothing worth closing; a person confirms (`atone decide atonement`).
+
+### Then compliance, as a view
+
+- **Mapping:** steps to ATT&CK techniques, techniques to the mitigations that block them, mitigations to 800-53
+  controls (the published ATT&CK to 800-53 mappings are the reviewed starting point). The controls a fix and its
+  check evidence are known, not guessed.
+- **Narratives** cite the fixes and their checks, so a statement says what was done and how it's proven.
+- **Coverage, checked before atonement closes:** every control in the baseline is either *covered* (the security
+  work addresses it), *needs a person* (policy, training, personnel: no attacker analysis reaches them, so they go
+  to the plan as people's items), or *not yet examined* (it goes back into phase 1). So the security work is shown
+  to cover what compliance needs, and nothing reaches the documents unexamined.
+
+### The attacker library
+
+Shipped in the package as plain text, each file with its source, licence and SHA-256 in `lock.json`, like NIST's:
+MITRE ATT&CK (techniques, tactics, mitigations), CAPEC (attack patterns), CWE (weakness types), the ATT&CK to 800-53
+mappings, and the ECHO threat concepts and component defaults (from TRACE). Built into lores for the hobkin,
+compiled exactly like the controls: what it cites is the source's own words.
+
+### Open questions
+
+- The effort levels' defaults per component kind: start from ECHO's catalog and observed-rate data, or a simpler
+  table the team writes?
+- The levels the gate asks for, per attacker profile: set per system in the engagement, with suggested defaults?
+- Mission effects: the hobkin drafts them from the system spec and data flows, and the system owner confirms. Is
+  the owner the right person to confirm, or the ISSE?
+
 ## 4b. The atone codex: the system's security history, as a git history
 
 *Built in 0.1.0: evidence at stable paths, the control model (`controls/`, `poam/`, `decisions/`), trailers, the
@@ -346,6 +487,9 @@ customer wants non-repudiation.
 - Commit signing: optional.
 
 ## 5. The engagement: a plan first
+
+The engagement has two phases: **atonement** (§4a: interrogate the system, lock it down) and then **compliance**
+(derive the documents from that work). The plan holds both, with atonement's items first.
 
 The first thing the hobkin does on a new system is make **the plan**: one big to-do list of every piece of the
 effort, made before anything else and kept current to the end. Each item says what it is, who can do it, what it's
